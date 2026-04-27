@@ -10,32 +10,35 @@ LLM 추론 시 프롬프트 접두사가 완전히 일치하지 않아도 캐시
 
 ## RALPH 루프 — 자율 연구 사이클
 
-하루 한 번 다음 5단계 멀티에이전트 파이프라인이 순서대로 실행된다.
-**2단계(Analyze)에서 아이디어 변화가 없으면 3~5단계는 건너뛴다.**
+하루 한 번 다음 7단계 멀티에이전트 파이프라인이 순서대로 실행된다.
+**2단계(Analyze)에서 아이디어 변화가 없으면 3~7단계는 건너뛴다.**
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│  매일 00:00 KST                                                  │
-│                                                                  │
-│  1. Research   → 외부 기술 동향 수집 → reports/trends/           │
-│       │                                                          │
-│       ▼                                                          │
-│  2. Analyze    → 아이디어 생성 → reports/ideas/                  │
-│       │                                                          │
-│       │  SIGNIFICANT_CHANGE: false → STOP                       │
-│       │  SIGNIFICANT_CHANGE: true  ↓                            │
-│       ▼                                                          │
-│  3. Launch     → Spec.md 생성                                    │
-│       │                                                          │
-│       ▼                                                          │
-│  4. Program ◄──────────────────────────────────────┐            │
-│       │                                             │            │
-│       ▼                                             │ 최대 3회   │
-│  5. Heuristic  → 피드백 → 구현 반영 ────────────────┘            │
-│       │                                                          │
-│       ▼                                                          │
-│     최종 평가 리포트 → reports/evaluations/                      │
-└─────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│  매일 KST 06:00                                                       │
+│                                                                       │
+│  R  1. Research   → 외부 기술 동향 수집 → reports/trends/             │
+│          │                                                            │
+│  A  2. Analyze    → 아이디어 생성 → reports/ideas/                    │
+│          │                                                            │
+│          │  SIGNIFICANT_CHANGE: false → STOP                         │
+│          │  SIGNIFICANT_CHANGE: true  ↓                              │
+│  L  3. Launch     → Spec.md 생성                                      │
+│          │                                                            │
+│  P  4. Program  ◄──────────────────────────────────────┐             │
+│          │                                              │ 최대 3회    │
+│  H  5. Heuristic  → 피드백 → 구현 반영 ─────────────────┘             │
+│          │                                                            │
+│          └→ Report ① reports/evaluations/YYYY-MM-DD.md               │
+│          │                                                            │
+│          ↓ 검증 통과 알고리즘                                          │
+│                                                                       │
+│     6. vLLM Port ◄─────────────────────────────────────┐             │
+│          │                                              │ 최대 3회    │
+│     7. vLLM Eval  → 피드백 → 이식 수정 ─────────────────┘             │
+│          │                                                            │
+│          └→ Report ② reports/vllm-evaluations/YYYY-MM-DD.md          │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
 ### 단계별 에이전트 정의
@@ -46,7 +49,16 @@ LLM 추론 시 프롬프트 접두사가 완전히 일치하지 않아도 캐시
 | 2. Analyze | `.claude/agents/idea-generator.md` | 트렌드 리포트 + 과거 아이디어 | `reports/ideas/YYYY-MM-DD.md` |
 | 3. Launch | `.claude/agents/planner.md` | 아이디어 리포트 | `Spec.md` |
 | 4. Program | `.claude/agents/implementer.md` | `Spec.md` + 평가 피드백 | `src/` 코드 변경 |
-| 5. Heuristic | `.claude/agents/evaluator.md` | 구현 결과 + `evaluation_criteria.md` | 피드백 or 최종 리포트 |
+| 5. Heuristic | `.claude/agents/evaluator.md` | 구현 결과 + `evaluation_criteria.md` | 피드백 or **Report ①** |
+| 6. vLLM Port | `.claude/agents/vllm-porter.md` | Report ① + `src/cache/` + vLLM latest | `vllm_integration/` |
+| 7. vLLM Eval | `.claude/agents/vllm-evaluator.md` | `vllm_integration/` + vLLM latest | 피드백 or **Report ②** |
+
+### 최종 산출물
+
+| 리포트 | 경로 | 내용 |
+|--------|------|------|
+| Report ① | `reports/evaluations/YYYY-MM-DD.md` | 독립 구현 검증 (히트율·지연·메모리·코드 품질) |
+| Report ② | `reports/vllm-evaluations/YYYY-MM-DD.md` | vLLM latest 이식 검증 (처리량·호환성·회귀) |
 
 ### 파이프라인 실행
 
@@ -78,19 +90,30 @@ LLM 추론 시 프롬프트 접두사가 완전히 일치하지 않아도 캐시
 │   │   ├── idea-generator.md        # 2단계: 아이디어 생성 + 변화 감지
 │   │   ├── planner.md               # 3단계: Spec.md 작성
 │   │   ├── implementer.md           # 4단계: 코드 구현
-│   │   └── evaluator.md             # 5단계: 평가 + 피드백 루프
+│   │   ├── evaluator.md             # 5단계: 평가 + 피드백 루프 → Report ①
+│   │   ├── vllm-porter.md           # 6단계: 검증 알고리즘 vLLM 이식
+│   │   └── vllm-evaluator.md        # 7단계: vLLM 환경 평가 → Report ②
 │   ├── commands/
 │   │   ├── run-pipeline.md          # /run-pipeline 슬래시 커맨드
 │   │   ├── run-trend.md             # /run-trend
 │   │   └── run-idea.md              # /run-idea
 │   └── settings.json                # 훅·권한·스케줄 설정
 │
+├── vllm_integration/                # vllm-porter 생성 (vLLM 이식 코드)
+│   ├── block_manager_patch.py
+│   ├── attention_backend_patch.py
+│   ├── scheduler_patch.py
+│   ├── install.sh                   # pip install --upgrade vllm + 패치
+│   └── README.md                    # 버전 호환성 기록
+│
 ├── reports/
 │   ├── trends/                      # trend-sensor 출력
 │   │   └── YYYY-MM-DD.md
 │   ├── ideas/                       # idea-generator 출력
 │   │   └── YYYY-MM-DD.md
-│   └── evaluations/                 # evaluator 최종 출력
+│   ├── evaluations/                 # evaluator 최종 출력 (Report ①)
+│   │   └── YYYY-MM-DD.md
+│   └── vllm-evaluations/            # vllm-evaluator 최종 출력 (Report ②)
 │       └── YYYY-MM-DD.md
 │
 ├── configs/
@@ -162,6 +185,9 @@ LLM 추론 시 프롬프트 접두사가 완전히 일치하지 않아도 캐시
 - 측정 결과는 `results/<exp-name>/metrics.json` 에 JSON으로 기록한다.
 - `Spec.md` 는 planner 에이전트만 수정한다. 사람이 직접 편집할 경우 planner에게 알린다.
 - `evaluation_criteria.md` 는 사람이 관리하며 에이전트는 읽기만 한다.
+- `vllm_integration/` 은 vllm-porter만 수정한다.
+- vLLM은 항상 `pip install --upgrade vllm` 으로 최신 버전을 사용한다. 고정 버전 핀 금지.
+- Report ①(evaluator)과 Report ②(vllm-evaluator)는 독립적으로 저장한다. 하나가 실패해도 다른 하나는 저장한다.
 
 ---
 
