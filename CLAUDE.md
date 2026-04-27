@@ -83,10 +83,12 @@ LLM 추론의 **처리량(throughput)**과 **메모리 효율**을 동시에 높
 
 ### 최종 산출물
 
-| 리포트 | 경로 | 내용 |
+| 산출물 | 경로 | 내용 |
 |--------|------|------|
 | Report ① | `reports/evaluations/YYYY-MM-DD.md` | 독립 구현 검증 (히트율·지연·메모리·코드 품질) |
 | Report ② | `reports/vllm-evaluations/YYYY-MM-DD.md` | vLLM latest 이식 검증 (처리량·호환성·회귀) |
+| 누적 요약 | `reports/summary/SUMMARY.md` | 전 사이클 Activity별 성과 추이, 목표 지표 달성 현황 |
+| 사이클 델타 | `reports/summary/YYYY-MM-DD-delta.md` | 해당 사이클 변화 요약 및 다음 제언 |
 
 ### 파이프라인 실행
 
@@ -119,8 +121,9 @@ LLM 추론의 **처리량(throughput)**과 **메모리 효율**을 동시에 높
 │   │   ├── planner.md               # 3단계: Spec.md 작성
 │   │   ├── implementer.md           # 4단계: 코드 구현
 │   │   ├── evaluator.md             # 5단계: 평가 + 피드백 루프 → Report ①
-│   │   ├── vllm-porter.md           # 6단계: 검증 알고리즘 vLLM 이식
-│   │   └── vllm-evaluator.md        # 7단계: vLLM 환경 평가 → Report ②
+│   │   │   ├── vllm-porter.md           # 6단계: 검증 알고리즘 vLLM 이식
+│   │   ├── vllm-evaluator.md        # 7단계: vLLM 환경 평가 → Report ②
+│   │   └── summarizer.md            # 8단계: 누적 성과 요약 갱신
 │   ├── commands/
 │   │   ├── run-pipeline.md          # /run-pipeline 슬래시 커맨드
 │   │   ├── run-trend.md             # /run-trend
@@ -141,8 +144,11 @@ LLM 추론의 **처리량(throughput)**과 **메모리 효율**을 동시에 높
 │   │   └── YYYY-MM-DD.md
 │   ├── evaluations/                 # evaluator 최종 출력 (Report ①)
 │   │   └── YYYY-MM-DD.md
-│   └── vllm-evaluations/            # vllm-evaluator 최종 출력 (Report ②)
-│       └── YYYY-MM-DD.md
+│   ├── vllm-evaluations/            # vllm-evaluator 최종 출력 (Report ②)
+│   │   └── YYYY-MM-DD.md
+│   └── summary/                     # summarizer 누적 출력
+│       ├── SUMMARY.md               # 전 사이클 성과 추이 (계속 갱신)
+│       └── YYYY-MM-DD-delta.md      # 사이클별 변화 요약
 │
 ├── configs/
 │   ├── baseline.yaml
@@ -232,6 +238,8 @@ low-rank approximation, CacheBlend, positional-independent caching.
 - `vllm_integration/` 은 vllm-porter만 수정한다.
 - vLLM은 항상 `pip install --upgrade vllm` 으로 최신 버전을 사용한다. 고정 버전 핀 금지.
 - Report ①(evaluator)과 Report ②(vllm-evaluator)는 독립적으로 저장한다. 하나가 실패해도 다른 하나는 저장한다.
+- `reports/summary/SUMMARY.md` 는 summarizer만 수정한다. 사람이 직접 편집하지 않는다.
+- summarizer는 SIGNIFICANT_CHANGE: false로 파이프라인이 중단된 날에도 반드시 실행한다.
 
 ---
 

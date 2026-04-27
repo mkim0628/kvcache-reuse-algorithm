@@ -31,12 +31,13 @@ Each daily cycle, the pipeline selects the highest-priority activity or combinat
 
 ## Daily Pipeline
 
-Every day, an autonomous multi-agent pipeline runs end-to-end:
+Every day, an autonomous 8-stage multi-agent pipeline runs end-to-end:
 
 1. Scans the latest papers and open-source releases for new ideas
 2. Proposes novel algorithms based on what it finds
 3. Implements and validates them against strict evaluation criteria
 4. **Ports the validated algorithm into vLLM** and benchmarks it there
+5. **Updates a cumulative summary** tracking progress across all cycles
 
 ---
 
@@ -49,30 +50,31 @@ Every day, an autonomous multi-agent pipeline runs end-to-end:
 │  1. 트렌드 수집  ─── trend-sensor      → reports/trends/              │
 │  2. 아이디어    ─── idea-generator    → reports/ideas/                │
 │                    │                                                  │
-│                    └─ SIGNIFICANT_CHANGE: false → STOP               │
-│                                                                       │
-│  3. 스펙 작성   ─── planner           → Spec.md                       │
-│  4. 구현        ─── implementer   ◄──────────────────────┐            │
-│  5. 평가        ─── evaluator     ──── feedback (×3 max) ┘            │
-│                    │                                                  │
-│                    └→ Report ① (통과 여부 무관하게 저장 후 계속)        │
-│                                                                       │
-│  6. vLLM 이식   ─── vllm-porter   → vllm_integration/                │
-│  7. vLLM 평가   ─── vllm-evaluator ─── feedback (×3 max) ┐           │
-│                    │               ◄─── vllm-porter       ┘           │
-│                    └→ Report ②                                        │
+│                    └─ SIGNIFICANT_CHANGE: false ─────────────┐       │
+│                                                               │       │
+│  3. 스펙 작성   ─── planner           → Spec.md               │       │
+│  4. 구현        ─── implementer   ◄──────────────────┐        │       │
+│  5. 평가        ─── evaluator     ── feedback (×3)   ┘        │       │
+│                    └→ Report ① (항상 저장 후 계속)              │       │
+│  6. vLLM 이식   ─── vllm-porter   → vllm_integration/         │       │
+│  7. vLLM 평가   ─── vllm-evaluator ── feedback (×3) ┐         │       │
+│                    └→ Report ②                       ┘         │       │
+│                                                               ↓       │
+│  8. 누적 요약   ─── summarizer    → reports/summary/  ◄────────┘       │
+│                    (매일 항상 실행 — SIGNIFICANT_CHANGE 무관)           │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
 | 단계 | 에이전트 | 역할 |
 |------|---------|------|
-| 1. 트렌드 수집 | `trend-sensor` | arXiv·GitHub·블로그에서 KV 캐시 관련 동향 수집 |
+| 1. 트렌드 수집 | `trend-sensor` | arXiv·학회·GitHub·블로그에서 Activity A/B/C별 동향 수집 |
 | 2. 아이디어 생성 | `idea-generator` | 트렌드 + 과거 아이디어 종합 → 새 아이디어 제안 |
-| 3. 스펙 작성 | `planner` | 아이디어 → 구체적인 `Spec.md` 작성 |
+| 3. 스펙 작성 | `planner` | 아이디어 → Activity별 구체적인 `Spec.md` 작성 |
 | 4. 구현 | `implementer` | `Spec.md` 기반 Python 구현 |
 | 5. 평가 | `evaluator` | `evaluation_criteria.md` 기준 평가·피드백 루프 |
-| 6. vLLM 이식 | `vllm-porter` | 알고리즘을 최신 vLLM 코드베이스에 이식 |
-| 7. vLLM 평가 | `vllm-evaluator` | vLLM 환경에서 성능·정확성 검증 |
+| 6. vLLM 이식 | `vllm-porter` | Activity별 통합 포인트에 맞게 최신 vLLM에 이식 |
+| 7. vLLM 평가 | `vllm-evaluator` | vLLM 환경에서 Activity별 성능·정확성 검증 |
+| 8. 누적 요약 | `summarizer` | 전 사이클 결과를 `SUMMARY.md`에 누적, delta 저장 |
 
 ---
 
@@ -86,13 +88,14 @@ Every day, an autonomous multi-agent pipeline runs end-to-end:
 │
 ├── .claude/
 │   ├── agents/                  # 에이전트 정의
-│   │   ├── trend-sensor.md
-│   │   ├── idea-generator.md
-│   │   ├── planner.md
-│   │   ├── implementer.md
-│   │   ├── evaluator.md
-│   │   ├── vllm-porter.md       # vLLM 이식 에이전트
-│   │   └── vllm-evaluator.md    # vLLM 환경 평가 에이전트
+│   │   ├── trend-sensor.md      # 1단계: Activity A/B/C별 동향 수집
+│   │   ├── idea-generator.md    # 2단계: 아이디어 생성 + 변화 감지
+│   │   ├── planner.md           # 3단계: Spec.md 작성
+│   │   ├── implementer.md       # 4단계: 코드 구현
+│   │   ├── evaluator.md         # 5단계: 평가·피드백 루프 → Report ①
+│   │   ├── vllm-porter.md       # 6단계: vLLM 이식 (Activity별 통합 포인트)
+│   │   ├── vllm-evaluator.md    # 7단계: vLLM 환경 평가 → Report ②
+│   │   └── summarizer.md        # 8단계: 누적 성과 요약 갱신
 │   └── commands/
 │       ├── run-pipeline.md      # /run-pipeline
 │       ├── run-trend.md         # /run-trend
@@ -117,7 +120,10 @@ Every day, an autonomous multi-agent pipeline runs end-to-end:
 │   ├── trends/                  # 트렌드 리포트
 │   ├── ideas/                   # 아이디어 리포트
 │   ├── evaluations/             # 알고리즘 검증 리포트 (Report ①)
-│   └── vllm-evaluations/        # vLLM 환경 리포트 (Report ②)
+│   ├── vllm-evaluations/        # vLLM 환경 리포트 (Report ②)
+│   └── summary/                 # 누적 요약 (summarizer 생성)
+│       ├── SUMMARY.md           # 전 사이클 성과 추이 누적
+│       └── YYYY-MM-DD-delta.md  # 사이클별 변화 요약
 │
 ├── configs/                     # 실험 설정 YAML
 ├── data/                        # 프롬프트 데이터셋
@@ -135,6 +141,8 @@ Every day, an autonomous multi-agent pipeline runs end-to-end:
 |--------|------|------------|------|
 | ① 알고리즘 검증 | `reports/evaluations/YYYY-MM-DD.md` | `evaluator` | Cache Hit Rate, TTFT, TBT, 메모리, 코드 품질 |
 | ② vLLM 검증 | `reports/vllm-evaluations/YYYY-MM-DD.md` | `vllm-evaluator` | vLLM latest 기준 처리량, 지연, 호환성, 회귀 |
+| 누적 요약 | `reports/summary/SUMMARY.md` | `summarizer` | Activity별 성과 추이, 목표 지표 달성 현황, 인사이트 |
+| 사이클 델타 | `reports/summary/YYYY-MM-DD-delta.md` | `summarizer` | 해당 사이클의 변화 요약 및 다음 사이클 제언 |
 
 ---
 
