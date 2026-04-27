@@ -8,7 +8,7 @@
 
 Standard KV caches only reuse computation when prompt prefixes are **byte-identical**. This project researches and implements techniques that allow **non-contiguous** cache segments to be reused — so even prompts that share fragments at arbitrary positions can benefit from caching.
 
-Every day, an autonomous multi-agent pipeline (the **RALPH loop**) runs end-to-end:
+Every day, an autonomous multi-agent pipeline runs end-to-end:
 
 1. Scans the latest papers and open-source releases for new ideas
 2. Proposes novel algorithms based on what it finds
@@ -17,41 +17,39 @@ Every day, an autonomous multi-agent pipeline (the **RALPH loop**) runs end-to-e
 
 ---
 
-## The RALPH Loop
+## Daily Pipeline
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
 │  매일 KST 06:00                                                       │
 │                                                                       │
-│  R  Research   ─── trend-sensor      → reports/trends/               │
-│  A  Analyze    ─── idea-generator    → reports/ideas/                 │
+│  1. 트렌드 수집  ─── trend-sensor      → reports/trends/              │
+│  2. 아이디어    ─── idea-generator    → reports/ideas/                │
 │                    │                                                  │
 │                    └─ SIGNIFICANT_CHANGE: false → STOP               │
 │                                                                       │
-│  L  Launch     ─── planner           → Spec.md                       │
-│  P  Program    ─── implementer   ◄──────────────────────┐            │
-│  H  Heuristic  ─── evaluator     ──── feedback (×3 max) ┘            │
+│  3. 스펙 작성   ─── planner           → Spec.md                       │
+│  4. 구현        ─── implementer   ◄──────────────────────┐            │
+│  5. 평가        ─── evaluator     ──── feedback (×3 max) ┘            │
 │                    │                                                  │
-│                    └→ reports/evaluations/YYYY-MM-DD.md  (Report ①)  │
+│                    └→ Report ① (통과 여부 무관하게 저장 후 계속)        │
 │                                                                       │
-│       ↓ 평가 통과한 알고리즘                                           │
-│                                                                       │
-│     vLLM Port  ─── vllm-porter   → vllm_integration/                 │
-│     vLLM Eval  ─── vllm-evaluator ──── feedback (×3 max) ┐           │
-│                    │              ◄──── vllm-porter       ┘           │
-│                    └→ reports/vllm-evaluations/YYYY-MM-DD.md (Report ②)│
+│  6. vLLM 이식   ─── vllm-porter   → vllm_integration/                │
+│  7. vLLM 평가   ─── vllm-evaluator ─── feedback (×3 max) ┐           │
+│                    │               ◄─── vllm-porter       ┘           │
+│                    └→ Report ②                                        │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
 | 단계 | 에이전트 | 역할 |
 |------|---------|------|
-| Research | `trend-sensor` | arXiv·GitHub·블로그에서 KV 캐시 관련 동향 수집 |
-| Analyze | `idea-generator` | 트렌드 + 과거 아이디어 종합 → 새 아이디어 제안 |
-| Launch | `planner` | 아이디어 → 구체적인 `Spec.md` 작성 |
-| Program | `implementer` | `Spec.md` 기반 Python 구현 |
-| Heuristic | `evaluator` | `evaluation_criteria.md` 기준 평가·피드백 루프 |
-| vLLM Port | `vllm-porter` | 검증된 알고리즘을 최신 vLLM 코드베이스에 이식 |
-| vLLM Eval | `vllm-evaluator` | vLLM 환경에서 성능·정확성 검증 |
+| 1. 트렌드 수집 | `trend-sensor` | arXiv·GitHub·블로그에서 KV 캐시 관련 동향 수집 |
+| 2. 아이디어 생성 | `idea-generator` | 트렌드 + 과거 아이디어 종합 → 새 아이디어 제안 |
+| 3. 스펙 작성 | `planner` | 아이디어 → 구체적인 `Spec.md` 작성 |
+| 4. 구현 | `implementer` | `Spec.md` 기반 Python 구현 |
+| 5. 평가 | `evaluator` | `evaluation_criteria.md` 기준 평가·피드백 루프 |
+| 6. vLLM 이식 | `vllm-porter` | 알고리즘을 최신 vLLM 코드베이스에 이식 |
+| 7. vLLM 평가 | `vllm-evaluator` | vLLM 환경에서 성능·정확성 검증 |
 
 ---
 

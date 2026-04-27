@@ -8,34 +8,33 @@ LLM 추론 시 프롬프트 접두사가 완전히 일치하지 않아도 캐시
 
 ---
 
-## RALPH 루프 — 자율 연구 사이클
+## Daily Pipeline — 자율 연구 사이클
 
 하루 한 번 다음 7단계 멀티에이전트 파이프라인이 순서대로 실행된다.
-**2단계(Analyze)에서 아이디어 변화가 없으면 3~7단계는 건너뛴다.**
+**2단계에서 아이디어 변화가 없으면 3~7단계는 건너뛴다. 단, 3단계 이후는 평가 결과와 무관하게 끝까지 실행한다.**
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
 │  매일 KST 06:00                                                       │
 │                                                                       │
-│  R  1. Research   → 외부 기술 동향 수집 → reports/trends/             │
+│  1. 트렌드 수집   → reports/trends/                                   │
 │          │                                                            │
-│  A  2. Analyze    → 아이디어 생성 → reports/ideas/                    │
+│  2. 아이디어 생성  → reports/ideas/                                   │
 │          │                                                            │
 │          │  SIGNIFICANT_CHANGE: false → STOP                         │
 │          │  SIGNIFICANT_CHANGE: true  ↓                              │
-│  L  3. Launch     → Spec.md 생성                                      │
+│  3. 스펙 작성     → Spec.md                                           │
 │          │                                                            │
-│  P  4. Program  ◄──────────────────────────────────────┐             │
+│  4. 구현        ◄──────────────────────────────────────┐             │
 │          │                                              │ 최대 3회    │
-│  H  5. Heuristic  → 피드백 → 구현 반영 ─────────────────┘             │
+│  5. 평가         → 피드백 → 구현 반영 ─────────────────┘             │
 │          │                                                            │
 │          └→ Report ① reports/evaluations/YYYY-MM-DD.md               │
-│          │                                                            │
-│          ↓ 검증 통과 알고리즘                                          │
-│                                                                       │
-│     6. vLLM Port ◄─────────────────────────────────────┐             │
+│          │   (통과 여부와 무관하게 항상 저장 후 6단계 진행)             │
+│          ↓                                                            │
+│  6. vLLM 이식   ◄──────────────────────────────────────┐             │
 │          │                                              │ 최대 3회    │
-│     7. vLLM Eval  → 피드백 → 이식 수정 ─────────────────┘             │
+│  7. vLLM 평가    → 피드백 → 이식 수정 ─────────────────┘             │
 │          │                                                            │
 │          └→ Report ② reports/vllm-evaluations/YYYY-MM-DD.md          │
 └──────────────────────────────────────────────────────────────────────┘
@@ -45,13 +44,13 @@ LLM 추론 시 프롬프트 접두사가 완전히 일치하지 않아도 캐시
 
 | 단계 | 에이전트 파일 | 입력 | 출력 |
 |------|-------------|------|------|
-| 1. Research | `.claude/agents/trend-sensor.md` | 웹 검색 | `reports/trends/YYYY-MM-DD.md` |
-| 2. Analyze | `.claude/agents/idea-generator.md` | 트렌드 리포트 + 과거 아이디어 | `reports/ideas/YYYY-MM-DD.md` |
-| 3. Launch | `.claude/agents/planner.md` | 아이디어 리포트 | `Spec.md` |
-| 4. Program | `.claude/agents/implementer.md` | `Spec.md` + 평가 피드백 | `src/` 코드 변경 |
-| 5. Heuristic | `.claude/agents/evaluator.md` | 구현 결과 + `evaluation_criteria.md` | 피드백 or **Report ①** |
-| 6. vLLM Port | `.claude/agents/vllm-porter.md` | Report ① + `src/cache/` + vLLM latest | `vllm_integration/` |
-| 7. vLLM Eval | `.claude/agents/vllm-evaluator.md` | `vllm_integration/` + vLLM latest | 피드백 or **Report ②** |
+| 1. 트렌드 수집 | `.claude/agents/trend-sensor.md` | 웹 검색 | `reports/trends/YYYY-MM-DD.md` |
+| 2. 아이디어 생성 | `.claude/agents/idea-generator.md` | 트렌드 리포트 + 과거 아이디어 | `reports/ideas/YYYY-MM-DD.md` |
+| 3. 스펙 작성 | `.claude/agents/planner.md` | 아이디어 리포트 | `Spec.md` |
+| 4. 구현 | `.claude/agents/implementer.md` | `Spec.md` + 평가 피드백 | `src/` 코드 변경 |
+| 5. 평가 | `.claude/agents/evaluator.md` | 구현 결과 + `evaluation_criteria.md` | 피드백 or **Report ①** |
+| 6. vLLM 이식 | `.claude/agents/vllm-porter.md` | Report ① + `src/cache/` + vLLM latest | `vllm_integration/` |
+| 7. vLLM 평가 | `.claude/agents/vllm-evaluator.md` | `vllm_integration/` + vLLM latest | 피드백 or **Report ②** |
 
 ### 최종 산출물
 

@@ -1,6 +1,6 @@
 # /run-pipeline
 
-비연속 KV 캐시 재사용 연구의 전체 RALPH 루프를 실행한다.
+비연속 KV 캐시 재사용 연구의 전체 파이프라인을 실행한다.
 
 ## 실행 순서
 
@@ -8,7 +8,7 @@
 
 ---
 
-### 1단계 — Research (트렌드 수집)
+### 1단계 — 트렌드 수집
 
 `trend-sensor` 에이전트를 호출한다.
 
@@ -17,18 +17,18 @@
 
 ---
 
-### 2단계 — Analyze (아이디어 생성)
+### 2단계 — 아이디어 생성
 
 `idea-generator` 에이전트를 호출한다.
 
 - 출력: `reports/ideas/YYYY-MM-DD.md`
 - **SIGNIFICANT_CHANGE 확인**:
-  - `false` → "오늘은 새로운 아이디어 변화가 없습니다. 파이프라인을 중단합니다." 출력 후 종료
+  - `false` → 트렌드·아이디어 리포트만 커밋·push 후 종료
   - `true` → 3단계 진행
 
 ---
 
-### 3단계 — Launch (스펙 작성)
+### 3단계 — 스펙 작성
 
 `planner` 에이전트를 호출한다.
 
@@ -37,7 +37,7 @@
 
 ---
 
-### 4~5단계 — Program + Heuristic (구현 + 평가 루프, 최대 3회)
+### 4~5단계 — 구현 + 평가 루프 (최대 3회)
 
 ```
 루프 N (N = 1, 2, 3):
@@ -46,29 +46,32 @@
      → "IMPLEMENTATION_COMPLETE" 확인
   2. evaluator 에이전트 호출
      → N < 3이고 미충족 항목 있으면 → 피드백 획득, N+1 루프 진행
-     → N = 3이거나 모든 항목 충족 → "EVAL_REPORT_SAVED" 확인 후 루프 종료
+     → N = 3이거나 모든 항목 충족 → Report ① 저장 후 루프 종료
 ```
 
 - 출력 (Report ①): `reports/evaluations/YYYY-MM-DD.md`
+- **평가 결과(통과/미통과)와 무관하게 Report ①를 저장하고 반드시 6단계로 진행한다.**
 
 ---
 
-### 6~7단계 — vLLM Port + vLLM Eval (이식 + vLLM 평가 루프, 최대 3회)
+### 6~7단계 — vLLM 이식 + vLLM 평가 루프 (최대 3회)
 
-5단계에서 Report ① 이 저장된 경우에만 진행한다.
-(5단계가 3회 루프 후 전부 Fail로 종료된 경우도 이식을 시도한다.)
+5단계에서 Report ①이 저장되면 무조건 진행한다.
 
 ```
 루프 N (N = 1, 2, 3):
   1. vllm-porter 에이전트 호출
-     (N=1이면 Report ① 기반, N>1이면 vllm-evaluator 피드백 반영)
+     - 작업 시작 전 항상: pip install --upgrade vllm
+     - N=1이면 Report ① 및 src/cache/ 기반 이식
+     - N>1이면 vllm-evaluator 피드백 반영
      → "VLLM_PORT_COMPLETE" 확인
   2. vllm-evaluator 에이전트 호출
      → N < 3이고 미충족 항목 있으면 → 피드백 획득, N+1 루프 진행
-     → N = 3이거나 모든 항목 충족 → "VLLM_EVAL_REPORT_SAVED" 확인 후 루프 종료
+     → N = 3이거나 모든 항목 충족 → Report ② 저장 후 루프 종료
 ```
 
 - 출력 (Report ②): `reports/vllm-evaluations/YYYY-MM-DD.md`
+- **vLLM 평가 결과와 무관하게 Report ②를 저장하고 최종 커밋으로 진행한다.**
 
 ---
 
@@ -78,14 +81,14 @@
 
 ```bash
 git add reports/ Spec.md vllm_integration/ src/ tests/ configs/
-git commit -m "RALPH loop YYYY-MM-DD"
+git commit -m "Daily pipeline YYYY-MM-DD"
 git push origin main
 ```
 
 다음을 출력한다:
 
 ```
-RALPH 루프 완료 — YYYY-MM-DD
+파이프라인 완료 — YYYY-MM-DD
 트렌드 리포트:   reports/trends/YYYY-MM-DD.md
 아이디어 리포트: reports/ideas/YYYY-MM-DD.md
 스펙:           Spec.md
