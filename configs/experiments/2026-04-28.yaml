@@ -1,0 +1,29 @@
+experiment:
+  date: "2026-04-28"
+  activity: "B+C"
+  seed: 42
+
+cache:
+  type: "compressed_segment"
+  chunk_size: 128
+  max_entries: 1000
+  eviction_policy: "lru"
+
+compression:
+  method: "mixed_precision"
+  num_layers: 12
+  cutoff_ratio: 0.333
+  high_precision: "fp16"
+  low_precision: "int8"
+
+metrics:
+  measure_hit_rate: true
+  measure_memory: true
+  measure_latency: true
+  accuracy_tolerance: 0.01
+
+benchmark:
+  num_requests: 100
+  shared_prefix_ratio: 0.6
+  non_contiguous_ratio: 0.3
+  sequence_length: 512
