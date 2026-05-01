@@ -11,9 +11,32 @@ description: KV Cache 관련 3개 연구 활동(Scheduling, Non-Contiguous Reuse
 
 오늘 날짜 기준으로 최근 7일간 발표된 논문·블로그·구현체를 **3개 Activity로 구분하여** 검색하고,
 `reports/trends/YYYY-MM-DD.md` 파일을 생성한다.
+**이미 과거 트렌드 리포트에 등재된 항목은 제외하고, 새로 등장한 동향만 보고한다.**
 
 탐색 범위: arXiv, ACL/EMNLP/NeurIPS/ICML/ICLR/MLSys, GitHub, Hugging Face Blog,
 vLLM/SGLang/TensorRT-LLM 릴리즈 노트, tech blog (Lmsys, Together AI, Anyscale, DeepMind, Meta AI 등)
+
+---
+
+## 사전 단계 — 과거 리포트 인덱싱 (필수)
+
+검색을 시작하기 **전에** 반드시 다음을 수행한다.
+
+1. `reports/trends/` 디렉토리에 존재하는 모든 `YYYY-MM-DD.md` 파일을 나열한다.
+   - 디렉토리가 비어 있거나 존재하지 않으면 이 단계는 건너뛴다.
+2. 최신순으로 **최근 14개**(없으면 가능한 모두) 파일을 Read 도구로 읽는다.
+3. 각 리포트에서 다음을 추출하여 **중복 제거 인덱스**를 메모리에 만든다.
+   - 각 항목의 **제목 / URL / arXiv ID / GitHub repo (org/name) / 핵심 키워드**
+   - "동향 변화 감지" 표에 기록된 기법 이름
+4. 이 인덱스를 "이미 보고된 항목" 집합으로 사용한다.
+
+검색 결과를 리포트에 포함하기 전에 다음 중 하나라도 일치하면 **제외**한다.
+   - 동일 URL 또는 동일 arXiv ID (버전 차이 무시: `2401.12345v1` ≈ `2401.12345v2`)
+   - 동일 GitHub 저장소 (org/name 기준)
+   - 동일 논문 제목 (대소문자·구두점 무시)
+
+이미 보고된 항목이라도 **유의미한 후속 변화**(예: 새 버전 릴리즈, 벤치마크 업데이트, 통합 지원 추가)가 있으면
+"동향 변화 감지" 표의 "이번 주 변화" 칸에만 간단히 갱신 사항을 기록한다(새 항목 카드로는 만들지 않는다).
 
 ---
 
@@ -161,8 +184,14 @@ vLLM/SGLang/TensorRT-LLM 릴리즈 노트, tech blog (Lmsys, Together AI, Anysca
 
 ## 실행 규칙
 
-1. Activity A, B, C를 순서대로 각각 검색한다. 키워드당 최소 1회 WebSearch를 실행한다.
-2. 관련성 high/medium 항목만 리포트에 포함한다.
-3. 학회 논문(NeurIPS/ICML/ICLR/MLSys/ACL 등)은 반드시 탐색에 포함한다.
-4. 파일 저장 후 반드시 출력: `TREND_REPORT_SAVED: reports/trends/YYYY-MM-DD.md`
-5. `reports/trends/` 디렉토리가 없으면 생성한다.
+1. **검색 전에 반드시 위의 "사전 단계 — 과거 리포트 인덱싱"을 먼저 수행한다.**
+2. Activity A, B, C를 순서대로 각각 검색한다. 키워드당 최소 1회 WebSearch를 실행한다.
+3. 관련성 high/medium 항목만 리포트에 포함한다.
+4. 학회 논문(NeurIPS/ICML/ICLR/MLSys/ACL 등)은 반드시 탐색에 포함한다.
+5. **과거 리포트 인덱스와 중복되는 항목은 새 카드로 작성하지 않는다.** 후속 변화가 있을 때만 "동향 변화 감지" 표에 갱신.
+6. 리포트 말미에 `## 중복 제거 통계` 섹션을 추가하여 다음을 1~3줄로 기록한다.
+   - 검토한 과거 리포트 수
+   - 검색 결과 중 중복으로 제외된 항목 수
+   - 새로 추가된 항목 수 (Activity별)
+7. 파일 저장 후 반드시 출력: `TREND_REPORT_SAVED: reports/trends/YYYY-MM-DD.md`
+8. `reports/trends/` 디렉토리가 없으면 생성한다.
