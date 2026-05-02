@@ -278,9 +278,99 @@ kv = mgr.lookup_segment_with_adapter(token_ids, chunk_idx, layer_idx, is_noncont
 
 ---
 
+## 2026-05-02 Additions (B+C Cross-1: LeverageScore + SignVQ)
+
+### Activity C — VllmLeverageCompressor (`leverage_compressor_patch.py`)
+
+Port of `src/cache/leverage_compressor.LeverageScoreCompressor` adapted for
+vLLM's paged-block KV cache layout `[2, num_blocks, block_size, num_kv_heads, head_size]`.
+
+3-tier classification per block:
+- Tier-1 (top 20% by leverage score): FP16 full KV — exact round-trip
+- Tier-2 (middle 60%): 1-bit sign packed Key + FP16 Value
+- Tier-3 (bottom 20%): evicted (0 bytes)
+
+Memory reduction: ~74% vs FP32 baseline (verified in Report ①).
+
+```python
+from vllm_integration.leverage_compressor_patch import VllmLeverageCompressor
+
+comp = VllmLeverageCompressor(rank=32, tier1_ratio=0.20, tier3_ratio=0.20)
+storage = comp.encode_block(key_block, value_block, layer_idx=5, block_id=42)
+decoded = comp.decode_block(storage)   # (2, block_size, d_head)
+# Multi-head variant (vLLM shape: block_size × num_kv_heads × head_size):
+per_head = comp.encode_block_multihead(key_block, value_block, layer_idx=5)
+out      = comp.decode_block_multihead(per_head)  # (2, bs, H, head_size)
+```
+
+### Activity B+C — SignVQSegmentIndex + NonContiguousKVCacheManagerV2 (`sign_vq_block_manager_patch.py`)
+
+Port of `src/cache/sign_vq_segment.SignVQSegmentCache`.  Adds a 3-stage lookup
+index alongside vLLM's standard prefix cache:
+
+1. **exact_fp16**: SHA-256 content-only hash → FP16 KV (exact)
+2. **approx_sign**: XOR + popcount Hamming distance ≤ threshold → ±1 sign KV
+3. **miss**: normal prefill
+
+`NonContiguousKVCacheManagerV2` subclasses `KVCacheManager` and exposes:
+- `store_segment(token_ids, chunk_idx, keys, values, layer_idx)`
+- `lookup_segment(token_ids, chunk_idx, layer_idx, query_keys)`
+- `lookup_all_segments(token_ids, layer_idx, query_keys)`
+- `sign_index_stats()` → tier hit rate dict
+
+```python
+from vllm_integration.sign_vq_block_manager_patch import NonContiguousKVCacheManagerV2
+
+kv_manager = NonContiguousKVCacheManagerV2(
+    kv_cache_config=kv_cache_config,
+    max_model_len=max_model_len,
+    hash_block_size=block_size,
+    enable_caching=True,
+    sign_vq_chunk_size=16,
+    sign_vq_max_entries=2000,
+    sign_vq_hamming_threshold=0.15,
+    sign_vq_rank=32,
+)
+```
+
+### Activity C — CacheConfig Extension (`cache_config_extension.py`)
+
+`SignVQCacheParams` carries the new compression parameters without modifying
+vLLM's frozen `CacheConfig`:
+
+```python
+from vllm_integration.cache_config_extension import (
+    SignVQCacheParams, build_sign_vq_compressor, build_sign_vq_index,
+)
+
+params = SignVQCacheParams(
+    enable_sign_vq=True,
+    tier1_ratio=0.20,
+    tier2_ratio=0.60,
+    hamming_threshold=0.15,
+)
+compressor = build_sign_vq_compressor(params)
+index      = build_sign_vq_index(params)
+```
+
+---
+
+## Updated Performance Expectations (from Report ① 2026-05-02)
+
+| Metric | Standalone (121/121 tests) | vLLM port target |
+|--------|---------------------------|-----------------|
+| Throughput improvement | ≥ +10% (vs FP32 memory budget) | ≥ +10% |
+| Non-contiguous cache hit rate | ≥ 30% | ≥ 30% |
+| KV memory reduction | 74.1% vs FP32 | ≥ 30% (goal −70%) |
+| Compression accuracy (KL) | < 0.015 (PRIMARY) | ≤ 0.015 |
+| Integration perplexity proxy | cosine ≥ 0.84 | ≥ 0.84 |
+| Scheduling overhead (TTFT) | ≤ 5% | ≤ 5% |
+
+---
+
 ## Latest Cycle
 
-- Date: 2026-04-30
+- Date: 2026-05-02
 - Loop: 1 / 3
-- Activity: A+B+C (multinode + tri-state + adapter)
-- Report ①: `reports/evaluations/2026-04-30.md`
+- Activity: B+C (LeverageScoreCompressor + SignVQSegmentCache)
+- Report ①: `reports/evaluations/2026-05-02.md`

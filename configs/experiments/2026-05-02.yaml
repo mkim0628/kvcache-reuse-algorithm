@@ -1,0 +1,42 @@
+experiment: "2026-05-02-bc-sign-vq-leverage"
+date: "2026-05-02"
+activities: [B, C]
+
+cache:
+  type: SignVQSegmentCache
+  chunk_size: 128
+  max_entries: 1000
+  hamming_threshold: 0.15      # hamming distance / d_head threshold (0.0–0.5)
+
+compressor:
+  type: LeverageScoreCompressor
+  rank: 32                     # rank-k approximation (k=32 → O(N*32*d))
+  reg_lambda: 0.001            # regularisation term λ
+  tier1_ratio: 0.20            # top 20% → FP16 preserved
+  tier3_ratio: 0.20            # bottom 20% → evict (middle 60% → 1-bit sign VQ)
+
+scheduler:
+  type: default                # Activity A not included — default scheduler
+
+metrics:
+  target_throughput_gain: 0.20          # +20% tokens/sec
+  target_memory_reduction: 0.70         # -70% KV memory
+  target_noncontiguous_hit_rate: 0.30   # ≥30% of hits from non-contiguous segments
+  max_perplexity_delta_pct: 1.0         # ±1% perplexity
+  max_task_accuracy_delta_pct: 1.0      # ±1% task accuracy
+  min_tier2_cosine_similarity: 0.50     # Tier-2 cosine similarity lower bound
+  hamming_threshold: 0.15               # approx hit threshold
+
+accuracy_benchmarks:
+  - name: wikitext2
+    metric: perplexity
+    tolerance: 0.01
+  - name: longbench_qa
+    metric: rouge_l
+    tolerance: 0.01
+  - name: longbench_summarization
+    metric: rouge_1
+    tolerance: 0.01
+  - name: longbench_fewshot
+    metric: exact_match
+    tolerance: 0.01
