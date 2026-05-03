@@ -11,6 +11,34 @@ import torch
 import torch.nn.functional as F
 
 
+def _packbits(bits: torch.Tensor) -> torch.Tensor:
+    """Pack a (n, d) uint8 tensor of 0/1 values into (n, ceil(d/8)) uint8 bytes.
+
+    Replacement for torch.packbits which is unavailable in some PyTorch builds.
+    """
+    n, d = bits.shape
+    padded_d = math.ceil(d / 8) * 8
+    if padded_d > d:
+        bits = torch.cat([bits, bits.new_zeros(n, padded_d - d)], dim=-1)
+    # Reshape to (n, ceil(d/8), 8) and pack each group of 8 bits into one byte
+    bits_r = bits.view(n, padded_d // 8, 8).long()
+    weights = bits.new_tensor([128, 64, 32, 16, 8, 4, 2, 1], dtype=torch.long)
+    packed = (bits_r * weights).sum(dim=-1).to(torch.uint8)
+    return packed
+
+
+def _unpackbits(packed: torch.Tensor) -> torch.Tensor:
+    """Unpack a (n, k) uint8 tensor into (n, k*8) uint8 tensor of 0/1 values.
+
+    Replacement for torch.unpackbits which is unavailable in some PyTorch builds.
+    """
+    n, k = packed.shape
+    weights = packed.new_tensor([128, 64, 32, 16, 8, 4, 2, 1], dtype=torch.uint8)
+    # (n, k, 8) → (n, k*8)
+    unpacked = ((packed.unsqueeze(-1) & weights) > 0).to(torch.uint8)
+    return unpacked.view(n, k * 8)
+
+
 class TurboQuantCodec:
     """Training-free KV cache codec combining PolarQuant rotation and QJL residual correction.
 
@@ -95,19 +123,22 @@ class TurboQuantCodec:
         scale = kv_rotated.abs().max(dim=-1, keepdim=True)[0].clamp(min=1e-8) / ((levels - 1) / 2)
         quantized = (kv_rotated / scale).round().clamp(-(levels // 2), (levels // 2) - 1).to(torch.int8)
 
-        # QJL residual correction: store sign of JL-projected residual
+        # QJL residual correction: store sign of JL-projected residual + per-row residual norm
         kv_dequant = quantized.float() * scale
         residual = kv_rotated - kv_dequant
         proj_dim = d_head
         P = self._get_qjl_matrix(layer_idx, d_head, proj_dim)
         proj = residual @ P.T
         qjl_bits_tensor = (proj >= 0).to(torch.uint8)
-        qjl_packed = torch.packbits(qjl_bits_tensor, dim=-1)
+        qjl_packed = _packbits(qjl_bits_tensor)
+        # Residual L2 norm per row: enables magnitude-correct reconstruction at decode time
+        qjl_residual_norm = residual.norm(dim=-1, keepdim=True)  # (n_tokens, 1) float32
 
         return {
             "quantized": quantized,
             "scale": scale,
             "qjl_packed": qjl_packed,
+            "qjl_residual_norm": qjl_residual_norm,
             "layer_idx": layer_idx,
             "tensor_id": tensor_id,
             "d_head": d_head,
@@ -142,10 +173,14 @@ class TurboQuantCodec:
         kv_dequant = compressed["quantized"].float() * compressed["scale"]
 
         # Unpack QJL sign bits and reconstruct residual approximation
-        qjl_unpacked = torch.unpackbits(compressed["qjl_packed"], dim=-1)[:, :proj_dim]
+        qjl_unpacked = _unpackbits(compressed["qjl_packed"])[:, :proj_dim]
         qjl_signs = 2.0 * qjl_unpacked.float() - 1.0
-        # JL approximate inverse: signs @ P projects back to original space
-        residual_approx = qjl_signs @ P
+        # JL direction approximation: signs @ P gives residual direction in original space
+        residual_dir = qjl_signs @ P  # (n, d_head)
+        # Scale by stored residual norm / reconstructed direction norm for magnitude accuracy
+        dir_norm = residual_dir.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        res_norm = compressed.get("qjl_residual_norm", dir_norm)
+        residual_approx = residual_dir / dir_norm * res_norm
         kv_corrected = kv_dequant + residual_approx
 
         # Inverse rotation: R is orthogonal so R^{-1} = R^T, thus (kv @ R^T)^{-1} = kv @ R
@@ -165,7 +200,8 @@ class TurboQuantCodec:
         quantized_bytes = n_tokens * d_head * 1  # int8, one byte per element
         scale_bytes = n_tokens * 4  # float32 per-row scale
         qjl_bytes = n_tokens * math.ceil(d_head / 8)  # 1-bit packed per proj_dim element
-        total = quantized_bytes + scale_bytes + qjl_bytes
+        qjl_norm_bytes = n_tokens * 4  # float32 per-row residual norm for magnitude correction
+        total = quantized_bytes + scale_bytes + qjl_bytes + qjl_norm_bytes
         baseline = n_tokens * d_head * 4  # FP32 baseline
         return {
             "total_bytes": total,
