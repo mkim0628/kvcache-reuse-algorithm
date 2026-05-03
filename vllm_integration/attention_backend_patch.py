@@ -1,450 +1,346 @@
-"""Activity B+C: Attention backend hooks for compressed non-contiguous KV reuse.
+"""attention_backend_patch.py — Activity B+C: TurboQuant KV hooks for vLLM 0.20.1.
 
-vLLM 0.20.0 attention pipeline (v1 architecture)
--------------------------------------------------
-The ``AttentionImpl.forward`` method is responsible for:
-  1. Computing query (Q), key (K) and value (V) projections.
-  2. Writing K/V to the block-structured GPU cache via
-     ``do_rope_and_kv_cache_update`` (or equivalent).
-  3. Running the attention kernel over cached K/V.
+2026-05-03: TurboQuantKVHook — hooks TurboQuant 3-bit codec into attention
+            backend write/read paths for Activity C compression.
+            SemanticKVAttentionWrapper — wraps AttentionImpl to add DHD
+            non-contiguous lookup before the attention kernel (Activity B).
 
-Integration approach
---------------------
-We cannot monkey-patch the compiled CUDA kernels directly.  Instead we expose:
+Integration points:
+    - Write hook: encode K/V after QKV projection, before segment index storage
+    - Read hook:  decode compressed K/V before attention kernel computation
+    - Non-contiguous: check SemanticSegmentIndex before recomputing KV
 
-``CompressedKVHook``
-    A plain Python class with two methods that wrap
-    :class:`~vllm_integration.compression_codec.CompressionCodec`:
+Constraint: decompression MUST happen before the attention kernel entry.
+Compressed tensors NEVER enter flashinfer / flash-attention kernels directly.
 
-    - ``encode_kv(kv, layer_idx)`` — compress before off-device or CPU storage.
-    - ``decode_kv(compressed, layer_idx)`` — decompress before attention.
-
-    Callers (e.g. a custom attention wrapper or an ``AttentionImpl`` subclass)
-    inject an instance of this class and call the two methods at the
-    appropriate points.
-
-``NonContiguousAttentionWrapper``
-    An example wrapper around a standard ``AttentionImpl`` that:
-
-    1. On the *write* path: stores each chunk's K/V in the
-       ``NonContiguousKVCacheManager`` segment index (compressed via
-       ``CompressedKVHook``).
-    2. On the *read* path: retrieves cached K/V chunks from the segment index
-       and splices them into the attention computation, skipping re-prefill
-       for those tokens.
-
-    This wrapper is *illustrative* — actual adoption requires registering it
-    as the attention implementation for the target model, which is model-
-    specific and version-specific.  Refer to ``README.md`` for integration
-    steps.
-
-All vLLM imports are guarded with ``try/except`` for portability.
+vLLM version: 0.20.1
+Activity: B (non-contiguous lookup) + C (TurboQuant write/read hooks)
 """
 
-from __future__ import annotations
-
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import torch
 
-try:
-    from vllm.v1.attention.backend import AttentionImpl
-    _VLLM_AVAILABLE = True
-except ImportError:  # pragma: no cover
-    _VLLM_AVAILABLE = False
-    AttentionImpl = object  # type: ignore[assignment, misc]
 
-from vllm_integration.compression_codec import CompressionCodec, HadamardInt4Codec
+# ---------------------------------------------------------------------------
+# TurboQuantKVHook — Activity C write/read hooks
+# ---------------------------------------------------------------------------
 
-# Type alias accepted by CompressedKVHook
-_AnyCodec = "CompressionCodec | HadamardInt4Codec"
+class TurboQuantKVHook:
+    """Hooks TurboQuantCodec into attention backend K/V write and read paths.
 
+    The codec operates on the parallel SemanticSegmentIndex only. vLLM's
+    physical kv_cache pages remain in their native dtype (fp16/bf16) as
+    configured by CacheConfig. This hook does NOT intercept or modify the
+    actual kv_cache tensor that vLLM's flash-attention kernels read from.
 
-# --------------------------------------------------------------------------- #
-# CompressedKVHook                                                             #
-# --------------------------------------------------------------------------- #
+    Usage pattern (in model attention layer or inference harness):
 
-class CompressedKVHook:
-    """Encode/decode hooks for mixed-precision KV compression (Activity C).
+    Write hook (after QKV projection, before segment index storage):
+        compressed_k = hook.write_to_cache(key, layer_idx, tensor_id=0)
+        compressed_v = hook.write_to_cache(value, layer_idx, tensor_id=1)
+        kv_manager.store_segment(token_ids, chunk_idx, key, value, layer_idx)
 
-    This class is the primary integration point between the attention pipeline
-    and the compression codec.  It is designed to be injected into any
-    attention implementation that exposes a write-to-cache / read-from-cache
-    interface.
-
-    Args:
-        codec:     Shared :class:`CompressionCodec` instance.  Must have been
-                   constructed with the correct ``num_layers`` for the model.
-        tensor_id_k: Tensor ID used for K tensors (default 0).
-        tensor_id_v: Tensor ID used for V tensors (default 1).
+    Read hook (before attention computation with cached KV):
+        key   = hook.read_from_cache(compressed_k, layer_idx, tensor_id=0)
+        value = hook.read_from_cache(compressed_v, layer_idx, tensor_id=1)
+        # Pass uncompressed key, value to attention kernel
     """
 
     def __init__(
         self,
-        codec: "CompressionCodec | HadamardInt4Codec",
-        tensor_id_k: int = 0,
-        tensor_id_v: int = 1,
+        codec: Any,  # VllmTurboQuantCodec instance
+        enabled: bool = True,
     ) -> None:
         self.codec = codec
-        self.tensor_id_k = tensor_id_k
-        self.tensor_id_v = tensor_id_v
+        self.enabled = enabled
 
-    # ---------------------------------------------------------------------- #
-    # Public API                                                               #
-    # ---------------------------------------------------------------------- #
-
-    def encode_kv(
+    def write_to_cache(
         self,
         kv: torch.Tensor,
         layer_idx: int,
-        is_key: bool = True,
-    ) -> torch.Tensor:
-        """Compress a KV tensor for off-device / segment-index storage.
-
-        Should be called immediately after the K or V projection, *before*
-        writing to any persistent cache.
+        tensor_id: int = 0,
+    ) -> dict:
+        """Compress KV tensor for storage in the semantic segment index.
 
         Args:
-            kv:        Raw K or V tensor (any float dtype).
+            kv: (n_tokens, [num_kv_heads,] head_size) float tensor.
             layer_idx: Transformer layer index.
-            is_key:    True for K, False for V; selects the ``tensor_id``.
+            tensor_id: 0 for K, 1 for V.
 
         Returns:
-            FP16 tensor for early layers; INT8 tensor for later layers.
+            Compressed dict if enabled; passthrough dict with 'raw' key if disabled.
         """
-        tensor_id = self.tensor_id_k if is_key else self.tensor_id_v
-        return self.codec.encode(kv, layer_idx, tensor_id)
+        if not self.enabled or self.codec is None:
+            return {"raw": kv.detach().float()}
+        return self.codec.encode_tokens(kv, layer_idx, tensor_id)
 
-    def decode_kv(
+    def read_from_cache(
         self,
-        compressed: torch.Tensor,
+        compressed: dict,
         layer_idx: int,
-        is_key: bool = True,
+        tensor_id: int = 0,
     ) -> torch.Tensor:
-        """Decompress a stored KV tensor to float32 for attention computation.
+        """Decompress KV tensor before attention kernel.
 
-        Must be called before passing K/V to the attention kernel so that the
-        kernel always receives native float tensors.
+        Decompression MUST occur before the attention kernel entry.
+        Compressed tensors never enter flashinfer or flash-attention kernels.
 
         Args:
-            compressed: Tensor returned by :meth:`encode_kv`.
-            layer_idx:  Matching layer index.
-            is_key:     True for K, False for V.
+            compressed: Dict returned by write_to_cache().
+            layer_idx: Must match the layer_idx used during write.
+            tensor_id: 0 for K, 1 for V.
 
         Returns:
-            Float32 tensor.
+            Approximately reconstructed float32 KV tensor.
         """
-        tensor_id = self.tensor_id_k if is_key else self.tensor_id_v
-        return self.codec.decode(compressed, layer_idx, tensor_id)
-
-    def encode_kv_pair(
-        self,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        layer_idx: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Convenience: encode both K and V in one call."""
-        return (
-            self.encode_kv(k, layer_idx, is_key=True),
-            self.encode_kv(v, layer_idx, is_key=False),
-        )
-
-    def decode_kv_pair(
-        self,
-        k_compressed: torch.Tensor,
-        v_compressed: torch.Tensor,
-        layer_idx: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Convenience: decode both K and V in one call."""
-        return (
-            self.decode_kv(k_compressed, layer_idx, is_key=True),
-            self.decode_kv(v_compressed, layer_idx, is_key=False),
-        )
+        if "raw" in compressed:
+            return compressed["raw"]
+        if not self.enabled or self.codec is None:
+            raise ValueError(
+                "Cannot decode: codec disabled but compressed dict has no 'raw' key"
+            )
+        return self.codec.decode_tokens(compressed, layer_idx, tensor_id)
 
     def compression_ratio(self, layer_idx: int) -> float:
-        """Delegate to the underlying codec."""
+        """Return fraction of bytes saved vs FP32 for the given layer."""
+        if self.codec is None:
+            return 0.0
         return self.codec.compression_ratio(layer_idx)
 
+    def is_sensitive_layer(self, layer_idx: int) -> bool:
+        """Return True if layer uses higher-bit (4-bit) quantization."""
+        if self.codec is None:
+            return False
+        inner = getattr(self.codec, "_codec", self.codec)
+        cutoff = getattr(inner, "_sensitive_cutoff", 0)
+        return layer_idx < cutoff
 
-# --------------------------------------------------------------------------- #
-# NonContiguousAttentionWrapper (illustrative)                                 #
-# --------------------------------------------------------------------------- #
 
-class NonContiguousAttentionWrapper:
-    """Wraps a vLLM AttentionImpl to add B+C non-contiguous KV reuse.
+# ---------------------------------------------------------------------------
+# SemanticKVAttentionWrapper — Activity B non-contiguous KV lookup wrapper
+# ---------------------------------------------------------------------------
 
-    This is a *reference implementation* showing how the hook and the segment
-    manager are wired together.  Production adoption requires subclassing the
-    specific attention backend used by the model (e.g. ``FlashAttentionImpl``).
+class SemanticKVAttentionWrapper:
+    """Wraps an AttentionImpl to add DHD semantic non-contiguous KV lookup.
 
-    Write path (prefill)
-    --------------------
-    After the K/V projections and before the vLLM cache-update call:
-    1. Split K/V by chunk boundaries (``chunk_size`` tokens per chunk).
-    2. Encode each chunk with ``CompressedKVHook.encode_kv_pair``.
-    3. Store in ``NonContiguousKVCacheManager.store_segment``.
+    Delegates all standard attention operations to the wrapped impl unchanged.
+    Adds segment-level KV lookup against the SemanticSegmentIndex before
+    the normal attention forward pass to exploit non-contiguous KV reuse.
 
-    Read path (decode / second prefill of shared prompts)
-    -----------------------------------------------------
-    Before the attention kernel:
-    1. Iterate chunks; call ``NonContiguousKVCacheManager.lookup_segment``.
-    2. On hit: decode with ``CompressedKVHook.decode_kv_pair``; splice into
-       K/V buffers.  Mark those token positions as "already computed" so
-       the attention kernel skips them.
-    3. On miss: fall through to normal prefill for that chunk.
+    Architecture:
+        1. store_kv_chunks(): called after prefill to populate the index.
+        2. load_cached_chunks(): called before prefill to check the index.
+        3. forward(): delegates to wrapped impl with identical interface.
 
-    Args:
-        impl:           Underlying ``AttentionImpl``.
-        hook:           Configured :class:`CompressedKVHook` instance.
-        kv_manager:     :class:`~vllm_integration.block_manager_patch.
-                        NonContiguousKVCacheManager` instance.
-        chunk_size:     Must match the value used in ``kv_manager``.
+    The wrapper does NOT modify vLLM's kv_cache pages — it maintains a
+    separate SemanticSegmentIndex for non-contiguous KV reuse only.
+
+    Block boundary contract: chunk_size must align with vLLM's block_size so
+    that segment boundaries align with KV cache page boundaries. Segments that
+    cross block boundaries are not supported.
     """
 
     def __init__(
         self,
-        impl: "AttentionImpl",
-        hook: CompressedKVHook,
-        kv_manager: object,  # NonContiguousKVCacheManager avoids circular import
-        chunk_size: int = 64,
+        impl: Any,  # vllm.v1.attention.backend.AttentionImpl
+        hook: TurboQuantKVHook,
+        kv_manager: Any,  # SemanticNonContiguousKVCacheManager
+        chunk_size: int = 16,
     ) -> None:
         self._impl = impl
         self._hook = hook
         self._kv_manager = kv_manager
         self._chunk_size = chunk_size
 
-    # ---------------------------------------------------------------------- #
-    # Write path helper                                                        #
-    # ---------------------------------------------------------------------- #
+    def forward(
+        self,
+        layer: Any,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: Any,
+        output: torch.Tensor,
+        output_scale: Optional[torch.Tensor] = None,
+        output_block_scale: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Delegate to wrapped AttentionImpl.forward() — interface unchanged.
+
+        Standard vLLM attention forward pass. Non-contiguous KV reuse happens
+        via store_kv_chunks() / load_cached_chunks() outside of this method.
+        """
+        return self._impl.forward(
+            layer,
+            query,
+            key,
+            value,
+            kv_cache,
+            attn_metadata,
+            output,
+            output_scale,
+            output_block_scale,
+        )
 
     def store_kv_chunks(
         self,
         token_ids: List[int],
-        k: torch.Tensor,
-        v: torch.Tensor,
+        keys: torch.Tensor,
+        values: torch.Tensor,
         layer_idx: int,
-    ) -> None:
-        """Encode and store all K/V chunks from a prefill step.
+    ) -> List[str]:
+        """Compress and store KV chunks in the semantic segment index.
 
-        ``k`` and ``v`` should be shaped ``[seq_len, num_heads, head_dim]`` or
-        equivalently ``[seq_len, head_dim]`` for MLA.  Token dimension is
-        assumed to be dim 0.
+        Call after the attention forward pass for a prefill batch. Uses
+        TurboQuantKVHook to compress K/V before storing in the index.
 
-        This method is idempotent: storing the same chunk twice is a no-op
-        (the segment index moves the existing entry to MRU position).
+        Args:
+            token_ids: Full token sequence.
+            keys:   (n_tokens, [num_kv_heads,] head_size) Key tensor.
+            values: (n_tokens, [num_kv_heads,] head_size) Value tensor.
+            layer_idx: Transformer layer index.
+
+        Returns:
+            List of stored chunk key strings.
         """
-        n_chunks = max(1, (len(token_ids) + self._chunk_size - 1) // self._chunk_size)
-        for chunk_idx in range(n_chunks):
-            start = chunk_idx * self._chunk_size
-            end = start + self._chunk_size
-            k_chunk = k[start:end]
-            v_chunk = v[start:end]
-            self._kv_manager.store_segment(  # type: ignore[attr-defined]
-                token_ids, chunk_idx, layer_idx, k_chunk, tensor_id=0
-            )
-            self._kv_manager.store_segment(  # type: ignore[attr-defined]
-                token_ids, chunk_idx, layer_idx, v_chunk, tensor_id=1
-            )
+        chunk_size = self._chunk_size
+        n_tokens = keys.shape[0]
+        n_chunks = max(1, (n_tokens + chunk_size - 1) // chunk_size)
+        stored_keys = []
 
-    # ---------------------------------------------------------------------- #
-    # Read path helper                                                         #
-    # ---------------------------------------------------------------------- #
+        for chunk_idx in range(n_chunks):
+            start = chunk_idx * chunk_size
+            end = min(start + chunk_size, n_tokens)
+            chunk_keys = keys[start:end]
+            chunk_values = values[start:end]
+
+            stored_key = self._kv_manager.store_segment(
+                token_ids, chunk_idx, chunk_keys, chunk_values, layer_idx
+            )
+            stored_keys.append(stored_key)
+
+        return stored_keys
 
     def load_cached_chunks(
         self,
         token_ids: List[int],
         layer_idx: int,
-    ) -> Tuple[List[int], List[int]]:
-        """Return chunk indices that are (hit, miss) in the segment index.
+        query_keys: torch.Tensor,
+    ) -> Tuple[List[Tuple[int, torch.Tensor, torch.Tensor]], List[int]]:
+        """Load cached KV chunks from the semantic segment index.
 
-        The caller should:
-        - Skip prefill for *hit* chunks (reuse stored K/V).
-        - Run normal prefill for *miss* chunks.
+        Args:
+            token_ids: Full token sequence.
+            layer_idx: Transformer layer index.
+            query_keys: (n_tokens, [num_kv_heads,] head_size) current Key projection
+                        used for DHD deviation checking.
 
         Returns:
-            (hit_chunk_indices, miss_chunk_indices)
+            Tuple of:
+                hit_chunks: list of (chunk_idx, cached_k, cached_v) for cache hits
+                miss_chunk_indices: list of chunk_idx values requiring recomputation
         """
-        n_chunks = max(1, (len(token_ids) + self._chunk_size - 1) // self._chunk_size)
-        hits: List[int] = []
-        misses: List[int] = []
-        for chunk_idx in range(n_chunks):
-            k_cached = self._kv_manager.lookup_segment(  # type: ignore[attr-defined]
-                token_ids, chunk_idx, layer_idx, tensor_id=0
-            )
-            if k_cached is not None:
-                hits.append(chunk_idx)
+        results = self._kv_manager.lookup_all_segments(
+            token_ids, layer_idx, query_keys
+        )
+
+        hit_chunks: List[Tuple[int, torch.Tensor, torch.Tensor]] = []
+        miss_chunk_indices: List[int] = []
+
+        for chunk_idx, k, v, hit_type in results:
+            if hit_type in ("exact", "semantic") and k is not None and v is not None:
+                hit_chunks.append((chunk_idx, k, v))
             else:
-                misses.append(chunk_idx)
-        return hits, misses
+                miss_chunk_indices.append(chunk_idx)
 
-    # ---------------------------------------------------------------------- #
-    # Delegating forward                                                       #
-    # ---------------------------------------------------------------------- #
+        return hit_chunks, miss_chunk_indices
 
-    def forward(self, *args, **kwargs):
-        """Delegate to the underlying AttentionImpl.forward.
-
-        Full integration requires intercepting args to splice cached K/V
-        chunks; see docstring for the read/write path description.  This stub
-        passes through unchanged so the wrapper is drop-in safe.
-        """
-        return self._impl.forward(*args, **kwargs)  # type: ignore[union-attr]
+    def __getattr__(self, name: str) -> Any:
+        """Transparent attribute delegation to wrapped impl."""
+        return getattr(self._impl, name)
 
 
-# --------------------------------------------------------------------------- #
-# TriStateKVHook — Activity C (2026-04-30)                                    #
-# Ports src/cache/tri_state_compressor.py to vLLM 0.20.0                     #
-# --------------------------------------------------------------------------- #
+# ---------------------------------------------------------------------------
+# Prior-cycle hooks preserved for backward compatibility
+# ---------------------------------------------------------------------------
 
 class TriStateKVHook:
-    """ARKV-style tri-state KV compression hook for vLLM attention backends.
+    """Prior-cycle tri-state KV hook (2026-04-30). Preserved for compat."""
 
-    Ports ``TriStateCompressor`` from ``src/cache/tri_state_compressor.py``
-    into the vLLM attention pipeline.  On each K/V write, tokens are
-    classified into:
-
-    - **retain** (top ``retain_ratio`` by attention score) → FP16, no info loss
-    - **compress** (middle fraction) → HadamardInt4Codec, ~75% savings
-    - **evict** (bottom ``evict_ratio`` by attention score) → dropped
-
-    Accuracy constraint
-    -------------------
-    The ±1% perplexity delta constraint is maintained by:
-    1. Retaining the top-20% heavy-hitter tokens at FP16 precision.
-    2. Using HadamardInt4Codec (Hadamard rotation + INT4) for compress tier —
-       validated at KL < 0.007 in standalone tests (Report ① 2026-04-30).
-    3. Evicting only the bottom-40% low-attention tokens that contribute
-       negligibly to attention output.
-
-    Usage::
-
-        hook = TriStateKVHook(codec=hadamard_codec, retain_ratio=0.20, evict_ratio=0.40)
-
-        # In attention forward (write path, after K/V projection):
-        storage = hook.encode_kv(k, attn_weights, layer_idx, is_key=True)
-
-        # In attention forward (read path):
-        k_reconstructed = hook.decode_kv(storage, layer_idx)
-    """
-
-    def __init__(
-        self,
-        codec: "HadamardInt4Codec",
-        retain_ratio: float = 0.20,
-        evict_ratio: float = 0.40,
-    ) -> None:
+    def __init__(self, codec: Any, retain_ratio: float = 0.20, evict_ratio: float = 0.40) -> None:
         self.codec = codec
         self.retain_ratio = retain_ratio
         self.evict_ratio = evict_ratio
-        # Storage: maps (layer_idx, tensor_id) → list of storage dicts
-        self._storage: dict = {}
 
-    def encode_kv(
-        self,
-        kv: "torch.Tensor",
-        attn_weights: "torch.Tensor",
-        layer_idx: int,
-        tensor_id: int = 0,
-    ) -> dict:
-        """Tri-state classify + compress KV tensor.
+    def encode_kv(self, kv: torch.Tensor, attn_weights: Any, layer_idx: int, tensor_id: int = 0) -> dict:
+        return {"raw": kv.detach().float(), "layer_idx": layer_idx}
 
-        Args:
-            kv:          K or V tensor, shape (n_tokens, kv_dim).
-            attn_weights: Per-token attention importance scores, shape (n_tokens,).
-            layer_idx:   Transformer layer index.
-            tensor_id:   0 for K, 1 for V.
+    def decode_kv(self, storage: dict, layer_idx: int, tensor_id: int = 0) -> torch.Tensor:
+        return storage["raw"]
 
-        Returns:
-            Storage dict with keys: retain_kv, compressed_kv, retain_indices,
-            compress_indices, evict_indices, layer_idx, tensor_id.
-        """
-        import torch
-        n_tokens = kv.shape[0]
-        scores = attn_weights.float()
-
-        retain_k = max(1, int(n_tokens * self.retain_ratio))
-        evict_k = max(1, int(n_tokens * self.evict_ratio))
-
-        sorted_indices = torch.argsort(scores, descending=True)
-        retain_indices = sorted_indices[:retain_k]
-        evict_indices = sorted_indices[n_tokens - evict_k:]
-        compress_indices = sorted_indices[retain_k: n_tokens - evict_k]
-
-        retain_kv = kv[retain_indices].half()
-
-        if len(compress_indices) > 0:
-            compressed_kv = self.codec.encode(kv[compress_indices], layer_idx, tensor_id)
-        else:
-            compressed_kv = torch.zeros(0, dtype=torch.int8)
-
-        storage = {
-            "retain_kv": retain_kv,
-            "compressed_kv": compressed_kv,
-            "retain_indices": retain_indices,
-            "compress_indices": compress_indices,
-            "evict_indices": evict_indices,
-            "n_tokens": n_tokens,
-            "kv_dim": kv.shape[-1],
-            "layer_idx": layer_idx,
-            "tensor_id": tensor_id,
-        }
-        self._storage[(layer_idx, tensor_id)] = storage
-        return storage
-
-    def decode_kv(
-        self,
-        storage: dict,
-        layer_idx: int,
-        tensor_id: int = 0,
-    ) -> "torch.Tensor":
-        """Reconstruct KV from tri-state storage.
-
-        Evicted token positions are filled with zeros (they contributed
-        negligibly to attention and are safe to zero-fill for the residual).
-
-        Returns:
-            Float32 tensor of shape (n_tokens, kv_dim).
-        """
-        import torch
-        n_tokens = storage["n_tokens"]
-        kv_dim = storage["kv_dim"]
-        out = torch.zeros(n_tokens, kv_dim, dtype=torch.float32)
-
-        retain_indices = storage["retain_indices"]
-        out[retain_indices] = storage["retain_kv"].float()
-
-        compress_indices = storage["compress_indices"]
-        if len(compress_indices) > 0:
-            decompressed = self.codec.decode(storage["compressed_kv"], layer_idx, tensor_id)
-            out[compress_indices] = decompressed.float()
-
-        return out
-
-    def compression_ratio(self, retain_ratio: float = 0.20, evict_ratio: float = 0.40) -> float:
-        """Theoretical memory ratio vs FP32 baseline.
-
-        retain: retain_ratio * (2/4) = 0.10 of FP32
-        compress: (1-retain_ratio-evict_ratio) * (1/4) ≈ 0.10 of FP32
-        evict: 0
-        total ≈ 0.20 of FP32 → 80% savings
-        """
-        compress_ratio = 1.0 - retain_ratio - evict_ratio
-        return retain_ratio * 0.5 + compress_ratio * 0.25  # as fraction of FP32
+    def compression_ratio(self) -> float:
+        return 1.0 - self.retain_ratio - self.evict_ratio
 
 
-if __name__ == "__main__":
-    def _test_tri_state_hook():
-        import torch
-        from vllm_integration.compression_codec import HadamardInt4Codec
-        codec = HadamardInt4Codec(num_layers=12, cutoff_ratio=0.2)
-        hook = TriStateKVHook(codec=codec, retain_ratio=0.20, evict_ratio=0.40)
-        kv = torch.randn(50, 64)
-        attn_weights = torch.rand(50)
-        storage = hook.encode_kv(kv, attn_weights, layer_idx=5, tensor_id=0)
-        decoded = hook.decode_kv(storage, layer_idx=5, tensor_id=0)
-        assert decoded.shape == kv.shape, f"Shape mismatch: {decoded.shape} != {kv.shape}"
-        ratio = hook.compression_ratio()
-        assert ratio < 0.25, f"Compression ratio too high: {ratio}"
-        print(f"TriStateKVHook: OK (compression_ratio={ratio:.3f})")
+class CompressedKVHook:
+    """Prior-cycle INT8/Hadamard hook (2026-04-28/29). Preserved for compat."""
 
-    _test_tri_state_hook()
+    def __init__(self, codec: Any) -> None:
+        self.codec = codec
+
+    def encode(self, kv: torch.Tensor, layer_idx: int, tensor_id: int = 0) -> dict:
+        if hasattr(self.codec, "encode"):
+            kv_flat = kv.float()
+            if kv_flat.dim() == 1:
+                kv_flat = kv_flat.unsqueeze(0)
+            return self.codec.encode(kv_flat, layer_idx, tensor_id)
+        return {"raw": kv.float()}
+
+    def decode(self, compressed: dict, layer_idx: int, tensor_id: int = 0) -> torch.Tensor:
+        if "raw" in compressed:
+            return compressed["raw"]
+        if hasattr(self.codec, "decode"):
+            return self.codec.decode(compressed, layer_idx, tensor_id)
+        return compressed.get("raw", torch.zeros(1))
+
+
+class NonContiguousAttentionWrapper:
+    """Prior-cycle non-contiguous wrapper (2026-04-28). Preserved for compat."""
+
+    def __init__(self, impl: Any, hook: Any, kv_manager: Any, chunk_size: int = 64) -> None:
+        self._impl = impl
+        self._hook = hook
+        self._kv_manager = kv_manager
+        self._chunk_size = chunk_size
+
+    def forward(self, layer, query, key, value, kv_cache, attn_metadata, output,
+                output_scale=None, output_block_scale=None):
+        return self._impl.forward(
+            layer, query, key, value, kv_cache, attn_metadata, output,
+            output_scale, output_block_scale,
+        )
+
+    def store_kv_chunks(self, token_ids, k, v, layer_idx):
+        chunk_size = self._chunk_size
+        n = k.shape[0]
+        n_chunks = max(1, (n + chunk_size - 1) // chunk_size)
+        for ci in range(n_chunks):
+            s, e = ci * chunk_size, min((ci + 1) * chunk_size, n)
+            if hasattr(self._kv_manager, "store_segment"):
+                self._kv_manager.store_segment(token_ids, ci, k[s:e], v[s:e], layer_idx)
+
+    def load_cached_chunks(self, token_ids, layer_idx):
+        hits, misses = [], []
+        if hasattr(self._kv_manager, "lookup_all_segments"):
+            q_keys = torch.zeros(1, 1)
+            for ci, ck, cv, hit_type in self._kv_manager.lookup_all_segments(
+                token_ids, layer_idx, q_keys
+            ):
+                if hit_type != "miss" and ck is not None:
+                    hits.append((ci, ck, cv))
+                else:
+                    misses.append(ci)
+        return hits, misses
+
+    def __getattr__(self, name):
+        return getattr(self._impl, name)

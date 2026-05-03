@@ -1,0 +1,62 @@
+experiment: "2026-05-03-abc-turbo-quant-semantic-dhd"
+date: "2026-05-03"
+activities: [A, B, C]
+
+cache:
+  type: SemanticSegmentCache
+  chunk_size: 128
+  max_entries: 1000
+  top_k: 5
+  similarity_threshold: 0.80
+  deviation_threshold: 0.20
+  recompute_budget: 0.20
+
+codec:
+  type: TurboQuantCodec
+  num_layers: 12
+  bits: 3
+  qjl_bits: 1
+  base_seed: 42
+  sensitive_layers_ratio: 0.25
+
+scheduler:
+  type: DualMapScheduler
+  num_nodes: 1
+  slo_ttft_ms: 200.0
+  top_k_semantic: 5
+  fairness_max_wait: 10
+
+speculative_fetcher:
+  enabled: true
+  max_wait_ms: 5.0
+  prefetch_depth: 1
+
+metrics:
+  target_throughput_gain: 0.20
+  target_memory_reduction: 0.60
+  target_noncontiguous_hit_rate: 0.30
+  max_perplexity_delta_pct: 1.0
+  max_task_accuracy_delta_pct: 1.0
+  min_cosine_similarity: 0.95
+  max_normalized_error: 0.10
+  max_scheduling_overhead_ttft_pct: 5.0
+
+accuracy_benchmarks:
+  - name: wikitext2_proxy
+    metric: normalized_reconstruction_error
+    threshold: 0.10
+  - name: cosine_similarity_proxy
+    metric: cosine_similarity_mean
+    threshold: 0.95
+  - name: mse_ratio_proxy
+    metric: mse_ratio
+    threshold: 0.15
+  - name: longbench_qa
+    metric: rouge_l
+    tolerance: 0.01
+  - name: longbench_summarization
+    metric: rouge_1
+    tolerance: 0.01
+  - name: longbench_fewshot
+    metric: exact_match
+    tolerance: 0.01

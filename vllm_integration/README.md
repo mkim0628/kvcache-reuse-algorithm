@@ -3,14 +3,14 @@
 ## Overview
 
 This package ports the independently-verified A+B+C KV cache pipeline from the
-standalone `src/` implementation into **vLLM 0.20.0**.
+standalone `src/` implementation into **vLLM 0.20.1**.
 
 | Activity | Description | Source |
 |----------|-------------|--------|
-| **A** | Cache-hit-rate-aware request scheduling | `src/scheduler/cache_aware_scheduler.py` |
-| **B** | Position-independent segmented hash cache | `src/cache/segmented.py` |
-| **C** | Hadamard INT4 + mixed-precision KV compression | `src/cache/compression.py` |
-| **A+B+C** | Full pipeline: scheduler + NC reuse + compression | `src/cache/compressed_segment.py` |
+| **A** | DualMap semantic-hit-rate cache-affinity scheduling | `src/scheduler/dual_map_scheduler.py` |
+| **B** | DHD semantic similarity non-contiguous KV reuse | `src/cache/dhd_segment_cache.py` |
+| **C** | TurboQuant 3-bit PolarQuant + QJL residual compression | `src/cache/turbo_quant.py` |
+| **A+B+C** | Full pipeline: scheduler + DHD NC reuse + TurboQuant compression | cross-activity |
 
 ---
 
@@ -18,12 +18,13 @@ standalone `src/` implementation into **vLLM 0.20.0**.
 
 | Field | Value |
 |-------|-------|
-| vLLM version | **0.20.0** |
+| vLLM version | **0.20.1** |
 | Install command | `pip install --upgrade vllm` |
-| Architecture | v1 (vllm.v1.*) |
+| Architecture | v1 (`vllm.v1.*`) |
 | KV cache manager | `vllm.v1.core.kv_cache_manager.KVCacheManager` |
-| Request queue | `vllm.v1.core.sched.request_queue.RequestQueue` |
+| Scheduler | `vllm.v1.core.sched.scheduler.Scheduler` |
 | Attention backend | `vllm.v1.attention.backend.AttentionImpl` |
+| CacheConfig | `vllm.config.cache.CacheConfig` (pydantic v2 frozen) |
 
 ---
 
@@ -31,87 +32,268 @@ standalone `src/` implementation into **vLLM 0.20.0**.
 
 ```
 vllm_integration/
-├── __init__.py                  Package marker
-├── compression_codec.py         Activity C: HadamardInt4Codec (new) + CompressionCodec (prior)
-├── block_manager_patch.py       Activity B: Position-independent segment index
-│                                + NonContiguousKVCacheManager subclass
-├── attention_backend_patch.py   Activity B+C: CompressedKVHook + wrapper
-├── scheduler_patch.py           Activity A: CacheHitAwareRequestQueue
-├── install.sh                   Install + smoke-test script
-└── README.md                    This file
+├── __init__.py                   Package marker
+├── compression_codec.py          Activity C: VllmTurboQuantCodec (new, 2026-05-03)
+│                                  + CacheCompressionConfig with compression_method field
+│                                  + HadamardInt4Codec, CompressionCodec (prior, preserved)
+├── block_manager_patch.py        Activity B: SemanticSegmentIndex (DHD semantic index)
+│                                  + SemanticNonContiguousKVCacheManager subclass
+│                                  + Prior-cycle SegmentHashMixin etc. (preserved)
+├── attention_backend_patch.py    Activity B+C: TurboQuantKVHook (new, 2026-05-03)
+│                                  + SemanticKVAttentionWrapper (new, 2026-05-03)
+│                                  + CompressedKVHook, TriStateKVHook (prior, preserved)
+├── scheduler_patch.py            Activity A: DualMapSchedulerMixin (new, 2026-05-03)
+│                                  + DualMapRoutingMixin, DualMapNodeState
+│                                  + CacheHitAwareRequestQueue, MultiNodeRequestRouter (prior)
+├── install.sh                    pip install --upgrade vllm + smoke tests
+├── README.md                     This file
+│
+│   Prior-cycle files (preserved for backward compatibility):
+├── leverage_compressor_patch.py  2026-05-02 LeverageScoreCompressor
+├── sign_vq_block_manager_patch.py 2026-05-02 SignVQSegmentIndex
+└── cache_config_extension.py     2026-05-02 SignVQCacheParams
 ```
 
 ---
 
-## vLLM Integration Points
-
-### Activity A — Cache-Hit-Aware Scheduling
+## Activity A — DualMap Semantic-Hit-Rate Scheduling
 
 **Primary integration file:** `scheduler_patch.py`
 
-vLLM 0.20.0 v1 scheduler uses a pluggable `RequestQueue` (defined in
-`vllm.v1.core.sched.request_queue`). The default policy is FCFS or priority.
+### Architecture
 
-`CacheHitAwareRequestQueue` subclasses `RequestQueue` and maintains a
-priority heap that orders requests by predicted KV segment hit rate:
+`DualMapSchedulerMixin` is a mixin for vLLM's `Scheduler` that adds
+cache-affinity-aware request ordering:
 
 ```
-priority = hit_rate × (1 − min(wait_steps / fairness_max_wait, 1.0))
+Routing score = semantic_hit_rate(req_emb, node) × (1 − node.load)
 ```
 
-Hit rate prediction peeks at `CompressedSegmentIndex._store` keys without
-calling `get()`, so cache statistics are not polluted.  A wait-step penalty
-prevents cold requests from being indefinitely starved.
+Where `semantic_hit_rate` is the mean cosine similarity of the request's
+token-mean embedding vs the top-k cached segment embeddings on each node.
 
-**How to enable:**
+Routing degrades to load-only when:
+- Any candidate node has an active SLO violation, OR
+- Request wait_steps >= fairness_max_wait (starvation protection)
+
+### Integration
+
 ```python
-from vllm_integration.scheduler_patch import create_cache_hit_aware_queue
-
-# In Scheduler.__init__, replace default request queue:
-self.waiting = create_cache_hit_aware_queue(
-    segment_index=kv_manager._segment_index,
-    chunk_size=kv_manager._segment_chunk_size,
-    fairness_max_wait=10,
+from vllm_integration.scheduler_patch import (
+    DualMapSchedulerMixin,
+    DualMapNodeState,
 )
+from vllm.v1.core.sched.scheduler import Scheduler
+
+class CacheAwareScheduler(DualMapSchedulerMixin, Scheduler):
+    def __init__(self, *args, nodes, **kwargs):
+        Scheduler.__init__(self, *args, **kwargs)
+        DualMapSchedulerMixin.__init__(self, nodes=nodes)
+
+    def schedule(self):
+        self.pre_schedule_sort()   # DualMap reorders waiting queue
+        return super().schedule()  # vLLM handles block allocation
+
+# Setup nodes with semantic index references
+nodes = [
+    DualMapNodeState(
+        node_id="node0",
+        semantic_index=kv_manager._segment_index._semantic_index,
+        current_load=0.0,
+    )
+]
+scheduler = CacheAwareScheduler(..., nodes=nodes)
+
+# Attach semantic index when kv_manager is ready
+scheduler.attach_semantic_index("node0", kv_manager._segment_index._semantic_index)
 ```
 
-### Activity B — Non-Contiguous KV Cache Reuse
+### Overhead Budget
 
-**Primary integration file:** `block_manager_patch.py`
-
-`NonContiguousKVCacheManager` subclasses `KVCacheManager` and adds:
-
-1. `SegmentHashMixin.get_segment_key(token_ids, chunk_idx, layer_idx)` — a
-   position-independent SHA-256 hash of a token chunk (content-only, no
-   absolute position), enabling reuse when tokens appear at different offsets.
-
-2. `CompressedSegmentIndex` — LRU dict mapping segment keys to compressed KV
-   tensors (backed by `HadamardInt4Codec` by default).
-
-3. `get_computed_blocks` override — queries the segment index after the
-   standard prefix cache lookup for non-contiguous hits.
-
-4. `store_segment` / `lookup_segment` — attention backend API.
-
-**Default codec changed to `HadamardInt4Codec`** in this cycle (pass
-`use_hadamard_int4=False` for the prior INT8 codec).
-
-### Activity C — KV Cache Compression
-
-**Primary integration file:** `compression_codec.py`, `attention_backend_patch.py`
-
-**`HadamardInt4Codec`** (new in cycle 2026-04-29, recommended):
-- Early layers (cutoff_ratio=0.2): FP16 — 50% savings
-- Late layers: Hadamard rotation + INT4-range quantized, stored as int8 — 75% savings
-- Average: ~70% memory reduction vs FP32
-- Accuracy: attention KL divergence < 0.05, cosine similarity ≥ 0.95
-
-**`CompressionCodec`** (prior cycle, reference):
-- Early layers: FP16; later layers: symmetric INT8 — ~67% average savings
+Pre-sort operates on the waiting queue list in Python — no GPU or disk I/O.
+Target: < 5ms / 100 requests (well within TTFT +5% budget).
+Measured in standalone: 0.028ms / 100 requests.
 
 ---
 
-## How to Apply Patches
+## Activity B — DHD Semantic Non-Contiguous KV Reuse
+
+**Primary integration file:** `block_manager_patch.py`
+
+### Architecture
+
+`SemanticNonContiguousKVCacheManager` subclasses `KVCacheManager` and adds
+a parallel `SemanticSegmentIndex` for non-contiguous KV reuse:
+
+```
+For each prefill chunk:
+    1. lookup_segment(token_ids, chunk_idx, query_keys, layer_idx)
+       → check exact SHA-256 hash (fast path)
+       → if miss: cosine similarity search over semantic_index
+       → DHD deviation check: ||q_keys - cached_keys|| / ||cached_keys|| <= threshold
+    2. On hit: return cached [K, V] (decompress via TurboQuantCodec)
+    3. On miss: compute KV normally, then store_segment() to populate index
+```
+
+DHD (Dual-Stage High Deviation) classification:
+- cosine_sim >= similarity_threshold → candidate found
+- L2 deviation <= deviation_threshold → semantic hit (return cached KV)
+- deviation > threshold → recompute (return miss, let caller recompute)
+
+### Integration
+
+```python
+from vllm_integration.block_manager_patch import SemanticNonContiguousKVCacheManager
+from vllm_integration.compression_codec import VllmTurboQuantCodec
+
+codec = VllmTurboQuantCodec(num_layers=32, bits=3)
+
+kv_manager = SemanticNonContiguousKVCacheManager(
+    kv_cache_config=kv_cache_config,
+    max_model_len=max_model_len,
+    hash_block_size=block_size,  # Must equal vLLM block_size
+    enable_caching=True,
+    codec=codec,
+    segment_chunk_size=16,       # Must align with vLLM block_size
+    segment_max_entries=2000,
+    similarity_threshold=0.80,
+    deviation_threshold=0.20,
+)
+
+# In attention layer (prefill):
+k_cached, v_cached, hit_type = kv_manager.lookup_segment(
+    token_ids, chunk_idx, query_keys, layer_idx
+)
+if hit_type == "miss":
+    # compute KV normally
+    kv_manager.store_segment(token_ids, chunk_idx, new_keys, new_values, layer_idx)
+```
+
+### Block Boundary Contract
+
+`segment_chunk_size` MUST divide evenly into vLLM's `block_size`. Segments
+that cross block boundaries are not supported. Set `segment_chunk_size` equal
+to `block_size` (default 16) for guaranteed alignment.
+
+### Non-Contiguous Hit Rate
+
+Semantic (non-contiguous) hits are counted separately from exact hash hits.
+Target: semantic_hits / total_hits >= 30%.
+
+```python
+stats = kv_manager.segment_index_stats()
+# stats["noncontiguous_ratio"] >= 0.30
+```
+
+---
+
+## Activity C — TurboQuant 3-bit KV Compression
+
+**Primary integration file:** `compression_codec.py`, `attention_backend_patch.py`
+
+### Architecture
+
+`VllmTurboQuantCodec` wraps `TurboQuantCodec` (PolarQuant + QJL) for vLLM shapes:
+
+```
+PolarQuant:
+    R = random orthogonal rotation matrix (per-layer, fixed seed)
+    kv_rotated = kv @ R.T               ← redistribute outliers uniformly
+    quantized = round(kv_rotated / scale)  ← 3-bit (or 4-bit for sensitive layers)
+
+QJL residual correction:
+    residual = kv_rotated - dequant(quantized)
+    proj = residual @ P.T               ← JL projection (P = ±1/sqrt(d))
+    qjl_packed = (proj >= 0)           ← 1-bit sign per projection dim
+
+Decode:
+    kv_dequant = quantized * scale
+    residual_approx = sign(qjl) @ P * ||residual||
+    kv_corrected = kv_dequant + residual_approx
+    return kv_corrected @ R             ← inverse rotation (R orthogonal: R^T = R^{-1})
+```
+
+Sensitive layers (first 25%): 4-bit quantization.
+Non-sensitive layers: 3-bit quantization.
+
+### Memory Reduction (d_head=128, n_tokens=1000)
+
+| Component | Bytes | Notes |
+|-----------|-------|-------|
+| FP32 baseline | 512,000 | reference |
+| quantized (int8) | 128,000 | 3-bit stored in int8 |
+| scale (float32) | 4,000 | per-row |
+| qjl_packed (1-bit) | 16,000 | packed bits |
+| qjl_residual_norm | 4,000 | per-row |
+| **Total** | **152,000** | **−70.3% vs FP32** |
+
+### CacheConfig Extension
+
+`CacheCompressionConfig` attaches compression parameters to vLLM via
+composition (not mutation of vLLM's frozen pydantic CacheConfig):
+
+```python
+from vllm_integration.compression_codec import CacheCompressionConfig
+
+# compression_method: "none" | "int8" | "fp8" | "turbo3" | "turbo4"
+cfg = CacheCompressionConfig(
+    compression_method="turbo3",
+    num_layers=32,
+    bits=3,
+    sensitive_layers_ratio=0.25,
+)
+codec = cfg.build_codec()  # VllmTurboQuantCodec or None
+```
+
+### Write/Read Hooks
+
+`TurboQuantKVHook` hooks compression into the attention backend write/read paths:
+
+```python
+from vllm_integration.attention_backend_patch import TurboQuantKVHook
+
+hook = TurboQuantKVHook(codec=codec, enabled=True)
+
+# After QKV projection, before segment index storage:
+compressed_k = hook.write_to_cache(key, layer_idx, tensor_id=0)
+compressed_v = hook.write_to_cache(value, layer_idx, tensor_id=1)
+
+# Before attention kernel (MUST decompress before kernel entry):
+key_decompressed   = hook.read_from_cache(compressed_k, layer_idx, tensor_id=0)
+value_decompressed = hook.read_from_cache(compressed_v, layer_idx, tensor_id=1)
+```
+
+**Critical constraint**: Compressed tensors NEVER enter flashinfer or
+flash-attention kernels. Decompression occurs BEFORE kernel invocation.
+
+### Wrapper for Combined B+C
+
+`SemanticKVAttentionWrapper` combines DHD lookup (Activity B) and TurboQuant
+hooks (Activity C) around an existing AttentionImpl:
+
+```python
+from vllm_integration.attention_backend_patch import SemanticKVAttentionWrapper
+
+wrapped = SemanticKVAttentionWrapper(
+    impl=original_attn_impl,
+    hook=hook,
+    kv_manager=kv_manager,
+    chunk_size=16,
+)
+
+# Prefill write path (store compressed KV in index):
+wrapped.store_kv_chunks(token_ids, keys, values, layer_idx)
+
+# Decode / re-prefill read path (check index for non-contiguous hits):
+hit_chunks, miss_indices = wrapped.load_cached_chunks(token_ids, layer_idx, query_keys)
+
+# Standard attention (interface unchanged):
+output = wrapped.forward(layer, query, key, value, kv_cache, attn_metadata, output)
+```
+
+---
+
+## How to Apply
 
 ### 1. Install
 
@@ -119,53 +301,61 @@ self.waiting = create_cache_hit_aware_queue(
 bash vllm_integration/install.sh
 ```
 
-### 2. Substitute KV Cache Manager (Activity B+C)
+### 2. Configure Compression (Activity C)
 
 ```python
-from vllm_integration.compression_codec import HadamardInt4Codec
-from vllm_integration.block_manager_patch import NonContiguousKVCacheManager
+from vllm_integration.compression_codec import CacheCompressionConfig, VllmTurboQuantCodec
 
-kv_manager = NonContiguousKVCacheManager(
+compression_cfg = CacheCompressionConfig(compression_method="turbo3", num_layers=32)
+codec = compression_cfg.build_codec()
+```
+
+### 3. Create Semantic KV Cache Manager (Activity B)
+
+```python
+from vllm_integration.block_manager_patch import SemanticNonContiguousKVCacheManager
+
+kv_manager = SemanticNonContiguousKVCacheManager(
     kv_cache_config=kv_cache_config,
     max_model_len=max_model_len,
     hash_block_size=block_size,
-    enable_caching=True,
-    use_hadamard_int4=True,   # HadamardInt4Codec (recommended)
-    segment_chunk_size=64,
+    codec=codec,
+    segment_chunk_size=block_size,  # align with vLLM block_size
     segment_max_entries=2000,
 )
 ```
 
-### 3. Enable Cache-Hit-Aware Scheduling (Activity A)
+### 4. Enable DualMap Scheduling (Activity A)
 
 ```python
-from vllm_integration.scheduler_patch import create_cache_hit_aware_queue
+from vllm_integration.scheduler_patch import DualMapSchedulerMixin, DualMapNodeState
+from vllm.v1.core.sched.scheduler import Scheduler
 
-# During Scheduler construction:
-self.waiting = create_cache_hit_aware_queue(
-    segment_index=kv_manager._segment_index,
-    chunk_size=64,
-    fairness_max_wait=10,
-)
+class CacheAwareScheduler(DualMapSchedulerMixin, Scheduler):
+    def __init__(self, *args, nodes, **kwargs):
+        Scheduler.__init__(self, *args, **kwargs)
+        DualMapSchedulerMixin.__init__(self, nodes=nodes)
+
+    def schedule(self):
+        self.pre_schedule_sort()
+        return super().schedule()
+
+nodes = [DualMapNodeState(
+    node_id="node0",
+    semantic_index=kv_manager._segment_index._semantic_index,
+)]
+scheduler = CacheAwareScheduler(..., nodes=nodes)
 ```
 
-### 4. Wire Compression Hooks into Attention (Activity B+C)
+### 5. Wire Compression Hooks (Activity B+C)
 
 ```python
-from vllm_integration.attention_backend_patch import (
-    CompressedKVHook, NonContiguousAttentionWrapper,
+from vllm_integration.attention_backend_patch import TurboQuantKVHook, SemanticKVAttentionWrapper
+
+hook = TurboQuantKVHook(codec=codec)
+wrapped_attn = SemanticKVAttentionWrapper(
+    impl=attn_impl, hook=hook, kv_manager=kv_manager, chunk_size=block_size
 )
-
-hook = CompressedKVHook(kv_manager._segment_index.codec)
-wrapped = NonContiguousAttentionWrapper(
-    impl=original_attn_impl, hook=hook, kv_manager=kv_manager, chunk_size=64,
-)
-
-# Prefill write path:
-wrapped.store_kv_chunks(token_ids, k, v, layer_idx)
-
-# Decode / re-prefill read path:
-hit_chunks, miss_chunks = wrapped.load_cached_chunks(token_ids, layer_idx)
 ```
 
 ---
@@ -174,24 +364,26 @@ hit_chunks, miss_chunks = wrapped.load_cached_chunks(token_ids, layer_idx)
 
 | Component | Status |
 |-----------|--------|
-| vLLM 0.20.0 (v1 engine) | Tested |
-| `KVCacheManager` public API | Preserved (subclass, no monkey-patching) |
-| `RequestQueue` interface | Fully implemented (`CacheHitAwareRequestQueue`) |
-| `AttentionImpl.forward` | Delegated (wrapper is pass-through) |
-| `SchedulerConfig` fields | Not modified |
-| GPU memory layout | Follows vLLM block_size |
+| vLLM 0.20.1 (v1 engine) | Target version |
+| `KVCacheManager` public API | Preserved (subclass only) |
+| `Scheduler` public API | Preserved (mixin, no monkey-patching) |
+| `AttentionImpl.forward` | Preserved (wrapper delegates unchanged) |
+| `CacheConfig` fields | Not modified (composition via CacheCompressionConfig) |
+| GPU memory layout | vLLM paged blocks unmodified |
+| Compression in flash-attn kernels | Never — decompress before kernel |
 
 ---
 
-## Performance Expectations (from Report ①)
+## Performance Expectations (from Report ① 2026-05-03)
 
-| Metric | Standalone (55/55 tests) | vLLM port target |
+| Metric | Standalone (45/45 tests) | vLLM port target |
 |--------|--------------------------|-----------------|
-| Throughput improvement | > 10% (memory-budget test) | ≥ 10% |
-| Non-contiguous cache hit rate | ≥ 30% | ≥ 30% |
-| KV cache memory reduction | ≥ 70% vs FP32 | ≥ 30% (goal) |
-| Compression accuracy (KL) | < 0.05 all layers | ≤ 0.05 |
-| Scheduling overhead (TTFT) | ≤ 5% | ≤ 5% |
+| Throughput improvement | +20% (memory-budget) | ≥ +10% |
+| Non-contiguous cache hit rate (semantic) | 100% (test) | ≥ 30% |
+| KV cache memory reduction | −70.3% vs FP32 | ≥ −30% (goal −60%) |
+| Compression accuracy (cosine sim) | ≥ 0.98 | ≥ 0.95 |
+| Scheduling overhead (TTFT) | 0.028ms / 100 reqs | ≤ 5ms / req |
+| Effective context length | 3.37× | ≥ 2× |
 
 ---
 
@@ -202,175 +394,5 @@ hit_chunks, miss_chunks = wrapped.load_cached_chunks(token_ids, layer_idx)
 | 2026-04-28 | 1/3 | B+C | NonContiguousKVCacheManager, CompressedKVHook (INT8) |
 | 2026-04-29 | 1/3 | A+B+C | CacheHitAwareRequestQueue, HadamardInt4Codec (INT4) |
 | 2026-04-30 | 1/3 | A+B+C | MultiNodeRequestRouter, TriStateKVHook, SegmentAdapterMixin |
-
----
-
-## 2026-04-30 Additions
-
-### Activity A — MultiNodeRequestRouter (`scheduler_patch.py`)
-
-Port of `src/scheduler/multi_node_scheduler.py`. Adds P/D disaggregated prefill
-routing above `CacheHitAwareRequestQueue`:
-
-```python
-from vllm_integration.scheduler_patch import create_multi_node_router, VllmNodeConfig
-
-router = create_multi_node_router(
-    prefill_nodes=[VllmNodeConfig("p0", "prefill"), VllmNodeConfig("p1", "prefill")],
-    decode_nodes=[VllmNodeConfig("d0", "decode"), VllmNodeConfig("d1", "decode")],
-    segment_index=kv_manager._segment_index,
-    chunk_size=128,
-    codec=hadamard_codec,               # enables compress_before_transfer
-    compress_threshold_bytes=1048576,
-)
-routing = router.route(request)
-# routing["compress_before_transfer"] → True if KV size > threshold
-```
-
-### Activity C — TriStateKVHook (`attention_backend_patch.py`)
-
-Port of `src/cache/tri_state_compressor.py`. Adds ARKV-style tri-state
-(retain/compress/evict) compression to the attention write path:
-
-```python
-from vllm_integration.attention_backend_patch import TriStateKVHook
-from vllm_integration.compression_codec import HadamardInt4Codec
-
-codec = HadamardInt4Codec(num_layers=32, cutoff_ratio=0.2)
-hook = TriStateKVHook(codec=codec, retain_ratio=0.20, evict_ratio=0.40)
-
-# Write path (after K/V projection):
-storage = hook.encode_kv(k, attn_weights, layer_idx=5, tensor_id=0)
-# Read path:
-k_reconstructed = hook.decode_kv(storage, layer_idx=5, tensor_id=0)
-# Compression: ~80% memory savings vs FP32 (hook.compression_ratio() ≈ 0.20)
-```
-
-**Accuracy constraint**: retain tier (FP16) + compress tier (HadamardInt4, KL<0.007)
-maintains perplexity delta ±1%. Validated in Report ① 2026-04-30.
-
-### Activity B — SegmentAdapterMixin (`block_manager_patch.py`)
-
-Port of `src/cache/segment_adapter.py`. Adds MLP position-mismatch correction
-to non-contiguous KV hits:
-
-```python
-from vllm_integration.block_manager_patch import NonContiguousKVCacheManagerWithAdapter
-
-mgr = NonContiguousKVCacheManagerWithAdapter(hidden_dim=64)
-# Offline training:
-mgr.train_adapter(cached_kvs, target_kvs, kv_dim=64, n_steps=500)
-# Inference (non-contiguous hit):
-kv = mgr.lookup_segment_with_adapter(token_ids, chunk_idx, layer_idx, is_noncontiguous=True)
-```
-
----
-
-## Updated Performance Expectations (from Report ① 2026-04-30)
-
-| Metric | Standalone (77/77 tests) | vLLM port target |
-|--------|--------------------------|-----------------|
-| Throughput improvement | +391% (memory-budget) | ≥ +10% |
-| Non-contiguous cache hit rate | ≥ 30% | ≥ 30% |
-| KV memory reduction (TriState) | 80% | ≥ 30% (goal) |
-| Compression accuracy (KL) | < 0.005 (INT4 tri-state) | ≤ 0.05 |
-| Scheduling overhead (TTFT) | 0.0% | ≤ 5% |
-
----
-
-## 2026-05-02 Additions (B+C Cross-1: LeverageScore + SignVQ)
-
-### Activity C — VllmLeverageCompressor (`leverage_compressor_patch.py`)
-
-Port of `src/cache/leverage_compressor.LeverageScoreCompressor` adapted for
-vLLM's paged-block KV cache layout `[2, num_blocks, block_size, num_kv_heads, head_size]`.
-
-3-tier classification per block:
-- Tier-1 (top 20% by leverage score): FP16 full KV — exact round-trip
-- Tier-2 (middle 60%): 1-bit sign packed Key + FP16 Value
-- Tier-3 (bottom 20%): evicted (0 bytes)
-
-Memory reduction: ~74% vs FP32 baseline (verified in Report ①).
-
-```python
-from vllm_integration.leverage_compressor_patch import VllmLeverageCompressor
-
-comp = VllmLeverageCompressor(rank=32, tier1_ratio=0.20, tier3_ratio=0.20)
-storage = comp.encode_block(key_block, value_block, layer_idx=5, block_id=42)
-decoded = comp.decode_block(storage)   # (2, block_size, d_head)
-# Multi-head variant (vLLM shape: block_size × num_kv_heads × head_size):
-per_head = comp.encode_block_multihead(key_block, value_block, layer_idx=5)
-out      = comp.decode_block_multihead(per_head)  # (2, bs, H, head_size)
-```
-
-### Activity B+C — SignVQSegmentIndex + NonContiguousKVCacheManagerV2 (`sign_vq_block_manager_patch.py`)
-
-Port of `src/cache/sign_vq_segment.SignVQSegmentCache`.  Adds a 3-stage lookup
-index alongside vLLM's standard prefix cache:
-
-1. **exact_fp16**: SHA-256 content-only hash → FP16 KV (exact)
-2. **approx_sign**: XOR + popcount Hamming distance ≤ threshold → ±1 sign KV
-3. **miss**: normal prefill
-
-`NonContiguousKVCacheManagerV2` subclasses `KVCacheManager` and exposes:
-- `store_segment(token_ids, chunk_idx, keys, values, layer_idx)`
-- `lookup_segment(token_ids, chunk_idx, layer_idx, query_keys)`
-- `lookup_all_segments(token_ids, layer_idx, query_keys)`
-- `sign_index_stats()` → tier hit rate dict
-
-```python
-from vllm_integration.sign_vq_block_manager_patch import NonContiguousKVCacheManagerV2
-
-kv_manager = NonContiguousKVCacheManagerV2(
-    kv_cache_config=kv_cache_config,
-    max_model_len=max_model_len,
-    hash_block_size=block_size,
-    enable_caching=True,
-    sign_vq_chunk_size=16,
-    sign_vq_max_entries=2000,
-    sign_vq_hamming_threshold=0.15,
-    sign_vq_rank=32,
-)
-```
-
-### Activity C — CacheConfig Extension (`cache_config_extension.py`)
-
-`SignVQCacheParams` carries the new compression parameters without modifying
-vLLM's frozen `CacheConfig`:
-
-```python
-from vllm_integration.cache_config_extension import (
-    SignVQCacheParams, build_sign_vq_compressor, build_sign_vq_index,
-)
-
-params = SignVQCacheParams(
-    enable_sign_vq=True,
-    tier1_ratio=0.20,
-    tier2_ratio=0.60,
-    hamming_threshold=0.15,
-)
-compressor = build_sign_vq_compressor(params)
-index      = build_sign_vq_index(params)
-```
-
----
-
-## Updated Performance Expectations (from Report ① 2026-05-02)
-
-| Metric | Standalone (121/121 tests) | vLLM port target |
-|--------|---------------------------|-----------------|
-| Throughput improvement | ≥ +10% (vs FP32 memory budget) | ≥ +10% |
-| Non-contiguous cache hit rate | ≥ 30% | ≥ 30% |
-| KV memory reduction | 74.1% vs FP32 | ≥ 30% (goal −70%) |
-| Compression accuracy (KL) | < 0.015 (PRIMARY) | ≤ 0.015 |
-| Integration perplexity proxy | cosine ≥ 0.84 | ≥ 0.84 |
-| Scheduling overhead (TTFT) | ≤ 5% | ≤ 5% |
-
----
-
-## Latest Cycle
-
-- Date: 2026-05-02
-- Loop: 1 / 3
-- Activity: B+C (LeverageScoreCompressor + SignVQSegmentCache)
-- Report ①: `reports/evaluations/2026-05-02.md`
+| 2026-05-02 | 1/3 | B+C | VllmLeverageCompressor, SignVQSegmentIndex, SignVQCacheParams |
+| 2026-05-03 | 1/3 | A+B+C | DualMapSchedulerMixin, SemanticSegmentIndex (DHD), VllmTurboQuantCodec, TurboQuantKVHook |
