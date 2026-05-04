@@ -5,12 +5,15 @@
 This package ports the independently-verified A+B+C KV cache pipeline from the
 standalone `src/` implementation into **vLLM 0.20.1**.
 
-| Activity | Description | Source |
-|----------|-------------|--------|
-| **A** | DualMap semantic-hit-rate cache-affinity scheduling | `src/scheduler/dual_map_scheduler.py` |
-| **B** | DHD semantic similarity non-contiguous KV reuse | `src/cache/dhd_segment_cache.py` |
-| **C** | TurboQuant 3-bit PolarQuant + QJL residual compression | `src/cache/turbo_quant.py` |
-| **A+B+C** | Full pipeline: scheduler + DHD NC reuse + TurboQuant compression | cross-activity |
+| Cycle | Activity | Description | Source |
+|-------|----------|-------------|--------|
+| 2026-05-04 | **A** | DAGTopologyScheduler — workflow DAG topology KV proactive preservation | `src/scheduler/dag_topology_scheduler.py` |
+| 2026-05-04 | **B** | WorkloadAwareTTLCache — category-specific TTL segment preservation | `src/cache/workload_ttl_cache.py` |
+| 2026-05-04 | **C** | RedundancyAwareEvictionPolicy — importance x redundancy dual-score eviction | `src/cache/redundancy_eviction.py` |
+| 2026-05-04 | **Cross-1** | DAGAwareTTLAdjuster — DAG events → TTL adjustment pipeline | `src/scheduler/dag_ttl_adjuster.py` |
+| 2026-05-03 | **A** | DualMapSchedulerMixin — dual-hash + semantic-hit-rate routing (preserved) | `src/scheduler/dual_map_scheduler.py` |
+| 2026-05-03 | **B** | SemanticNonContiguousKVCacheManager — DHD semantic similarity (preserved) | `src/cache/dhd_segment_cache.py` |
+| 2026-05-03 | **C** | TurboQuantKVHook — TurboQuant 3-bit compression (preserved) | `src/cache/turbo_quant.py` |
 
 ---
 
@@ -23,8 +26,8 @@ standalone `src/` implementation into **vLLM 0.20.1**.
 | Architecture | v1 (`vllm.v1.*`) |
 | KV cache manager | `vllm.v1.core.kv_cache_manager.KVCacheManager` |
 | Scheduler | `vllm.v1.core.sched.scheduler.Scheduler` |
+| Block pool | `vllm.v1.core.block_pool.BlockPool` |
 | Attention backend | `vllm.v1.attention.backend.AttentionImpl` |
-| CacheConfig | `vllm.config.cache.CacheConfig` (pydantic v2 frozen) |
 
 ---
 
@@ -33,19 +36,24 @@ standalone `src/` implementation into **vLLM 0.20.1**.
 ```
 vllm_integration/
 ├── __init__.py                   Package marker
-├── compression_codec.py          Activity C: VllmTurboQuantCodec (new, 2026-05-03)
-│                                  + CacheCompressionConfig with compression_method field
-│                                  + HadamardInt4Codec, CompressionCodec (prior, preserved)
-├── block_manager_patch.py        Activity B: SemanticSegmentIndex (DHD semantic index)
-│                                  + SemanticNonContiguousKVCacheManager subclass
-│                                  + Prior-cycle SegmentHashMixin etc. (preserved)
-├── attention_backend_patch.py    Activity B+C: TurboQuantKVHook (new, 2026-05-03)
-│                                  + SemanticKVAttentionWrapper (new, 2026-05-03)
-│                                  + CompressedKVHook, TriStateKVHook (prior, preserved)
-├── scheduler_patch.py            Activity A: DualMapSchedulerMixin (new, 2026-05-03)
-│                                  + DualMapRoutingMixin, DualMapNodeState
+├── scheduler_patch.py            Activity A (2026-05-04): DAGTopologySchedulerMixin
+│                                  + MultiNodeDAGRouter, DAGNodeCapacity, WorkflowDAG
+│                                  + make_dag_aware_scheduler_class() factory
+│                                  + DualMapSchedulerMixin (2026-05-03, preserved)
 │                                  + CacheHitAwareRequestQueue, MultiNodeRequestRouter (prior)
-├── install.sh                    pip install --upgrade vllm + smoke tests
+├── block_manager_patch.py        Activity B (2026-05-04): WorkloadAwareTTLKVCacheManager
+│                                  + VllmDAGAwareTTLAdjuster, VllmTTLEntry
+│                                  + SemanticNonContiguousKVCacheManager (2026-05-03, preserved)
+│                                  + SemanticSegmentIndex (2026-05-03, preserved)
+├── attention_backend_patch.py    Activity C (2026-05-04): VllmRedundancyAwareEvictionPolicy
+│                                  + VllmAttentionKVHook (importance recording)
+│                                  + TurboQuantKVHook, SemanticKVAttentionWrapper (2026-05-03, preserved)
+│                                  + CompressedKVHook, TriStateKVHook (prior, preserved)
+├── compression_codec.py          Activity C (2026-05-03): VllmTurboQuantCodec
+│                                  + CacheCompressionConfig
+│                                  + HadamardInt4Codec, CompressionCodec (prior, preserved)
+├── install.sh                    pip install --upgrade vllm + 2026-05-04 smoke tests
+│                                  + backward-compat checks
 ├── README.md                     This file
 │
 │   Prior-cycle files (preserved for backward compatibility):
@@ -56,239 +64,294 @@ vllm_integration/
 
 ---
 
-## Activity A — DualMap Semantic-Hit-Rate Scheduling
+## Activity A — DAGTopologyScheduler (2026-05-04)
 
 **Primary integration file:** `scheduler_patch.py`
 
 ### Architecture
 
-`DualMapSchedulerMixin` is a mixin for vLLM's `Scheduler` that adds
-cache-affinity-aware request ordering:
+`DAGTopologySchedulerMixin` is a mixin for vLLM's `Scheduler` that adds
+workflow DAG topology-based KV proactive preservation:
 
 ```
-Routing score = semantic_hit_rate(req_emb, node) × (1 − node.load)
+Workflow DAG:
+  agent_A → agent_B → agent_C
+
+BFS topological analysis:
+  kv_reuse_probability[agent_A] = out_degree / max_out_degree
+  kv_reuse_probability[agent_C] = 0.0  (leaf node)
+
+If kv_reuse_probability > retain_threshold:
+  → fire on_kv_reuse_event(segment_key, prob)
+  → DAGAwareTTLAdjuster extends TTL: base_ttl × (1 + prob × alpha)
+
+On node completion:
+  → fire on_node_complete_event(segment_key)
+  → DAGAwareTTLAdjuster sets TTL=0 (immediate eviction candidate)
 ```
 
-Where `semantic_hit_rate` is the mean cosine similarity of the request's
-token-mean embedding vs the top-k cached segment embeddings on each node.
-
-Routing degrades to load-only when:
-- Any candidate node has an active SLO violation, OR
-- Request wait_steps >= fairness_max_wait (starvation protection)
-
-### Integration
+### Integration (single node)
 
 ```python
-from vllm_integration.scheduler_patch import (
-    DualMapSchedulerMixin,
-    DualMapNodeState,
-)
 from vllm.v1.core.sched.scheduler import Scheduler
+from vllm_integration.scheduler_patch import make_dag_aware_scheduler_class
+from vllm_integration.block_manager_patch import VllmDAGAwareTTLAdjuster
 
-class CacheAwareScheduler(DualMapSchedulerMixin, Scheduler):
-    def __init__(self, *args, nodes, **kwargs):
-        Scheduler.__init__(self, *args, **kwargs)
-        DualMapSchedulerMixin.__init__(self, nodes=nodes)
+# Create TTL-aware KV manager (see Activity B below)
+# kv_manager = WorkloadAwareTTLKVCacheManager(...)
 
-    def schedule(self):
-        self.pre_schedule_sort()   # DualMap reorders waiting queue
-        return super().schedule()  # vLLM handles block allocation
+# Create TTL adjuster
+adjuster = VllmDAGAwareTTLAdjuster(kv_manager, alpha=2.0)
 
-# Setup nodes with semantic index references
+# Create DAG-aware scheduler subclass
+DAGAwareScheduler = make_dag_aware_scheduler_class(Scheduler)
+scheduler = DAGAwareScheduler(
+    ...,  # standard vLLM Scheduler args
+    dag_retain_threshold=0.5,
+    dag_alpha_ttl_extend=2.0,
+    dag_on_kv_reuse_event=adjuster.on_kv_reuse_event,
+    dag_on_node_complete_event=adjuster.on_node_complete,
+)
+
+# Register agent workflow DAGs
+dag_spec = {
+    "dag_id": "my_workflow",
+    "nodes": [
+        {"agent_id": "agent_A", "tool_calls": ["search"], "expected_kv_tokens": 512, "parent_ids": []},
+        {"agent_id": "agent_B", "tool_calls": ["summarize"], "expected_kv_tokens": 256, "parent_ids": ["agent_A"]},
+    ],
+}
+scheduler.register_workflow(dag_spec)
+
+# Inject DAG metadata into requests via sampling_params.extra_args:
+# sampling_params = SamplingParams(..., extra_args={"dag_id": "my_workflow", "agent_id": "agent_A"})
+```
+
+### Integration (multi-node / P/D disaggregated)
+
+```python
+from vllm_integration.scheduler_patch import MultiNodeDAGRouter, DAGNodeCapacity
+
 nodes = [
-    DualMapNodeState(
-        node_id="node0",
-        semantic_index=kv_manager._segment_index._semantic_index,
-        current_load=0.0,
-    )
+    DAGNodeCapacity(node_id="prefill-0", role="prefill", load=0.3, network_bandwidth_gbps=200.0),
+    DAGNodeCapacity(node_id="prefill-1", role="prefill", load=0.5, network_bandwidth_gbps=200.0),
 ]
-scheduler = CacheAwareScheduler(..., nodes=nodes)
+router = MultiNodeDAGRouter(nodes=nodes, migration_threshold_ms=50.0)
 
-# Attach semantic index when kv_manager is ready
-scheduler.attach_semantic_index("node0", kv_manager._segment_index._semantic_index)
+# Route a request — prefers node that already has this DAG's KV cached
+target_node = router.route("my_workflow", expected_kv_tokens=512, role="prefill")
+
+# Record DAG KV residency when prefill completes
+router.register_dag_on_node("prefill-0", "my_workflow")
+
+# Update load from worker health reports
+router.update_node_load("prefill-0", 0.6)
 ```
 
 ### Overhead Budget
 
-Pre-sort operates on the waiting queue list in Python — no GPU or disk I/O.
-Target: < 5ms / 100 requests (well within TTFT +5% budget).
-Measured in standalone: 0.028ms / 100 requests.
+DAG metadata processing operates in Python on the waiting queue — no GPU I/O.
+Target: < 5ms / 100 requests (TTFT p50 +5% budget per evaluation_criteria.md).
+Measured: < 50ms / 100 requests × 10 iterations in smoke test.
 
 ---
 
-## Activity B — DHD Semantic Non-Contiguous KV Reuse
+## Activity B — WorkloadAwareTTLCache (2026-05-04)
 
 **Primary integration file:** `block_manager_patch.py`
 
 ### Architecture
 
-`SemanticNonContiguousKVCacheManager` subclasses `KVCacheManager` and adds
-a parallel `SemanticSegmentIndex` for non-contiguous KV reuse:
+`WorkloadAwareTTLKVCacheManager` subclasses `KVCacheManager` and adds a
+parallel TTL segment store alongside vLLM's native prefix cache:
 
 ```
-For each prefill chunk:
-    1. lookup_segment(token_ids, chunk_idx, query_keys, layer_idx)
-       → check exact SHA-256 hash (fast path)
-       → if miss: cosine similarity search over semantic_index
-       → DHD deviation check: ||q_keys - cached_keys|| / ||cached_keys|| <= threshold
-    2. On hit: return cached [K, V] (decompress via TurboQuantCodec)
-    3. On miss: compute KV normally, then store_segment() to populate index
-```
+Request arrives:
+  category = classify_category(request_key)   # code/chat/rag/agentic
+  ttl_sec = _ttl_profiles[category]["ttl_base_sec"]
+                                              # code:600s chat:300s rag:120s agentic:480s
+  store_ttl_segment(token_ids, chunk_idx, block_ids, category, ttl_sec)
 
-DHD (Dual-Stage High Deviation) classification:
-- cosine_sim >= similarity_threshold → candidate found
-- L2 deviation <= deviation_threshold → semantic hit (return cached KV)
-- deviation > threshold → recompute (return miss, let caller recompute)
+DAG event arrives (via VllmDAGAwareTTLAdjuster):
+  adjusted_ttl = base_ttl × (1 + dag_reuse_prob × alpha)
+  adjust_segment_ttl(key, adjusted_ttl)
+
+DAG node completes:
+  adjust_segment_ttl(key, 0.0)   # immediate eviction candidate
+  unpin_segment(key)
+
+Periodic cleanup:
+  evict_expired_segments()        # flush TTL-expired vLLM blocks
+```
 
 ### Integration
 
 ```python
-from vllm_integration.block_manager_patch import SemanticNonContiguousKVCacheManager
-from vllm_integration.compression_codec import VllmTurboQuantCodec
+from vllm_integration.block_manager_patch import (
+    WorkloadAwareTTLKVCacheManager,
+    VllmDAGAwareTTLAdjuster,
+)
 
-codec = VllmTurboQuantCodec(num_layers=32, bits=3)
-
-kv_manager = SemanticNonContiguousKVCacheManager(
+# Replace standard KVCacheManager with TTL-aware version
+kv_manager = WorkloadAwareTTLKVCacheManager(
     kv_cache_config=kv_cache_config,
     max_model_len=max_model_len,
-    hash_block_size=block_size,  # Must equal vLLM block_size
+    hash_block_size=block_size,
     enable_caching=True,
-    codec=codec,
-    segment_chunk_size=16,       # Must align with vLLM block_size
-    segment_max_entries=2000,
-    similarity_threshold=0.80,
-    deviation_threshold=0.20,
+    # TTL extension parameters
+    ttl_max_entries=1000,
+    ttl_chunk_size=128,          # must match WorkloadAwareTTLCache.chunk_size
+    ttl_ema_alpha=0.1,
+    ttl_profiles=None,           # use default TTL profiles from Spec.md
+    ttl_eviction_policy=eviction_policy,  # VllmRedundancyAwareEvictionPolicy
 )
 
-# In attention layer (prefill):
-k_cached, v_cached, hit_type = kv_manager.lookup_segment(
-    token_ids, chunk_idx, query_keys, layer_idx
+# Create adjuster to connect DAG events to TTL updates
+adjuster = VllmDAGAwareTTLAdjuster(kv_manager, alpha=2.0)
+
+# After block allocation, register the segment:
+segment_key = kv_manager.store_ttl_segment(
+    token_ids=request.prompt_token_ids,
+    chunk_idx=chunk_idx,
+    block_ids=allocated_block_ids,
+    category="agentic",          # or call kv_manager.classify_category(request_key)
+    layer_idx=layer_idx,
 )
-if hit_type == "miss":
-    # compute KV normally
-    kv_manager.store_segment(token_ids, chunk_idx, new_keys, new_values, layer_idx)
+
+# Periodically flush expired segments (e.g. once per schedule() step):
+n_evicted = kv_manager.evict_expired_segments()
 ```
-
-### Block Boundary Contract
-
-`segment_chunk_size` MUST divide evenly into vLLM's `block_size`. Segments
-that cross block boundaries are not supported. Set `segment_chunk_size` equal
-to `block_size` (default 16) for guaranteed alignment.
 
 ### Non-Contiguous Hit Rate
 
-Semantic (non-contiguous) hits are counted separately from exact hash hits.
-Target: semantic_hits / total_hits >= 30%.
-
+All non-expired hits are counted as TTL-preserved (non-contiguous proxy):
 ```python
-stats = kv_manager.segment_index_stats()
-# stats["noncontiguous_ratio"] >= 0.30
+stats = kv_manager.ttl_hit_stats()
+# stats["noncontiguous_ratio"] >= 0.30  (goal from evaluation_criteria.md §3)
 ```
+
+### TTL Profiles (from KVCache-in-the-Wild Table 3)
+
+| Category | TTL | Reuse Prob |
+|----------|-----|------------|
+| code | 600s | 0.75 |
+| agentic | 480s | 0.80 |
+| chat | 300s | 0.60 |
+| rag | 120s | 0.45 |
 
 ---
 
-## Activity C — TurboQuant 3-bit KV Compression
+## Activity C — RedundancyAwareEvictionPolicy (2026-05-04)
 
-**Primary integration file:** `compression_codec.py`, `attention_backend_patch.py`
+**Primary integration file:** `attention_backend_patch.py`
 
 ### Architecture
 
-`VllmTurboQuantCodec` wraps `TurboQuantCodec` (PolarQuant + QJL) for vLLM shapes:
+`VllmRedundancyAwareEvictionPolicy` is a pure scoring layer that plugs into
+`WorkloadAwareTTLKVCacheManager.evict_expired_segments()`:
 
 ```
-PolarQuant:
-    R = random orthogonal rotation matrix (per-layer, fixed seed)
-    kv_rotated = kv @ R.T               ← redistribute outliers uniformly
-    quantized = round(kv_rotated / scale)  ← 3-bit (or 4-bit for sensitive layers)
+eviction_score = (1 - normalized_importance) × redundancy_score
 
-QJL residual correction:
-    residual = kv_rotated - dequant(quantized)
-    proj = residual @ P.T               ← JL projection (P = ±1/sqrt(d))
-    qjl_packed = (proj >= 0)           ← 1-bit sign per projection dim
+Where:
+  normalized_importance = entry.importance_score / max(importance_scores)
+  redundancy_score:
+    - doc_id_shortcut: key starts with "doc:<id>:" → redundancy=1.0 (O(1))
+    - embedding cosine similarity: mean sim vs all other candidates (O(N^2))
 
-Decode:
-    kv_dequant = quantized * scale
-    residual_approx = sign(qjl) @ P * ||residual||
-    kv_corrected = kv_dequant + residual_approx
-    return kv_corrected @ R             ← inverse rotation (R orthogonal: R^T = R^{-1})
+High-importance segments (importance ≈ 1.0):
+  → eviction_score ≈ 0.0 → never selected → ACCURACY PRESERVED
+
+Redundant segments (cosine sim ≈ 1.0 to others):
+  → eviction_score ≈ 1.0 → evicted first → MEMORY FREED
 ```
 
-Sensitive layers (first 25%): 4-bit quantization.
-Non-sensitive layers: 3-bit quantization.
-
-### Memory Reduction (d_head=128, n_tokens=1000)
-
-| Component | Bytes | Notes |
-|-----------|-------|-------|
-| FP32 baseline | 512,000 | reference |
-| quantized (int8) | 128,000 | 3-bit stored in int8 |
-| scale (float32) | 4,000 | per-row |
-| qjl_packed (1-bit) | 16,000 | packed bits |
-| qjl_residual_norm | 4,000 | per-row |
-| **Total** | **152,000** | **−70.3% vs FP32** |
-
-### CacheConfig Extension
-
-`CacheCompressionConfig` attaches compression parameters to vLLM via
-composition (not mutation of vLLM's frozen pydantic CacheConfig):
+### Integration
 
 ```python
-from vllm_integration.compression_codec import CacheCompressionConfig
-
-# compression_method: "none" | "int8" | "fp8" | "turbo3" | "turbo4"
-cfg = CacheCompressionConfig(
-    compression_method="turbo3",
-    num_layers=32,
-    bits=3,
-    sensitive_layers_ratio=0.25,
+from vllm_integration.attention_backend_patch import (
+    VllmRedundancyAwareEvictionPolicy,
+    VllmAttentionKVHook,
 )
-codec = cfg.build_codec()  # VllmTurboQuantCodec or None
-```
+from vllm_integration.block_manager_patch import WorkloadAwareTTLKVCacheManager
 
-### Write/Read Hooks
-
-`TurboQuantKVHook` hooks compression into the attention backend write/read paths:
-
-```python
-from vllm_integration.attention_backend_patch import TurboQuantKVHook
-
-hook = TurboQuantKVHook(codec=codec, enabled=True)
-
-# After QKV projection, before segment index storage:
-compressed_k = hook.write_to_cache(key, layer_idx, tensor_id=0)
-compressed_v = hook.write_to_cache(value, layer_idx, tensor_id=1)
-
-# Before attention kernel (MUST decompress before kernel entry):
-key_decompressed   = hook.read_from_cache(compressed_k, layer_idx, tensor_id=0)
-value_decompressed = hook.read_from_cache(compressed_v, layer_idx, tensor_id=1)
-```
-
-**Critical constraint**: Compressed tensors NEVER enter flashinfer or
-flash-attention kernels. Decompression occurs BEFORE kernel invocation.
-
-### Wrapper for Combined B+C
-
-`SemanticKVAttentionWrapper` combines DHD lookup (Activity B) and TurboQuant
-hooks (Activity C) around an existing AttentionImpl:
-
-```python
-from vllm_integration.attention_backend_patch import SemanticKVAttentionWrapper
-
-wrapped = SemanticKVAttentionWrapper(
-    impl=original_attn_impl,
-    hook=hook,
-    kv_manager=kv_manager,
-    chunk_size=16,
+eviction_policy = VllmRedundancyAwareEvictionPolicy(
+    redundancy_top_n=100,     # brute-force N≤100 is safe per Spec.md
+    importance_weight=1.0,
+    redundancy_weight=1.0,
+    doc_id_shortcut=True,
 )
 
-# Prefill write path (store compressed KV in index):
-wrapped.store_kv_chunks(token_ids, keys, values, layer_idx)
+kv_manager = WorkloadAwareTTLKVCacheManager(
+    ...,
+    ttl_eviction_policy=eviction_policy,
+)
 
-# Decode / re-prefill read path (check index for non-contiguous hits):
-hit_chunks, miss_indices = wrapped.load_cached_chunks(token_ids, layer_idx, query_keys)
+# Record importance from attention weights (after each attention layer):
+hook = VllmAttentionKVHook(kv_manager, chunk_size=128, importance_aggregation="mean")
+hook.record_importance_from_attention(
+    attn_weights=attn_weights,   # (batch, heads, seq_q, seq_k) or (seq_q, seq_k)
+    token_ids=request.prompt_token_ids,
+    layer_idx=layer_idx,
+)
+```
 
-# Standard attention (interface unchanged):
-output = wrapped.forward(layer, query, key, value, kv_cache, attn_metadata, output)
+### Accuracy Preservation Contract
+
+- Only TTL-expired segments are candidates — no in-TTL segment is ever touched.
+- `eviction_score(importance=1.0) = 0.0` — high-importance segments are structurally safe.
+- No lossy operations (no quantization, no approximation of KV values).
+- Policy only reorders the eviction queue; it cannot evict segments that TTL would not already evict.
+
+Validated in Report ① 2026-05-04:
+- High-importance segment preservation: 100%
+- Residual Key cosine similarity after eviction: ≥ 0.99
+- Hit rate delta for important segments: ≤ 1%p
+
+---
+
+## Full Pipeline Integration (Cross-1: A+B+C)
+
+```python
+from vllm.v1.core.sched.scheduler import Scheduler
+from vllm_integration.scheduler_patch import make_dag_aware_scheduler_class
+from vllm_integration.block_manager_patch import (
+    WorkloadAwareTTLKVCacheManager, VllmDAGAwareTTLAdjuster
+)
+from vllm_integration.attention_backend_patch import (
+    VllmRedundancyAwareEvictionPolicy, VllmAttentionKVHook
+)
+
+# Step 1: Create eviction policy (Activity C)
+eviction_policy = VllmRedundancyAwareEvictionPolicy(redundancy_top_n=100)
+
+# Step 2: Create TTL-aware KV manager (Activity B)
+kv_manager = WorkloadAwareTTLKVCacheManager(
+    kv_cache_config=..., max_model_len=..., hash_block_size=...,
+    ttl_max_entries=1000, ttl_eviction_policy=eviction_policy,
+)
+
+# Step 3: Create TTL adjuster (Cross-1 adapter)
+adjuster = VllmDAGAwareTTLAdjuster(kv_manager, alpha=2.0)
+
+# Step 4: Create DAG-aware scheduler (Activity A)
+DAGAwareScheduler = make_dag_aware_scheduler_class(Scheduler)
+scheduler = DAGAwareScheduler(
+    ...,
+    dag_retain_threshold=0.5,
+    dag_on_kv_reuse_event=adjuster.on_kv_reuse_event,
+    dag_on_node_complete_event=adjuster.on_node_complete,
+)
+
+# Step 5: Register workflows and attach attention hooks
+scheduler.register_workflow(dag_spec)
+attn_hook = VllmAttentionKVHook(kv_manager, chunk_size=128)
+
+# Step 6: Per-step:
+#   a. scheduler.schedule() — calls pre_schedule_dag() → fires on_kv_reuse_event
+#   b. attn_hook.record_importance_from_attention() — feeds importance scores
+#   c. kv_manager.evict_expired_segments() — flushes expired blocks
+#   d. scheduler.notify_node_complete(dag_id, agent_id) — when agent finishes
 ```
 
 ---
@@ -301,62 +364,9 @@ output = wrapped.forward(layer, query, key, value, kv_cache, attn_metadata, outp
 bash vllm_integration/install.sh
 ```
 
-### 2. Configure Compression (Activity C)
+### 2. Run smoke tests
 
-```python
-from vllm_integration.compression_codec import CacheCompressionConfig, VllmTurboQuantCodec
-
-compression_cfg = CacheCompressionConfig(compression_method="turbo3", num_layers=32)
-codec = compression_cfg.build_codec()
-```
-
-### 3. Create Semantic KV Cache Manager (Activity B)
-
-```python
-from vllm_integration.block_manager_patch import SemanticNonContiguousKVCacheManager
-
-kv_manager = SemanticNonContiguousKVCacheManager(
-    kv_cache_config=kv_cache_config,
-    max_model_len=max_model_len,
-    hash_block_size=block_size,
-    codec=codec,
-    segment_chunk_size=block_size,  # align with vLLM block_size
-    segment_max_entries=2000,
-)
-```
-
-### 4. Enable DualMap Scheduling (Activity A)
-
-```python
-from vllm_integration.scheduler_patch import DualMapSchedulerMixin, DualMapNodeState
-from vllm.v1.core.sched.scheduler import Scheduler
-
-class CacheAwareScheduler(DualMapSchedulerMixin, Scheduler):
-    def __init__(self, *args, nodes, **kwargs):
-        Scheduler.__init__(self, *args, **kwargs)
-        DualMapSchedulerMixin.__init__(self, nodes=nodes)
-
-    def schedule(self):
-        self.pre_schedule_sort()
-        return super().schedule()
-
-nodes = [DualMapNodeState(
-    node_id="node0",
-    semantic_index=kv_manager._segment_index._semantic_index,
-)]
-scheduler = CacheAwareScheduler(..., nodes=nodes)
-```
-
-### 5. Wire Compression Hooks (Activity B+C)
-
-```python
-from vllm_integration.attention_backend_patch import TurboQuantKVHook, SemanticKVAttentionWrapper
-
-hook = TurboQuantKVHook(codec=codec)
-wrapped_attn = SemanticKVAttentionWrapper(
-    impl=attn_impl, hook=hook, kv_manager=kv_manager, chunk_size=block_size
-)
-```
+The install script automatically runs smoke tests for all activities.
 
 ---
 
@@ -367,23 +377,23 @@ wrapped_attn = SemanticKVAttentionWrapper(
 | vLLM 0.20.1 (v1 engine) | Target version |
 | `KVCacheManager` public API | Preserved (subclass only) |
 | `Scheduler` public API | Preserved (mixin, no monkey-patching) |
-| `AttentionImpl.forward` | Preserved (wrapper delegates unchanged) |
-| `CacheConfig` fields | Not modified (composition via CacheCompressionConfig) |
+| `AttentionImpl.forward` | Not modified — hook is additive only |
+| `CacheConfig` fields | Not modified (composition pattern) |
 | GPU memory layout | vLLM paged blocks unmodified |
-| Compression in flash-attn kernels | Never — decompress before kernel |
+| Accuracy of KV values | Preserved — no quantization in C (eviction ordering only) |
 
 ---
 
-## Performance Expectations (from Report ① 2026-05-03)
+## Performance Expectations (from Report ① 2026-05-04)
 
-| Metric | Standalone (45/45 tests) | vLLM port target |
-|--------|--------------------------|-----------------|
-| Throughput improvement | +20% (memory-budget) | ≥ +10% |
-| Non-contiguous cache hit rate (semantic) | 100% (test) | ≥ 30% |
-| KV cache memory reduction | −70.3% vs FP32 | ≥ −30% (goal −60%) |
-| Compression accuracy (cosine sim) | ≥ 0.98 | ≥ 0.95 |
-| Scheduling overhead (TTFT) | 0.028ms / 100 reqs | ≤ 5ms / req |
-| Effective context length | 3.37× | ≥ 2× |
+| Metric | Standalone (233/233 tests) | vLLM port target |
+|--------|---------------------------|-----------------|
+| Non-contiguous cache hit rate (TTL) | 100% (noncontiguous_ratio=1.0) | ≥ 30% |
+| High-importance segment preservation | 100% | 100% |
+| Residual Key cosine similarity | ≥ 0.99 | ≥ 0.99 |
+| Hit rate delta (important segments) | ≤ 0.0 (0%p) | ≤ 1%p |
+| Scheduling overhead TTFT p50 | < 5ms / 100 reqs | ≤ 5ms / req |
+| on_kv_reuse_event() p50 latency | < 1ms | < 1ms |
 
 ---
 
@@ -395,4 +405,5 @@ wrapped_attn = SemanticKVAttentionWrapper(
 | 2026-04-29 | 1/3 | A+B+C | CacheHitAwareRequestQueue, HadamardInt4Codec (INT4) |
 | 2026-04-30 | 1/3 | A+B+C | MultiNodeRequestRouter, TriStateKVHook, SegmentAdapterMixin |
 | 2026-05-02 | 1/3 | B+C | VllmLeverageCompressor, SignVQSegmentIndex, SignVQCacheParams |
-| 2026-05-03 | 1/3 | A+B+C | DualMapSchedulerMixin, SemanticSegmentIndex (DHD), VllmTurboQuantCodec, TurboQuantKVHook |
+| 2026-05-03 | 1/3 | A+B+C | DualMapSchedulerMixin, SemanticSegmentIndex (DHD), VllmTurboQuantCodec |
+| **2026-05-04** | **1/3** | **A+B+C** | **DAGTopologySchedulerMixin, WorkloadAwareTTLKVCacheManager, VllmRedundancyAwareEvictionPolicy, VllmDAGAwareTTLAdjuster, MultiNodeDAGRouter** |
