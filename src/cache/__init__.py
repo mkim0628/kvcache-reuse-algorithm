@@ -10,6 +10,9 @@ from src.cache.info_flow_reorder import InfoFlowChunkReorderCache
 from src.cache.tri_attention_codec import TriAttentionCodec
 from src.cache.qc_tri_store import QueryCentricTriAttentionCache
 from src.cache.dual_filter_selector import DualFilterSegmentSelector
+from src.cache.eopt_shrinkq_codec import eOptShrinkQCodec
+from src.cache.static_dynamic_segment import StaticDynamicSegmentCache
+from src.cache.manifoldkv_windowed import ManifoldKVWindowedEviction
 
 __all__ = [
     "CacheStore",
@@ -25,4 +28,7 @@ __all__ = [
     "TriAttentionCodec",
     "QueryCentricTriAttentionCache",
     "DualFilterSegmentSelector",
+    "eOptShrinkQCodec",
+    "StaticDynamicSegmentCache",
+    "ManifoldKVWindowedEviction",
 ]
