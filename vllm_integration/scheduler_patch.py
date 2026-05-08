@@ -1614,6 +1614,9 @@ class PreemptiveKVOffloadSchedulerMixin:
             "currently_preempted": len(self._pko_preempted),
             "buffer_occupancy_ratio": self._pko_buffer_occupancy_ratio(),
             "consumption_rate": self._pko_estimate_consumption_rate(),
+            # Added in loop 2: requested by vllm-evaluator feedback
+            "preempted_requests": list(self._pko_preempted.keys()),
+            "buffer_occupancy_threshold": self._pko_threshold,
         }
 
     # ------------------------------------------------------------------
