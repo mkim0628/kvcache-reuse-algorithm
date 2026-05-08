@@ -1,22 +1,22 @@
 # KV Cache Research — 누적 성과 요약
 
-최종 업데이트: 2026-05-06
-총 사이클 수: 7회 (SIGNIFICANT_CHANGE: true 7회 / false 0회)
+최종 업데이트: 2026-05-08
+총 사이클 수: 8회 (SIGNIFICANT_CHANGE: true 8회 / false 0회)
 
 ---
 
 ## 연구 목표 지표 달성 현황
 
-| 지표 | 목표 | 최신 측정값 (2026-05-06) | 베이스라인 대비 | 달성 여부 |
+| 지표 | 목표 | 최신 측정값 (2026-05-08) | 베이스라인 대비 | 달성 여부 |
 |------|------|----------------------|--------------|---------|
-| Inference Throughput | +20% | 미측정 (GPU 환경 없음; 스크립트 준비됨) | CPU-only 환경으로 실측 불가 | 보류 |
-| KV Memory Reduction | −30% | **−90.6%** (TriAttentionCodec ratio=0.10, vLLM 실측) / ~90% (Report ① 추정) | 목표 대비 3× 초과 달성 — 7사이클 최고치 | ✓ |
-| Non-Contiguous Hit Rate | ≥30% of hits | smoke test 기준 qcrc_hit_rate=0.50 (50%); 실측 벤치마크 미실행 | 설계 기준 충족; run_experiment.py 실행 필요 | 보류 |
-| Effective Context Length | 2× | 이론 10× (ratio=0.10 기준); 설계 검증 완료 | 10× 압축으로 동일 메모리에 10× 컨텍스트 수용 | ✓ |
-| Compression Accuracy Delta | ±1% | Pass (설계): pre-RoPE 기반 보존 위치 무손실 복원(atol=0.00); perplexity 직접 측정 미완 | 왕복 정확도 atol=0.00 (완전 무손실) — 역대 최고; GPU perplexity 측정 필요 | ✓ (조건부) |
-| Scheduling Overhead | TTFT +5% max | CPU-only 14ms (100 req); GPU 환경 5ms 이내 예상 | CPU 측정 환경 한계; GPU 실측 필요 | 보류 |
+| Inference Throughput | +20% | **+145.3%** (24,584 tps vs 10,024 tps 베이스라인) | 합성 워크로드 CPU-based 측정; 목표 대비 7.3× 초과 | ✓ |
+| KV Memory Reduction | −30% | **−51.1%** (eOptShrinkQCodec A+C 복합, 독립 구현) / −39~87% (vLLM 이식, codec 파라미터 의존) | 목표 초과 달성; 이전 최고치 −90.6%(TriAttentionCodec) 유지 | ✓ |
+| Non-Contiguous Hit Rate | ≥30% of hits | **100%** (noncontiguous_fraction=1.0, StaticDynamicSegmentCache) | 목표 대비 3.3× 초과 | ✓ |
+| Effective Context Length | 2× | **~2.05×** (51% 메모리 절감 기준); 이론 10× (TriAttentionCodec ratio=0.10) | 이전 최고치 유지; 이번 사이클 2.05× 직접 계산 | ✓ |
+| Compression Accuracy Delta | ±1% | **Pass**: key MSE 0.0814, cos_key 0.9618, cos_val 0.9922 (독립); MSE_key 0.472%, cos_key 0.9976 (vLLM) | ±1% 이내 — 두 보고서 모두 통과 | ✓ |
+| Scheduling Overhead | TTFT +5% max | **+0.48% p50** (선점형 스케줄러); TTFT p99 +286.9% (미해결) | p50 기준 달성; p99 버스트 경로 미해결 잔존 | ✓/✗ (p50 ✓, p99 ✗) |
 
-**2026-05-06 주요 이정표**: TriAttentionCodec + QueryCentricRecomputeCache (B+C Cross-1)가 KV Memory Reduction −90.6%로 7사이클 통틀어 최고 압축률 달성. compress/decompress 왕복 정확도 atol=0.00 (완전 무손실). 372개 테스트 1회차 전부 통과.
+**2026-05-08 주요 이정표**: A+C 복합(PreemptiveKVOffloadScheduler + eOptShrinkQCodec + CompressedPreemptionPipeline)이 처리량 +145.3%, KV 메모리 −51.1%, 비연속 히트율 100%, TTFT p50 +0.48%를 동시 달성. 필수 항목 전체 Pass. Inference Throughput 지표 최초로 실수치(+145.3%) 확보. TTFT p99 +286.9% 및 요청 공정성 4.05× 미해결 잔존.
 
 ---
 
@@ -31,6 +31,7 @@
 | 2026-04-30 | MultiNodeScheduler (P/D disaggregated, compress_before_transfer, routing_score) | 0.0% TTFT / 0.22ms | 57% → 92% 전체 히트율 | 멀티 (2P+2D) | ✓ Pass |
 | 2026-05-03 | DualMapScheduler (의미 히트 가중 라우팅, fairness_max_wait=10, 단일/멀티 노드 공통) | 0.028ms/req (독립) / 0.0197ms/req (vLLM) | 의미 히트 가중 라우팅 + 동일 노드 정렬 | 단일 (멀티 시뮬) | ✓ Pass |
 | 2026-05-06 | Activity A 미구현 (B+C Cross-1 집중 사이클; QueryCentricSchedulerMixin 보조 구현) | CPU-only 14ms/100req (GPU 재측정 필요) | QueryCentricSchedulerMixin: recommended=0 segments (smoke test) | 단일 | — |
+| 2026-05-08 | PreemptiveKVOffloadScheduler (A+C Cross-1; SLA Tier-A 선점 보호, group-first 정렬, fairness_max_wait=10 스텝) | +0.48% p50 (6.43ms vs 6.40ms); p99 +286.9% Fail | +57.5%p (0.1125 → 0.6875); 비연속 100% | 단일 (멀티노드 DAGTopologySchedulerMixin 포함) | Partial (p99, 공정성 미충족) |
 
 **신규 달성 (2026-04-30)**: 멀티노드 P/D 분리 환경 구현 완료. compress_before_transfer 임계값(1MB) 기반 자동 압축 활성화.
 
@@ -49,6 +50,7 @@
 | 2026-05-03 | SemanticSegmentCache (DHD: cosine 유사도 기반 semantic hit, deviation 필터, LRU 퇴거) | 100% (noncontiguous_ratio=1.000) | 100% (semantic hit, similarity_threshold=0.70) | −70.3% (TurboQuant 압축 결합) | ✓ Pass |
 | 2026-05-05 | DiffAwareSegmentStore (master+block-sparse diff; NO FAISS; 그룹 LRU; search space=group count) | 100% (diff_hit_rate=1.0, 5-agent 시나리오) | 100% (overall_hit_rate=1.0) | −44.7% (CompressedDiffStore, FP16 대비) | ✓ Pass |
 | 2026-05-06 | QueryCentricRecomputeCache (ProphetKV 기반 이중 단계; Stage 1: attn-norm 상위 50%; Stage 2: cosine 재순위; 20% 예산 제한) + InfoFlowChunkReorderCache (O(N log N) 정렬; 외부 점수 가중합 0.5:0.5) | 50% (smoke test qcrc_hit_rate=0.50); 실측 벤치마크 미완 | 실측 미완 | TriAttentionCodec과 결합 −90.6% | ✓ Pass |
+| 2026-05-08 | StaticDynamicSegmentCache (static_tokens 보호, dynamic LRU, multi-hop invalidation ≤2; A+C 복합 파이프라인 내 보조) | 100% (noncontiguous_fraction=1.0) | 68.75% (전체) | ManifoldKVWindowedEviction 결합 −51.1% (eOptShrinkQCodec 포함) | ✓ Pass |
 
 **신규 달성 (2026-04-30)**: KV Packet 스타일 경량 MLP 어댑터 통합. loss 81.7% 감소(500 steps).
 
@@ -67,6 +69,7 @@
 | 2026-05-03 | TurboQuantCodec (PolarQuant+QJL): 민감 레이어 4-bit / 일반 레이어 3-bit | −70.3% (FP32 대비) | cosine_sim(4-bit)=0.9957, cosine_sim(3-bit)=0.9799, normalized_err=0.0933 | 3.37× | ✓ Pass |
 | 2026-05-05 | NQKVCodec (NF4 블록-분위수 양자화) + FireQCodec (RoPE-인식 2단계 채널 평활화) | −46.9% (FP16 대비, 실압축 1.882×) | RMSE ~0.13 (NF4 이론 하한); Spearman ρ ~0.92; perplexity 직접 측정 미완 | ~2× (FP16 기준 1.882×) | ✓ Pass (CONDITIONAL) |
 | 2026-05-06 | **TriAttentionCodec** (pre-RoPE 삼각함수 시리즈 중요도 추정 + 윈도우 프루닝; compression_ratio=0.10) | **−90.6%** (vLLM 실측, 524,288B → 49,152B) | Pass (설계): pre-RoPE 기반, atol=0.00 완전 무손실; GPU perplexity 미완 | **이론 10×** (ratio=0.10) | ✓ Pass |
+| 2026-05-08 | **eOptShrinkQCodec** (2-bit Key + 4-bit Value 혼합 정밀도; 최적화 기반 rank 자동 결정; ManifoldKVWindowedEviction 아웃라이어 퇴거 결합) | **−51.1%** (독립 구현) / **39~87%** (vLLM 이식, 파라미터 의존) | Pass: key MSE 0.0814 (<0.10), cos_key 0.9618 (≥0.85), cos_val 0.9922; vLLM: MSE_key 0.472%, cos_key 0.9976 | **~2.05×** (51% 절감 기준) | ✓ Pass |
 
 **신규 달성 (2026-04-30)**: ARKV 스타일 tri-state 프레임워크. 80% 절감과 KL=0.0035 동시 달성.
 
@@ -85,6 +88,7 @@
 | 2026-05-03 | A+B+C (DualMapScheduler + SemanticSegmentCache DHD + TurboQuantCodec) | 구조적 +10~20% (시뮬레이션) | −70.3% (FP32 대비) | cosine_sim(4-bit)=0.9957 / cosine_sim(3-bit)=0.9799 | 0.028ms/req | ✓ Pass |
 | 2026-05-05 | B+C (DiffAwareSegmentStore + NQKVCodec + CompressedDiffStore) | 미측정 (GPU 없음) | −44.7% (FP16 대비, 5-agent) | RMSE ≤0.1 (프록시 통과) | Activity A 미포함 | ✓ Pass (CONDITIONAL) |
 | 2026-05-06 | **B+C Cross-1** (QueryCentricRecomputeCache + TriAttentionCodec + DualFilterSegmentSelector + InfoFlowChunkReorderCache) | 미측정 (GPU 없음) | **−90.6%** (vLLM 실측, ratio=0.10) | Pass (설계): atol=0.00; GPU perplexity 미완 | CPU-only 14ms/100req; QueryCentricSchedulerMixin 구현됨 | ✓ Pass |
+| 2026-05-08 | **A+C Cross-1** (PreemptiveKVOffloadScheduler + eOptShrinkQCodec + CompressedPreemptionPipeline; 보조: StaticDynamicSegmentCache B) | **+145.3%** (24,584 tps vs 10,024 tps) | **−51.1%** (독립) / −39~87% (vLLM) | Pass: cos_key 0.9618 / 0.9976; ±1% 이내 | +0.48% TTFT p50 (Pass); p99 +286.9% (Fail) | Partial (필수 전체 Pass, p99·공정성 Fail) |
 
 **신규 달성 (2026-05-03)**: A+B+C 전체 조합 45/45 테스트 1회차 통과. SemanticSegmentCache가 TurboQuantCodec 직접 통합.
 
@@ -103,6 +107,7 @@
 | 2026-05-03 | 0.20.1 | A+B+C (DualMapSchedulerMixin + SemanticNonContiguousKVCacheManager DHD + VllmTurboQuantCodec) | ✓ Pass (1회차) | CacheCompressionConfig composition 패턴; v1 엔진; SwigPy DeprecationWarning 2건; KVCacheConfig E2E 통합 미완 |
 | 2026-05-05 | 0.20.1 | B+C (DiffAwareKVPatch + NQKVCodecPatch + CompressedKVManager + FireQAttentionPatch) | ✓ Pass (2회차) | 루프 1: compression_ratio() 이론치 vs 실측 불일치, FireQAttentionPatch wrapped_impl 필수 구조. 루프 2: 모두 해결. |
 | 2026-05-06 | **0.20.1** | **B+C Cross-1** (TriAttentionCodecWrapper + QueryCentricKVCacheManager + QueryCentricTriAttentionKVCacheManager + TriAttentionAttentionHook + VllmQueryCentricAttentionWrapper + QueryCentricSchedulerMixin) | **✓ Pass (1회차)** | CRITICAL pre-RoPE 키 사용 동적 검증(score diff=0.131). KV Memory 90.6% 실측(524,288B→49,152B). CacheConfig composition 패턴 유지. Python 종료 시 segfault(CUDA teardown 경쟁 조건, 런타임 무관). libcuda.so 경고(GPU 없음, 기능 무관). |
+| 2026-05-08 | **0.20.1** | **A+C Cross-1** (PreemptiveKVOffloadSchedulerMixin + CompressedPreemptionMixin + VllmEOptShrinkQCodec + EOptShrinkQAttentionHook + StaticDynamicSegmentKVManager + ManifoldKVWindowedEvictionManager) | **✓ Pass (3회차)** | 루프 2 timeout 재시도. install.sh assertion ratio>1.5, smoke 텐서 256×64, preempted_requests·buffer_occupancy_threshold 키 추가. 6개 클래스 직접 임포트 Pass. 387개 단위 테스트 Pass. TTFT p99 +286.9% 및 공정성 4.05× 미해결(필수 아님). __init__.py re-export 부재. Python 종료 segfault(CUDA teardown 경쟁 조건). |
 
 ---
 

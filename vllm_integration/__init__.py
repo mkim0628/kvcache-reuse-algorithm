@@ -1,5 +1,22 @@
 # vllm_integration: Activity A+B+C KV cache port for vLLM 0.20.1
 #
+# 2026-05-08 cycle additions:
+#   scheduler_patch          — PreemptiveKVOffloadSchedulerMixin: preemptive scheduling
+#                               + async GPU→CPU KV offload (Activity A)
+#                             + CompressedPreemptionMixin: CUDA dual-stream inline
+#                               compression via VllmEOptShrinkQCodec (Activity A+C)
+#                             + make_preemptive_scheduler_class() factory
+#   compression_codec        — VllmEOptShrinkQCodec: BBP auto-rank low-rank + TurboQuant
+#                               residual (Key 2-bit / Value 3-bit, Activity C)
+#   attention_backend_patch  — EOptShrinkQAttentionHook: write/read hooks for eOptShrinkQ
+#                               (Activity C: compress before store, decompress before kernel)
+#                             + ManifoldKVOutlierScoreHook: Euclidean outlier scoring hook
+#                               (Activity C: read-only, no lossy ops)
+#   block_manager_patch      — StaticDynamicSegmentKVManager: static/dynamic segment
+#                               classification + Multi-hop invalidation (Activity B)
+#                             + ManifoldKVWindowedEvictionManager: Euclidean outlier-based
+#                               eviction policy (Activity C, drop-in for LRU)
+#
 # 2026-05-06 cycle additions:
 #   block_manager_patch      — QueryCentricKVCacheManager: ProphetKV dual-stage recompute (B)
 #                             + QueryCentricTriAttentionKVCacheManager: dual-path raw/compressed (B+C)

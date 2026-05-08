@@ -43,7 +43,7 @@ import struct
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, Set, Tuple, TYPE_CHECKING
 
 import torch
 
@@ -1552,3 +1552,388 @@ class TriAttentionCodecWrapper:
             import os
             os.makedirs(os.path.dirname(save_path), exist_ok=True) if os.path.dirname(save_path) else None
             torch.save({"mu_k": self.mu_k, "a_m": self.a_m}, save_path)
+
+
+# ---------------------------------------------------------------------------
+# 2026-05-08 Activity B: StaticDynamicSegmentKVManager
+# ---------------------------------------------------------------------------
+
+class StaticDynamicSegmentKVManager(KVCacheManager):
+    """KVCacheManager subclass adding static/dynamic segment classification.
+
+    Ports src/cache/static_dynamic_segment.StaticDynamicSegmentCache into the
+    vLLM integration layer.
+
+    Design:
+        Maintains a parallel segment index alongside vLLM's native prefix cache.
+        Static segments (system prompts, shared documents) are marked as LRU-exempt
+        and never evicted until explicitly demoted via mark_segment_dynamic().
+        Dynamic segments (agentic history, per-user context) use standard LRU
+        eviction with Multi-hop invalidation range limiting.
+
+    Integration with vLLM v1 KVCacheManager:
+        - The static/dynamic index is a parallel Python dict — it does NOT modify
+          vLLM's native block pool or prefix cache.
+        - Static segments are protected from pressure eviction by checking
+          is_static_segment() before calling evict_blocks().
+        - Dynamic segments are invalidated within max_invalidation_range steps of
+          the updated segment to prevent unbounded recomputation cascades.
+
+    Activity B non-contiguous reuse:
+        Static segments are always eligible for full reuse across requests
+        (noncontiguous_ratio target ≥ 30% per evaluation_criteria.md §3).
+        The segment index is keyed by SHA-256 hash of token chunk + layer_idx
+        (compatible with WorkloadAwareTTLKVCacheManager.store_ttl_segment()).
+
+    Accuracy contract:
+        This manager does NOT compress or modify KV values. It only controls
+        which block_ids are protected from vLLM's eviction pressure.
+    """
+
+    def __init__(
+        self,
+        *args: Any,
+        sdm_max_invalidation_range: int = 2,
+        sdm_max_static_segments: int = 512,
+        sdm_chunk_size: int = 128,
+        **kwargs: Any,
+    ) -> None:
+        """
+        Args:
+            sdm_max_invalidation_range: Max number of segments to invalidate
+                after a dynamic segment update (Multi-hop depth limit).
+            sdm_max_static_segments: Maximum number of static segment slots.
+                Excess static segments are demoted to dynamic on overflow.
+            sdm_chunk_size: Token chunk size for SHA-256 segment key computation.
+        """
+        super().__init__(*args, **kwargs)
+        self._sdm_max_invalidation_range = sdm_max_invalidation_range
+        self._sdm_max_static = sdm_max_static_segments
+        self._sdm_chunk_size = sdm_chunk_size
+
+        # Segment metadata
+        self._sdm_static_keys: Set[str] = set()
+        self._sdm_segment_order: List[str] = []  # insertion order for invalidation
+        # segment_key → block_ids set
+        self._sdm_block_map: Dict[str, Set[int]] = {}
+
+        # Hit tracking
+        self._sdm_static_hits: int = 0
+        self._sdm_dynamic_hits: int = 0
+        self._sdm_misses: int = 0
+
+    # ------------------------------------------------------------------
+    # Public segment API
+    # ------------------------------------------------------------------
+
+    def store_segment(
+        self,
+        token_ids: List[int],
+        chunk_idx: int,
+        block_ids: Set[int],
+        layer_idx: int = 0,
+        is_static: bool = False,
+    ) -> str:
+        """Register a segment in the static/dynamic index.
+
+        Args:
+            token_ids: Full prompt token IDs.
+            chunk_idx: Chunk index within the prompt.
+            block_ids: vLLM block IDs associated with this segment.
+            layer_idx: Transformer layer index.
+            is_static: If True, mark segment as static (LRU-exempt).
+
+        Returns:
+            SHA-256 hex segment key string.
+        """
+        key = self._sdm_chunk_key(token_ids, chunk_idx, layer_idx)
+        self._sdm_block_map[key] = set(block_ids)
+        if key not in self._sdm_segment_order:
+            self._sdm_segment_order.append(key)
+        if is_static:
+            self.mark_segment_static(key)
+        return key
+
+    def mark_segment_static(self, segment_key: str) -> None:
+        """Mark a segment as static (LRU-exempt, no pressure eviction).
+
+        If the static set is at capacity, the oldest static segment is demoted
+        to dynamic before adding the new one.
+        """
+        if len(self._sdm_static_keys) >= self._sdm_max_static:
+            # Demote the oldest static segment
+            oldest = next(
+                (k for k in self._sdm_segment_order if k in self._sdm_static_keys),
+                None,
+            )
+            if oldest is not None:
+                self._sdm_static_keys.discard(oldest)
+        self._sdm_static_keys.add(segment_key)
+
+    def mark_segment_dynamic(self, segment_key: str) -> None:
+        """Demote a segment from static to dynamic (restores eviction eligibility)."""
+        self._sdm_static_keys.discard(segment_key)
+
+    def is_static_segment(self, segment_key: str) -> bool:
+        """Return True if the segment is currently static (LRU-exempt)."""
+        return segment_key in self._sdm_static_keys
+
+    def get_segment_block_ids(self, segment_key: str) -> Optional[Set[int]]:
+        """Return vLLM block IDs for a registered segment, or None if not found."""
+        block_ids = self._sdm_block_map.get(segment_key)
+        if block_ids is not None:
+            if segment_key in self._sdm_static_keys:
+                self._sdm_static_hits += 1
+            else:
+                self._sdm_dynamic_hits += 1
+        else:
+            self._sdm_misses += 1
+        return block_ids
+
+    def invalidate_dynamic_range(
+        self, segment_key: str
+    ) -> List[str]:
+        """Invalidate up to max_invalidation_range segments following segment_key.
+
+        Used when a dynamic segment is updated to prevent stale downstream
+        segments from being reused. Only invalidates dynamic (non-static) segments.
+
+        Args:
+            segment_key: The updated segment's key.
+
+        Returns:
+            List of invalidated segment keys (caller should release their block IDs).
+        """
+        if segment_key not in self._sdm_segment_order:
+            return []
+
+        idx = self._sdm_segment_order.index(segment_key)
+        invalidation_end = min(
+            idx + 1 + self._sdm_max_invalidation_range,
+            len(self._sdm_segment_order),
+        )
+        invalidated: List[str] = []
+        for inv_key in self._sdm_segment_order[idx + 1: invalidation_end]:
+            if inv_key not in self._sdm_static_keys and inv_key in self._sdm_block_map:
+                block_ids = self._sdm_block_map.pop(inv_key, set())
+                if block_ids:
+                    try:
+                        self.evict_blocks(block_ids)
+                    except Exception:
+                        pass
+                invalidated.append(inv_key)
+        # Remove invalidated keys from segment_order
+        for inv_key in invalidated:
+            try:
+                self._sdm_segment_order.remove(inv_key)
+            except ValueError:
+                pass
+        return invalidated
+
+    def evict_dynamic_pressure_segment(self) -> Optional[str]:
+        """Evict the oldest dynamic (non-static) segment under memory pressure.
+
+        Returns:
+            Evicted segment key, or None if no dynamic segments available.
+        """
+        for key in self._sdm_segment_order:
+            if key not in self._sdm_static_keys and key in self._sdm_block_map:
+                block_ids = self._sdm_block_map.pop(key)
+                self._sdm_segment_order.remove(key)
+                try:
+                    self.evict_blocks(block_ids)
+                except Exception:
+                    pass
+                return key
+        return None
+
+    def sdm_hit_stats(self) -> Dict[str, Any]:
+        """Return static/dynamic segment hit statistics."""
+        total = self._sdm_static_hits + self._sdm_dynamic_hits + self._sdm_misses
+        noncontiguous_hits = self._sdm_static_hits  # static hits are non-contiguous reuse
+        total_hits = self._sdm_static_hits + self._sdm_dynamic_hits
+        return {
+            "static_hits": self._sdm_static_hits,
+            "dynamic_hits": self._sdm_dynamic_hits,
+            "misses": self._sdm_misses,
+            "overall_hit_rate": total_hits / max(total, 1),
+            "noncontiguous_ratio": noncontiguous_hits / max(total_hits, 1),
+            "num_static_segments": len(self._sdm_static_keys),
+            "num_dynamic_segments": len(self._sdm_block_map) - len(self._sdm_static_keys),
+        }
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _sdm_chunk_key(
+        self, token_ids: List[int], chunk_idx: int, layer_idx: int
+    ) -> str:
+        """SHA-256 chunk key (compatible with WorkloadAwareTTLKVCacheManager)."""
+        import hashlib
+        import struct
+        start = chunk_idx * self._sdm_chunk_size
+        chunk = token_ids[start: start + self._sdm_chunk_size]
+        if not chunk:
+            chunk = [0]
+        raw = struct.pack(f"{len(chunk)}I", *chunk)
+        layer_prefix = struct.pack("I", layer_idx)
+        return hashlib.sha256(layer_prefix + raw).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# 2026-05-08 Activity C: ManifoldKVWindowedEvictionManager
+# ---------------------------------------------------------------------------
+
+class ManifoldKVWindowedEvictionManager(KVCacheManager):
+    """KVCacheManager subclass with Euclidean outlier-based eviction scoring.
+
+    Ports src/cache/manifoldkv_windowed.ManifoldKVWindowedEviction into the
+    vLLM integration layer.
+
+    ManifoldKV (arXiv 2602.08343) insight:
+        Standard cosine-similarity eviction ignores token norm (scale), causing
+        semantically important high-norm tokens to be incorrectly evicted.
+        Euclidean distance from the sliding-window local centroid captures
+        true "outlier" tokens that stand out from their local context.
+        Segments with high mean outlier score are retained; low-score
+        segments are evicted first.
+
+    Eviction policy:
+        evict_lowest_outlier_score(): evict the registered segment with the
+        lowest mean Euclidean outlier score. Designed as a drop-in replacement
+        for LRU-based evict_blocks() calls in the engine loop.
+
+    Integration:
+        Outlier scores are fed by ManifoldKVOutlierScoreHook (attention_backend_patch)
+        via register_outlier_score(). The engine loop calls evict_lowest_outlier_score()
+        under memory pressure instead of the default LRU eviction.
+
+    Accuracy contract:
+        This manager NEVER modifies KV values — it only reorders which vLLM blocks
+        are evicted. No quantization, no approximation.
+
+    Usage:
+
+        from vllm_integration.block_manager_patch import ManifoldKVWindowedEvictionManager
+        from vllm_integration.attention_backend_patch import ManifoldKVOutlierScoreHook
+
+        # Score store shared between hook and manager
+        score_store: dict = {}
+
+        hook = ManifoldKVOutlierScoreHook(segment_score_store=score_store)
+        mgr  = ManifoldKVWindowedEvictionManager(
+            ...,  # standard KVCacheManager args
+            mvwem_window_size=4096,
+        )
+
+        # After attention for each layer:
+        hook.record_outlier_score(key_tensor, segment_key)
+        mgr.register_outlier_score(segment_key, block_ids, score_store[segment_key])
+
+        # Under memory pressure:
+        evicted_key = mgr.evict_lowest_outlier_score()
+    """
+
+    def __init__(
+        self,
+        *args: Any,
+        mvwem_window_size: int = 4096,
+        **kwargs: Any,
+    ) -> None:
+        """
+        Args:
+            mvwem_window_size: Sliding window size (tokens) for outlier score
+                computation by ManifoldKVOutlierScoreHook.
+        """
+        super().__init__(*args, **kwargs)
+        self._mvwem_window_size = mvwem_window_size
+
+        # segment_key → (block_ids, outlier_score)
+        self._mvwem_segments: Dict[str, Tuple[Set[int], float]] = {}
+        self._mvwem_evict_count: int = 0
+
+    def register_outlier_score(
+        self,
+        segment_key: str,
+        block_ids: Set[int],
+        outlier_score: float,
+    ) -> None:
+        """Register a segment with its Euclidean outlier score.
+
+        Args:
+            segment_key: Segment identifier (e.g. SHA-256 hash).
+            block_ids: vLLM block IDs for this segment.
+            outlier_score: Mean Euclidean distance from window centroid.
+                Higher = more semantically important = keep.
+                Lower = less important = evict first.
+        """
+        self._mvwem_segments[segment_key] = (set(block_ids), float(outlier_score))
+
+    def evict_lowest_outlier_score(self) -> Optional[str]:
+        """Evict the segment with the lowest outlier score (least important).
+
+        Returns:
+            Evicted segment key, or None if no segments registered.
+        """
+        if not self._mvwem_segments:
+            return None
+
+        worst_key = min(
+            self._mvwem_segments.keys(),
+            key=lambda k: self._mvwem_segments[k][1],
+        )
+        block_ids, _ = self._mvwem_segments.pop(worst_key)
+        try:
+            self.evict_blocks(block_ids)
+        except Exception:
+            pass
+        self._mvwem_evict_count += 1
+        return worst_key
+
+    def evict_lowest_n(self, n: int) -> List[str]:
+        """Evict the n segments with the lowest outlier scores.
+
+        Args:
+            n: Number of segments to evict.
+
+        Returns:
+            List of evicted segment keys.
+        """
+        sorted_keys = sorted(
+            self._mvwem_segments.keys(),
+            key=lambda k: self._mvwem_segments[k][1],
+        )
+        evicted = []
+        for key in sorted_keys[:n]:
+            block_ids, _ = self._mvwem_segments.pop(key)
+            try:
+                self.evict_blocks(block_ids)
+            except Exception:
+                pass
+            self._mvwem_evict_count += 1
+            evicted.append(key)
+        return evicted
+
+    def outlier_score_for(self, segment_key: str) -> Optional[float]:
+        """Return the registered outlier score for a segment, or None."""
+        entry = self._mvwem_segments.get(segment_key)
+        return entry[1] if entry is not None else None
+
+    def mvwem_stats(self) -> Dict[str, Any]:
+        """Return ManifoldKVWindowedEviction statistics."""
+        if self._mvwem_segments:
+            scores = [v[1] for v in self._mvwem_segments.values()]
+            mean_score = sum(scores) / len(scores)
+            min_score = min(scores)
+            max_score = max(scores)
+        else:
+            mean_score = min_score = max_score = 0.0
+        return {
+            "registered_segments": len(self._mvwem_segments),
+            "evict_count": self._mvwem_evict_count,
+            "mean_outlier_score": mean_score,
+            "min_outlier_score": min_score,
+            "max_outlier_score": max_score,
+            "window_size": self._mvwem_window_size,
+        }

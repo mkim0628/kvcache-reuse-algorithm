@@ -1,0 +1,38 @@
+experiment:
+  date: "2026-05-08"
+  activity: "A+C"
+  description: "PreemptiveKVOffloadScheduler + eOptShrinkQCodec + CompressedPreemptionPipeline (A+C Cross-1), auxiliary: StaticDynamicSegmentCache (B), ManifoldKVWindowedEviction (C)"
+
+scheduler:
+  type: "preemptive_kv_offload"
+  cache_capacity_bytes: 4294967296     # 4 GiB
+  threshold_preempt: 0.85              # Buffer occupancy preemption threshold
+  consumption_rate_window: 32          # Token consumption rate rolling window (tokens)
+  fairness_max_wait: 10                # Max steps before preemption exemption
+  preempt_compress: true               # Enable CompressedPreemptionPipeline integration
+  sla_tier_a_ids: []                   # SLA Tier-A request IDs (exempt from preemption)
+
+compression:
+  method: "eopt_shrinkq"               # eOptShrinkQCodec
+  key_bits: 2                          # Key quantization bits (aggressive)
+  value_bits: 3                        # Value quantization bits (conservative)
+  calibration_samples: 20              # Offline calibration minimum sample count
+  calibration_save_path: "results/2026-05-08/eopt_calibration.pt"
+
+compressed_preemption:
+  use_dual_stream: true                # CUDA dual-stream compression/transfer overlap
+  sla_tier_a_no_compress: true         # SLA Tier-A preemptions bypass compression
+
+cache:
+  type: "static_dynamic_segment"       # StaticDynamicSegmentCache
+  capacity_bytes: 4294967296           # 4 GiB
+  max_invalidation_range: 2            # Max subsequent segments invalidated per dynamic update
+  max_recompute_hops: 2                # Multi-hop recomputation propagation depth limit
+
+eviction:
+  policy: "manifoldkv_windowed"        # ManifoldKVWindowedEviction
+  window_size: 4096                    # Sliding window size (tokens)
+  evict_ratio: 0.2                     # Fraction of low-outlier segments to evict
+
+seed: 42
+results_dir: "results/2026-05-08"

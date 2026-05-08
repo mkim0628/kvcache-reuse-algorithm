@@ -7,6 +7,13 @@ standalone `src/` implementation into **vLLM 0.20.1**.
 
 | Cycle | Activity | Description | Source |
 |-------|----------|-------------|--------|
+| 2026-05-08 | **A** | PreemptiveKVOffloadSchedulerMixin — TokenFlow preemptive scheduling + async GPU→CPU KV offload | `src/scheduler/preemptive_kv_offload.py` |
+| 2026-05-08 | **C** | VllmEOptShrinkQCodec — BBP auto-rank low-rank (Key 2-bit / Value 3-bit) + TurboQuant residual | `src/cache/eopt_shrinkq_codec.py` |
+| 2026-05-08 | **A+C** | CompressedPreemptionMixin — CUDA dual-stream inline compression during preemption offload | `src/scheduler/compressed_preemption.py` |
+| 2026-05-08 | **C** | EOptShrinkQAttentionHook — write/read hooks for eOptShrinkQ (compress before store, decompress before kernel) | (new) |
+| 2026-05-08 | **C** | ManifoldKVOutlierScoreHook — read-only Euclidean outlier scoring hook (no lossy ops) | (new) |
+| 2026-05-08 | **B** | StaticDynamicSegmentKVManager — static/dynamic segment classification + multi-hop invalidation (max 2 hops) | (new) |
+| 2026-05-08 | **C** | ManifoldKVWindowedEvictionManager — Euclidean outlier-based eviction policy (drop-in for LRU) | (new) |
 | 2026-05-06 | **B** | QueryCentricKVCacheManager — ProphetKV dual-stage recompute budget allocation | `src/cache/query_centric_recompute.py` |
 | 2026-05-06 | **C** | TriAttentionCodecWrapper — pre-RoPE trigonometric KV compression codec | `src/cache/tri_attention_codec.py` |
 | 2026-05-06 | **B+C** | QueryCentricTriAttentionKVCacheManager — dual-path raw/compressed store | `src/cache/qc_tri_store.py` |
@@ -38,6 +45,290 @@ standalone `src/` implementation into **vLLM 0.20.1**.
 | Scheduler | `vllm.v1.core.sched.scheduler.Scheduler` |
 | Block pool | `vllm.v1.core.block_pool.BlockPool` |
 | Attention backend | `vllm.v1.attention.backend.AttentionImpl` |
+
+---
+
+## 2026-05-08 Integration: Activity A+C (PreemptiveKVOffload + eOptShrinkQCodec)
+
+### Summary
+
+This cycle addresses two known failure modes from the 2026-05-08 Report ①:
+- **TTFT p99 regression** (+286.9% over baseline) caused by unbounded preemption latency.
+- **Request fairness** (burst p99/normal p50 = 4.0×) caused by uncapped SLA Tier-A protection.
+
+The CompressedPreemptionMixin cross-couples Activity A and C: CUDA dual-stream overlap
+compresses KV tensors on `compute_stream` while PCIe transfer runs on `memory_stream`,
+cutting preemption wall time by the codec's compression ratio.
+
+### Files Modified
+
+| File | Activity | New Class | Description |
+|------|----------|-----------|-------------|
+| `scheduler_patch.py` | A | `PreemptiveKVOffloadSchedulerMixin` | Preemptive scheduling + async GPU→CPU KV offload |
+| `scheduler_patch.py` | A+C | `CompressedPreemptionMixin` | Dual-stream inline compression during preemption |
+| `scheduler_patch.py` | A+C | `make_preemptive_scheduler_class()` | Factory combining base + preemption + compression mixins |
+| `compression_codec.py` | C | `VllmEOptShrinkQCodec` | BBP auto-rank low-rank + TurboQuant residual (K 2-bit / V 3-bit) |
+| `attention_backend_patch.py` | C | `EOptShrinkQAttentionHook` | compress-before-store / decompress-before-kernel hooks |
+| `attention_backend_patch.py` | C | `ManifoldKVOutlierScoreHook` | Read-only Euclidean outlier scoring (no lossy ops) |
+| `block_manager_patch.py` | B | `StaticDynamicSegmentKVManager` | Static/dynamic segment classification + multi-hop invalidation |
+| `block_manager_patch.py` | C | `ManifoldKVWindowedEvictionManager` | Euclidean outlier-based eviction (drop-in for LRU) |
+
+### Architecture
+
+```
+[Request arrives at Scheduler]
+         │
+         ▼
+PreemptiveKVOffloadSchedulerMixin.pre_schedule_preemptive()
+  ├── _pko_buffer_occupancy_ratio() >= 0.85 ?
+  │    NO  → normal scheduling
+  │    YES → select preemption candidates:
+  │          - Sort by priority (Tier-A last)
+  │          - Skip if fairness_max_wait_steps exceeded
+  │          - Select lowest-priority until buffer drops below 0.85
+  └── pko_offload_kv(request_id, kv_key, kv_val, layer_idx)
+       │
+       ▼
+CompressedPreemptionMixin.cpm_offload_with_compression()  [Cross-1: A+C]
+  ├── CUDA compute_stream: VllmEOptShrinkQCodec.encode_tokens(kv_key, kv_val, layer_idx)
+  │    ├── BBP threshold: sigma_c = noise_level × (1 + sqrt(aspect_ratio))^2
+  │    ├── SVD decomposition → keep top-r singular vectors (float16)
+  │    └── TurboQuant residual: Key 2-bit / Value 3-bit asymmetric
+  └── CUDA memory_stream: pinned_tensor.copy_(compressed, non_blocking=True)
+       [streams overlap → PCIe transfer hides compression compute time]
+         │
+         ▼
+[Buffer pressure relieved — normal scheduling resumes]
+         │
+         ▼
+[Request restore: pko_restore_kv() / cpm_restore_with_decompression()]
+  ├── Load compressed payload from CPU
+  └── VllmEOptShrinkQCodec.decode_tokens(compressed) BEFORE returning to caller
+       [accuracy contract: decompressed KV never enters attention kernel compressed]
+         │
+         ▼
+[Attention Kernel — receives fully decompressed FP16 KV tensors]
+```
+
+### eOptShrinkQCodec: BBP Auto-Rank Selection
+
+The codec uses the Baik-Ben Arous-Péché (BBP) phase-transition threshold to
+automatically determine the optimal low-rank cut-off:
+
+```
+Marchenko-Pastur noise floor:
+  sigma_c = noise_level × (1 + sqrt(n / m))^2
+
+For each (layer, head):
+  singular_values = SVD(K)[1]         # descending
+  r = sum(singular_values > sigma_c)  # BBP threshold
+
+Compression:
+  K_low = U_r @ S_r @ Vt_r           # float16 low-rank
+  residual = K - K_low
+  K_compressed = quantize(residual, bits=2)   # Key 2-bit
+  V_compressed = quantize(V,        bits=3)   # Value 3-bit
+
+Effective rate: ~2.2 bits/element
+Accuracy target: cosine(K, decode(encode(K))) >= 0.85 (validated in smoke test)
+```
+
+### Integration (Activity A — preemptive scheduling)
+
+```python
+from vllm.v1.core.sched.scheduler import Scheduler
+from vllm_integration.scheduler_patch import make_preemptive_scheduler_class
+from vllm_integration.compression_codec import VllmEOptShrinkQCodec
+
+# Step 1: Create and calibrate eOptShrinkQCodec
+codec = VllmEOptShrinkQCodec(
+    num_layers=32,
+    key_bits=2,
+    value_bits=3,
+    calibration_samples=20,
+)
+# calib_kvs: list of (kv_key, kv_val, layer_idx) tuples from representative requests
+codec.calibrate(calib_kvs, save_path="eopt_calibration.pt")
+# (or) codec.load_calibration("eopt_calibration.pt")
+
+# Step 2: Create preemptive scheduler class
+PreemptiveScheduler = make_preemptive_scheduler_class(
+    Scheduler,
+    use_compression=True,    # activates CompressedPreemptionMixin
+)
+
+scheduler = PreemptiveScheduler(
+    ...,  # standard vLLM Scheduler args
+    # PreemptiveKVOffloadSchedulerMixin args:
+    pko_cache_capacity_bytes=4 * 1024**3,   # 4 GiB CPU offload buffer
+    pko_threshold_preempt=0.85,             # preempt if buffer > 85%
+    pko_consumption_rate_window=32,         # sliding window size
+    pko_fairness_max_wait=10,               # max wait steps before Tier-A exemption expires
+    pko_sla_tier_a_ids={"req_vip_001"},    # SLA Tier-A request IDs
+    # CompressedPreemptionMixin additional args:
+    cpm_codec=codec,
+    cpm_use_dual_stream=True,              # CUDA dual-stream overlap
+    cpm_sla_tier_a_no_compress=True,       # Tier-A: offload uncompressed for speed
+)
+
+# Step 3: Per-schedule-step preemption check
+preempted, exempted = scheduler.pre_schedule_preemptive(
+    active_request_ids=list(active_requests.keys())
+)
+# preempted: request IDs offloaded to CPU this step
+# exempted: Tier-A requests that were protected
+
+# Step 4: Record processed tokens (feeds consumption rate estimator)
+scheduler.pko_record_processed_tokens(batch_token_count)
+
+# Step 5: Restore preempted request when rescheduled
+kv_key, kv_val = scheduler.cpm_restore_with_decompression(request_id, layer_idx=0)
+
+# Step 6: Stats
+stats = scheduler.cpm_stats()
+# stats["overlap_efficiency"] >= 0.5 → dual-stream is helping
+# stats["compression_ratio"]       → e.g. 3.8 (3.8× smaller in CPU)
+```
+
+### Integration (Activity C — eOptShrinkQCodec attention hooks)
+
+```python
+from vllm_integration.compression_codec import VllmEOptShrinkQCodec
+from vllm_integration.attention_backend_patch import (
+    EOptShrinkQAttentionHook, ManifoldKVOutlierScoreHook
+)
+
+codec = VllmEOptShrinkQCodec(num_layers=32, key_bits=2, value_bits=3)
+codec.calibrate(calib_kvs)
+
+# Compress-before-store / decompress-before-kernel hook
+hook = EOptShrinkQAttentionHook(codec=codec, enabled=True)
+
+# In attention layer write path (before paged block write):
+compressed_payload = hook.write_to_cache(kv_key, kv_val, layer_idx)
+# Returns EncodedKVPayload dict (or passthrough if codec not calibrated)
+
+# In attention layer read path (before passing to FlashAttention kernel):
+kv_key_fp16, kv_val_fp16 = hook.read_from_cache(compressed_payload, layer_idx)
+# ALWAYS decompresses — never returns compressed tensors to attention kernel
+
+# Stats:
+stats = hook.hook_stats()
+# stats["n_writes"], stats["n_reads"], stats["mean_cosine_sim"]
+
+# Optional: outlier scoring hook (read-only, no lossy ops)
+outlier_hook = ManifoldKVOutlierScoreHook(window_size=4096)
+score = outlier_hook.record_outlier_score(
+    key_vectors=kv_key,    # [n_tokens, head_dim]
+    segment_key="seg_001"
+)
+# score: Euclidean outlier score [0, ∞) — high score = semantically important
+```
+
+### Integration (Activity B — StaticDynamicSegmentKVManager)
+
+```python
+from vllm_integration.block_manager_patch import StaticDynamicSegmentKVManager
+
+kv_manager = StaticDynamicSegmentKVManager(
+    kv_cache_config=kv_cache_config,
+    max_model_len=max_model_len,
+    hash_block_size=block_size,
+    enable_caching=True,
+    # StaticDynamicSegmentKVManager args:
+    sdm_max_invalidation_range=2,   # max 2-hop invalidation propagation
+    sdm_max_static_segments=512,    # max static segment count
+    sdm_chunk_size=128,             # token chunk size for segment keys
+)
+
+# Store a segment and mark it static (LRU-exempt):
+seg_key = kv_manager.store_segment(
+    token_ids=[1, 2, 3, 4],
+    chunk_idx=0,
+    block_ids={42, 43},
+    layer_idx=0,
+    is_static=True,
+)
+
+# Mark an existing segment static or dynamic:
+kv_manager.mark_segment_static(seg_key)
+kv_manager.mark_segment_dynamic(seg_key)
+
+# Invalidate a dynamic segment and up to 2 hops of dependents:
+invalidated = kv_manager.invalidate_dynamic_range(seg_key)
+
+# Stats:
+stats = kv_manager.sdm_hit_stats()
+# stats["static_hits"], stats["dynamic_hits"], stats["noncontiguous_ratio"]
+```
+
+### Integration (Activity C — ManifoldKVWindowedEvictionManager)
+
+```python
+from vllm_integration.block_manager_patch import ManifoldKVWindowedEvictionManager
+
+kv_manager = ManifoldKVWindowedEvictionManager(
+    kv_cache_config=kv_cache_config,
+    max_model_len=max_model_len,
+    hash_block_size=block_size,
+    enable_caching=True,
+    mvwem_window_size=4096,    # sliding window for local centroid distance
+)
+
+# Register a segment with its outlier score (from ManifoldKVOutlierScoreHook):
+kv_manager.register_outlier_score(
+    segment_key="seg_001",
+    block_ids={42, 43},
+    outlier_score=3.7,    # high score = semantically important, retain
+)
+
+# Evict the segment with the lowest outlier score (least important):
+evicted = kv_manager.evict_lowest_outlier_score()
+
+# Evict N least-important segments:
+evicted_list = kv_manager.evict_lowest_n(n=10)
+
+# Stats:
+stats = kv_manager.mvwem_stats()
+# stats["n_segments"], stats["mean_outlier_score"], stats["n_evictions"]
+```
+
+### Key Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `pko_threshold_preempt` | 0.85 | Buffer occupancy ratio that triggers preemption |
+| `pko_cache_capacity_bytes` | 4 GiB | Total CPU offload buffer capacity |
+| `pko_fairness_max_wait` | 10 | Max scheduling steps before Tier-A exemption expires |
+| `cpm_use_dual_stream` | True | CUDA dual-stream overlap for compress+transfer |
+| `cpm_sla_tier_a_no_compress` | True | Offload Tier-A requests uncompressed for latency |
+| `key_bits` | 2 | Quantization bits for Key residual |
+| `value_bits` | 3 | Quantization bits for Value |
+| `calibration_samples` | 20 | Number of (kv, layer) samples for BBP calibration |
+| `sdm_max_invalidation_range` | 2 | Max hops for multi-hop invalidation |
+| `sdm_chunk_size` | 128 | Token chunk size for segment keys |
+| `mvwem_window_size` | 4096 | Sliding window size for outlier centroid distance |
+
+### Accuracy Preservation Contract
+
+1. **EOptShrinkQAttentionHook.read_from_cache()** always calls `codec.decode_tokens()`
+   before returning — compressed tensors never reach the attention kernel.
+2. **CompressedPreemptionMixin.cpm_restore_with_decompression()** always calls
+   `codec.decode_tokens()` before returning KV to the scheduler — no compressed
+   KV ever reenters the forward pass.
+3. **ManifoldKVWindowedEvictionManager** only evicts segments by outlier score —
+   it never modifies KV tensor values (lossless eviction ordering).
+4. **ManifoldKVOutlierScoreHook** is read-only — it never writes to or modifies
+   any KV tensor.
+5. Accuracy target: cosine similarity between original and encode→decode KV >= 0.85
+   (validated in install.sh smoke tests).
+
+### Scheduling Overhead
+
+PreemptiveKVOffloadSchedulerMixin CPU overhead: O(N) per schedule step where
+N = active request count. Buffer occupancy check: O(1). Target: < 5ms / 100 requests.
+CompressedPreemptionMixin compression: GPU kernel — overlapped with PCIe transfer via
+dual CUDA streams. Preemption wall time ≈ transfer_time (not transfer_time + compress_time).
 
 ---
 
@@ -287,28 +578,40 @@ vllm_integration/
 ├── diff_aware_kv_patch.py        Activity B-1 (2026-05-05): DiffAwareKVPatch
 ├── compressed_kv_manager.py      Activity B+C Cross-1 (2026-05-05): CompressedKVManager
 ├── fireq_attention_patch.py      Activity C-2 (2026-05-05): FireQAttentionPatch
-├── scheduler_patch.py            Activity A (2026-05-04): DAGTopologySchedulerMixin
+├── scheduler_patch.py            Activity A (2026-05-08): PreemptiveKVOffloadSchedulerMixin
+│                                  + CompressedPreemptionMixin (A+C Cross-1, CUDA dual-stream)
+│                                  + make_preemptive_scheduler_class() factory
+│                                  Activity A (2026-05-04): DAGTopologySchedulerMixin
 │                                  + MultiNodeDAGRouter, DAGNodeCapacity, WorkflowDAG
 │                                  + make_dag_aware_scheduler_class() factory
 │                                  Activity B (2026-05-06): QueryCentricSchedulerMixin
 │                                  + make_qcrc_aware_scheduler_class() factory
 │                                  + DualMapSchedulerMixin (2026-05-03, preserved)
 │                                  + CacheHitAwareRequestQueue, MultiNodeRequestRouter (prior)
-├── block_manager_patch.py        Activity B (2026-05-06): QueryCentricKVCacheManager
+├── block_manager_patch.py        Activity B (2026-05-08): StaticDynamicSegmentKVManager
+│                                  + multi-hop invalidation (max 2 hops)
+│                                  Activity C (2026-05-08): ManifoldKVWindowedEvictionManager
+│                                  + Euclidean outlier-based eviction (drop-in for LRU)
+│                                  Activity B (2026-05-06): QueryCentricKVCacheManager
 │                                  + QueryCentricTriAttentionKVCacheManager (B+C)
 │                                  + TriAttentionCodecWrapper (Activity C codec adapter)
 │                                  Activity B (2026-05-04): WorkloadAwareTTLKVCacheManager
 │                                  + VllmDAGAwareTTLAdjuster, VllmTTLEntry
 │                                  + SemanticNonContiguousKVCacheManager (2026-05-03, preserved)
 │                                  + SemanticSegmentIndex (2026-05-03, preserved)
-├── attention_backend_patch.py    Activity C (2026-05-06): TriAttentionAttentionHook
+├── attention_backend_patch.py    Activity C (2026-05-08): EOptShrinkQAttentionHook
+│                                  + ManifoldKVOutlierScoreHook (read-only outlier scoring)
+│                                  Activity C (2026-05-06): TriAttentionAttentionHook
 │                                  + VllmQueryCentricAttentionWrapper (pre-RoPE capture)
 │                                  Activity C (2026-05-04): VllmRedundancyAwareEvictionPolicy
 │                                  + VllmAttentionKVHook (importance recording)
 │                                  + TurboQuantKVHook, SemanticKVAttentionWrapper (2026-05-03, preserved)
 │                                  + CompressedKVHook, TriStateKVHook (prior, preserved)
-├── compression_codec.py          Activity C (2026-05-03): VllmTurboQuantCodec
-│                                  + CacheCompressionConfig
+├── compression_codec.py          Activity C (2026-05-08): VllmEOptShrinkQCodec
+│                                  + BBP auto-rank low-rank (Key 2-bit / Value 3-bit)
+│                                  + TurboQuant residual backend
+│                                  Activity C (2026-05-03): VllmTurboQuantCodec
+│                                  + CacheCompressionConfig (updated: eopt_shrinkq method)
 │                                  + HadamardInt4Codec, CompressionCodec (prior, preserved)
 ├── install.sh                    pip install --upgrade vllm + all smoke tests
 │                                  (2026-05-06, 2026-05-05, 2026-05-04, backward-compat)
@@ -667,3 +970,4 @@ The install script automatically runs smoke tests for all activities.
 | 2026-05-04 | 1/3 | A+B+C | DAGTopologySchedulerMixin, WorkloadAwareTTLKVCacheManager, VllmRedundancyAwareEvictionPolicy, VllmDAGAwareTTLAdjuster, MultiNodeDAGRouter |
 | 2026-05-05 | 1/3 | B+C | NQKVCodecPatch (NF4 INT4), DiffAwareKVPatch (block-sparse diff), CompressedKVManager, FireQAttentionPatch (RoPE-aware 2-stage) |
 | **2026-05-06** | **1/3** | **B+C** | **QueryCentricKVCacheManager (ProphetKV dual-stage), TriAttentionCodecWrapper (pre-RoPE trig), QueryCentricTriAttentionKVCacheManager (B+C dual-path), TriAttentionAttentionHook, VllmQueryCentricAttentionWrapper, QueryCentricSchedulerMixin** |
+| **2026-05-08** | **1/3** | **A+C** | **PreemptiveKVOffloadSchedulerMixin (TokenFlow preemption + async offload), CompressedPreemptionMixin (CUDA dual-stream), VllmEOptShrinkQCodec (BBP auto-rank K2/V3), EOptShrinkQAttentionHook, ManifoldKVOutlierScoreHook, StaticDynamicSegmentKVManager (multi-hop invalidation), ManifoldKVWindowedEvictionManager (outlier-based eviction)** |
