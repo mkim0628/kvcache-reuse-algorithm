@@ -7,10 +7,15 @@ Wraps a backend CacheStore (e.g. StaticDynamicSegmentCache) and adds an index la
 from __future__ import annotations
 
 import heapq
+import itertools
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import torch
+
+# Module-level counter used as tie-breaker in heap entries so that _IndexNode
+# objects are never compared directly (they don't implement __lt__).
+_counter = itertools.count()
 
 from src.cache.base import CacheStore
 
@@ -117,11 +122,11 @@ class TriangleInequalitySegmentIndex(CacheStore):
 
         # Max-heap of size top_k: store (-distance, key) so smallest distance at top
         results: List[Tuple[float, str]] = []  # (-dist, key) max-heap
-        pq: List[Tuple[float, _IndexNode]] = []
-        heapq.heappush(pq, (0.0, self._root))
+        pq: List[Tuple[float, int, _IndexNode]] = []
+        heapq.heappush(pq, (0.0, next(_counter), self._root))
 
         while pq:
-            lb_dist, node = heapq.heappop(pq)
+            lb_dist, _, node = heapq.heappop(pq)
 
             best_so_far = -results[0][0] if len(results) >= top_k else float("inf")
             if lb_dist > best_so_far:
@@ -146,7 +151,7 @@ class TriangleInequalitySegmentIndex(CacheStore):
                     child_dist = self._distance(query_embedding, child.center_embedding)
                     lower_bound = max(0.0, child_dist - child.max_radius)
                     if lower_bound <= best_so_far:
-                        heapq.heappush(pq, (lower_bound, child))
+                        heapq.heappush(pq, (lower_bound, next(_counter), child))
 
         # Sort results by ascending distance
         final = [(-neg_d, k) for neg_d, k in results]
