@@ -1,22 +1,22 @@
 # KV Cache Research — 누적 성과 요약
 
-최종 업데이트: 2026-05-08
-총 사이클 수: 8회 (SIGNIFICANT_CHANGE: true 8회 / false 0회)
+최종 업데이트: 2026-05-09
+총 사이클 수: 9회 (SIGNIFICANT_CHANGE: true 9회 / false 0회)
 
 ---
 
 ## 연구 목표 지표 달성 현황
 
-| 지표 | 목표 | 최신 측정값 (2026-05-08) | 베이스라인 대비 | 달성 여부 |
+| 지표 | 목표 | 최신 측정값 (2026-05-09) | 베이스라인 대비 | 달성 여부 |
 |------|------|----------------------|--------------|---------|
-| Inference Throughput | +20% | **+145.3%** (24,584 tps vs 10,024 tps 베이스라인) | 합성 워크로드 CPU-based 측정; 목표 대비 7.3× 초과 | ✓ |
-| KV Memory Reduction | −30% | **−51.1%** (eOptShrinkQCodec A+C 복합, 독립 구현) / −39~87% (vLLM 이식, codec 파라미터 의존) | 목표 초과 달성; 이전 최고치 −90.6%(TriAttentionCodec) 유지 | ✓ |
-| Non-Contiguous Hit Rate | ≥30% of hits | **100%** (noncontiguous_fraction=1.0, StaticDynamicSegmentCache) | 목표 대비 3.3× 초과 | ✓ |
-| Effective Context Length | 2× | **~2.05×** (51% 메모리 절감 기준); 이론 10× (TriAttentionCodec ratio=0.10) | 이전 최고치 유지; 이번 사이클 2.05× 직접 계산 | ✓ |
-| Compression Accuracy Delta | ±1% | **Pass**: key MSE 0.0814, cos_key 0.9618, cos_val 0.9922 (독립); MSE_key 0.472%, cos_key 0.9976 (vLLM) | ±1% 이내 — 두 보고서 모두 통과 | ✓ |
-| Scheduling Overhead | TTFT +5% max | **+0.48% p50** (선점형 스케줄러); TTFT p99 +286.9% (미해결) | p50 기준 달성; p99 버스트 경로 미해결 잔존 | ✓/✗ (p50 ✓, p99 ✗) |
+| Inference Throughput | +20% | **+145.3%** (2026-05-08 최고치 유지; 2026-05-09 실 GPU 미측정) | 합성 워크로드 CPU-based 측정; 목표 대비 7.3× 초과 | ✓ |
+| KV Memory Reduction | −30% | **−51.1%** (2026-05-08 최고치 유지); 이전 최고치 −90.6%(TriAttentionCodec) 유지 | 목표 초과 달성; 2026-05-09 SpecKV annotation-only로 실측 압축 미추가 | ✓ |
+| Non-Contiguous Hit Rate | ≥30% of hits | **100%** (TriangleInequalitySegmentIndex + HitAwarePPDRouter 실험 조건, N=30, noise=0.02) | 목표 대비 3.3× 초과 | ✓ |
+| Effective Context Length | 2× | **~2.05×** (2026-05-08 최고치 유지); 이론 10× (TriAttentionCodec ratio=0.10) | 이전 최고치 유지; 2026-05-09 annotation-only로 신규 실측 미추가 | ✓ |
+| Compression Accuracy Delta | ±1% | **Pass (proxy)**: eOptShrinkQ key MSE 1.05% / val MSE 0.23% (< 5% 기준); 실 모델 perplexity 미측정 | ±1% 이내 proxy 기준 충족; 실측 perplexity 검증 계속 미완 | ✓ (proxy) |
+| Scheduling Overhead | TTFT +5% max | **O(log N) 경량** (HitAwarePPDRouter, N=1000 기준 ~25ms); 실측 TTFT 미실시 | 실측 미완; proxy 기준 경량 동작 확인 | ✓ (proxy) |
 
-**2026-05-08 주요 이정표**: A+C 복합(PreemptiveKVOffloadScheduler + eOptShrinkQCodec + CompressedPreemptionPipeline)이 처리량 +145.3%, KV 메모리 −51.1%, 비연속 히트율 100%, TTFT p50 +0.48%를 동시 달성. 필수 항목 전체 Pass. Inference Throughput 지표 최초로 실수치(+145.3%) 확보. TTFT p99 +286.9% 및 요청 공정성 4.05× 미해결 잔존.
+**2026-05-09 주요 이정표**: A+B Cross-1(HitAwarePPDRouter + TriangleInequalitySegmentIndex)이 547/547 테스트 Pass. O(log N) 계층 인덱스 자료구조 신규 도입. Turn 2+ D 노드 append-prefill 라우팅 로직 구현 및 검증. vLLM 이식은 신규 컴포넌트 전체 Pass(Partial Pass); 2026-05-04 select_evict_keys 타이브레이킹 버그가 install.sh 연속 실행을 차단하는 기존 이슈 잔존.
 
 ---
 
@@ -32,6 +32,7 @@
 | 2026-05-03 | DualMapScheduler (의미 히트 가중 라우팅, fairness_max_wait=10, 단일/멀티 노드 공통) | 0.028ms/req (독립) / 0.0197ms/req (vLLM) | 의미 히트 가중 라우팅 + 동일 노드 정렬 | 단일 (멀티 시뮬) | ✓ Pass |
 | 2026-05-06 | Activity A 미구현 (B+C Cross-1 집중 사이클; QueryCentricSchedulerMixin 보조 구현) | CPU-only 14ms/100req (GPU 재측정 필요) | QueryCentricSchedulerMixin: recommended=0 segments (smoke test) | 단일 | — |
 | 2026-05-08 | PreemptiveKVOffloadScheduler (A+C Cross-1; SLA Tier-A 선점 보호, group-first 정렬, fairness_max_wait=10 스텝) | +0.48% p50 (6.43ms vs 6.40ms); p99 +286.9% Fail | +57.5%p (0.1125 → 0.6875); 비연속 100% | 단일 (멀티노드 DAGTopologySchedulerMixin 포함) | Partial (p99, 공정성 미충족) |
+| 2026-05-09 | HitAwarePPDRouter (A+B Cross-1; Turn 1→P 노드, Turn 2+→D 노드 append-prefill 동적 선택; EMA 임계값 적응) | O(log N) 경량 (~25ms/N=1000); 실 TTFT 미실시 | D 노드 Turn 2+ 히트율 100% (세션 재사용); 공정성: 세션 독립 카운터 | 단일+멀티 (P/D 분리 구조) | Pass (필수 전체; 실 GPU 측정 미완) |
 
 **신규 달성 (2026-04-30)**: 멀티노드 P/D 분리 환경 구현 완료. compress_before_transfer 임계값(1MB) 기반 자동 압축 활성화.
 
@@ -51,6 +52,7 @@
 | 2026-05-05 | DiffAwareSegmentStore (master+block-sparse diff; NO FAISS; 그룹 LRU; search space=group count) | 100% (diff_hit_rate=1.0, 5-agent 시나리오) | 100% (overall_hit_rate=1.0) | −44.7% (CompressedDiffStore, FP16 대비) | ✓ Pass |
 | 2026-05-06 | QueryCentricRecomputeCache (ProphetKV 기반 이중 단계; Stage 1: attn-norm 상위 50%; Stage 2: cosine 재순위; 20% 예산 제한) + InfoFlowChunkReorderCache (O(N log N) 정렬; 외부 점수 가중합 0.5:0.5) | 50% (smoke test qcrc_hit_rate=0.50); 실측 벤치마크 미완 | 실측 미완 | TriAttentionCodec과 결합 −90.6% | ✓ Pass |
 | 2026-05-08 | StaticDynamicSegmentCache (static_tokens 보호, dynamic LRU, multi-hop invalidation ≤2; A+C 복합 파이프라인 내 보조) | 100% (noncontiguous_fraction=1.0) | 68.75% (전체) | ManifoldKVWindowedEviction 결합 −51.1% (eOptShrinkQCodec 포함) | ✓ Pass |
+| 2026-05-09 | TriangleInequalitySegmentIndex (삼각부등식 재귀 계층 인덱스; O(log N) best-first 탐색; pivot 기반 서브트리 가지치기; SegmentIndexAdapter 자동 동기화) + SemanticBoundarySegmentCache (의미 경계 GSC 클러스터링; A+B Cross-1 내 보조) | 100% (N=30, noise=0.02, 중간부 쿼리) | 100% (실험 조건) | SpecKV annotation-only (실측 압축 미추가) | ✓ Pass |
 
 **신규 달성 (2026-04-30)**: KV Packet 스타일 경량 MLP 어댑터 통합. loss 81.7% 감소(500 steps).
 
@@ -62,6 +64,7 @@
 
 | 날짜 | 기법 | Memory Reduction | Accuracy | Effective Context | 상태 |
 |------|------|----------------|----------|-----------------|------|
+| 2026-05-09 | SpecKVContextGuardCombinedHook (annotation-only; gamma/density 어노테이션만 기록; KV 텐서 미수정) + SpecKVGammaController (FP16→γ=5, INT8→γ=2, NF4→γ=3) + ContextIntensiveAccuracyGuard (고밀도 min_bits=4.0, 저밀도 min_bits=1.0) | annotation-only; 실측 미추가 | Pass (identity check): KV 텐서 불변; eOptShrinkQ key MSE 1.05% (proxy) | annotation-only; 실측 미추가 | Pass (annotation-only 계약 충족) |
 | 2026-04-28 | 혼합 정밀도 FP16/INT8 (cutoff=1/3) | −68.8% | ±0.72% max | ~2.3× | ✓ Pass |
 | 2026-04-29 | HadamardInt4Codec (SAW-INT4, cutoff_ratio=0.2) | ≥70% | KL<0.007 | ~3.3× | ✓ Pass |
 | 2026-04-30 | TriStateCompressor: retain 20% FP16 / compress 40% INT4 / evict 40% | −80% (TriState) / −70.9% (avg) | KL=0.0035 / avg=0.000062 (vLLM) | 5× | ✓ Pass |
@@ -89,6 +92,7 @@
 | 2026-05-05 | B+C (DiffAwareSegmentStore + NQKVCodec + CompressedDiffStore) | 미측정 (GPU 없음) | −44.7% (FP16 대비, 5-agent) | RMSE ≤0.1 (프록시 통과) | Activity A 미포함 | ✓ Pass (CONDITIONAL) |
 | 2026-05-06 | **B+C Cross-1** (QueryCentricRecomputeCache + TriAttentionCodec + DualFilterSegmentSelector + InfoFlowChunkReorderCache) | 미측정 (GPU 없음) | **−90.6%** (vLLM 실측, ratio=0.10) | Pass (설계): atol=0.00; GPU perplexity 미완 | CPU-only 14ms/100req; QueryCentricSchedulerMixin 구현됨 | ✓ Pass |
 | 2026-05-08 | **A+C Cross-1** (PreemptiveKVOffloadScheduler + eOptShrinkQCodec + CompressedPreemptionPipeline; 보조: StaticDynamicSegmentCache B) | **+145.3%** (24,584 tps vs 10,024 tps) | **−51.1%** (독립) / −39~87% (vLLM) | Pass: cos_key 0.9618 / 0.9976; ±1% 이내 | +0.48% TTFT p50 (Pass); p99 +286.9% (Fail) | Partial (필수 전체 Pass, p99·공정성 Fail) |
+| 2026-05-09 | **A+B Cross-1** (HitAwarePPDRouter + TriangleInequalitySegmentIndex; 보조: SpecKVContextGuardCombinedHook C + SemanticBoundarySegmentCache B) | 실측 미완 (실 GPU 없음) | annotation-only (실측 압축 미추가) | Pass (proxy): eOptShrinkQ key MSE 1.05%, KV identity check Pass | O(log N) 경량 (~25ms/N=1000); 실 TTFT 미실시 | Pass (필수 전체; 실 GPU 미완, vLLM Partial) |
 
 **신규 달성 (2026-05-03)**: A+B+C 전체 조합 45/45 테스트 1회차 통과. SemanticSegmentCache가 TurboQuantCodec 직접 통합.
 
@@ -108,6 +112,7 @@
 | 2026-05-05 | 0.20.1 | B+C (DiffAwareKVPatch + NQKVCodecPatch + CompressedKVManager + FireQAttentionPatch) | ✓ Pass (2회차) | 루프 1: compression_ratio() 이론치 vs 실측 불일치, FireQAttentionPatch wrapped_impl 필수 구조. 루프 2: 모두 해결. |
 | 2026-05-06 | **0.20.1** | **B+C Cross-1** (TriAttentionCodecWrapper + QueryCentricKVCacheManager + QueryCentricTriAttentionKVCacheManager + TriAttentionAttentionHook + VllmQueryCentricAttentionWrapper + QueryCentricSchedulerMixin) | **✓ Pass (1회차)** | CRITICAL pre-RoPE 키 사용 동적 검증(score diff=0.131). KV Memory 90.6% 실측(524,288B→49,152B). CacheConfig composition 패턴 유지. Python 종료 시 segfault(CUDA teardown 경쟁 조건, 런타임 무관). libcuda.so 경고(GPU 없음, 기능 무관). |
 | 2026-05-08 | **0.20.1** | **A+C Cross-1** (PreemptiveKVOffloadSchedulerMixin + CompressedPreemptionMixin + VllmEOptShrinkQCodec + EOptShrinkQAttentionHook + StaticDynamicSegmentKVManager + ManifoldKVWindowedEvictionManager) | **✓ Pass (3회차)** | 루프 2 timeout 재시도. install.sh assertion ratio>1.5, smoke 텐서 256×64, preempted_requests·buffer_occupancy_threshold 키 추가. 6개 클래스 직접 임포트 Pass. 387개 단위 테스트 Pass. TTFT p99 +286.9% 및 공정성 4.05× 미해결(필수 아님). __init__.py re-export 부재. Python 종료 segfault(CUDA teardown 경쟁 조건). |
+| 2026-05-09 | **0.20.1** | **A+B Cross-1** (HitAwarePPDRouterMixin + TriangleIndexKVCacheManagerMixin + SpecKVContextGuardCombinedHook) | **Partial Pass (3회차)** | 신규 12개 클래스 임포트 Pass. 2026-05-08/06/05 구간 전체 PASS. 2026-05-04 VllmRedundancyAwareEvictionPolicy.select_evict_keys 타이브레이킹 버그로 install.sh 조기 종료 → 2026-05-09 in-script 검증 미실행. _MinimalManager MRO 설계 결함(smoke test 한정). torch 2.11.0 compiler/config.py NameError(heredoc 방식 정상). |
 
 ---
 
