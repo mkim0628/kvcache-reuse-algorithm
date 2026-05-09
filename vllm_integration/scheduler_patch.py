@@ -1450,6 +1450,132 @@ def make_preemptive_scheduler_class(base_scheduler_class: Any) -> Any:
 
 
 # ---------------------------------------------------------------------------
+# CompressedPreemptionMixin (2026-05-09) — backward-compat addition
+# ---------------------------------------------------------------------------
+
+class CompressedPreemptionMixin(PreemptiveKVOffloadSchedulerMixin):
+    """Mixin that extends PreemptiveKVOffloadSchedulerMixin with integrated
+    KV compression during offload and decompression during restore.
+
+    Adds three methods required by the 2026-05-08 smoke test suite:
+        cpm_offload_with_compression()
+        cpm_restore_with_decompression()
+        cpm_stats()
+
+    Usage:
+
+        class MyScheduler(CompressedPreemptionMixin, Scheduler):
+            def __init__(self, *args, **kwargs):
+                Scheduler.__init__(self, *args, **kwargs)
+                CompressedPreemptionMixin.__init__(
+                    self,
+                    cpm_encode_fn=my_int8_encoder,
+                    cpm_decode_fn=my_int8_decoder,
+                )
+
+    If no encode/decode functions are provided the mixin falls back to
+    plain CPU offload (identical to PreemptiveKVOffloadSchedulerMixin).
+    """
+
+    def __init__(
+        self,
+        *args: Any,
+        cpm_encode_fn: Optional[Callable] = None,
+        cpm_decode_fn: Optional[Callable] = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self._cpm_encode_fn = cpm_encode_fn
+        self._cpm_decode_fn = cpm_decode_fn
+        self._cpm_offload_count: int = 0
+        self._cpm_restore_count: int = 0
+        self._cpm_compress_count: int = 0
+        self._cpm_total_bytes_before: int = 0
+        self._cpm_total_bytes_after: int = 0
+
+    def cpm_offload_with_compression(
+        self,
+        request_id: str,
+        kv_key: torch.Tensor,
+        kv_val: torch.Tensor,
+        layer_idx: int,
+    ) -> None:
+        """Offload KV tensors to CPU, optionally applying compression.
+
+        Delegates to pko_offload_kv() with the registered encode function.
+        Tracks compression ratio statistics via cpm_stats().
+
+        Args:
+            request_id: Identifier for the request being preempted.
+            kv_key: Key tensor (GPU) for the given layer.
+            kv_val: Value tensor (GPU) for the given layer.
+            layer_idx: Transformer layer index (passed to encode_fn).
+        """
+        self._cpm_offload_count += 1
+        bytes_before = kv_key.nbytes + kv_val.nbytes
+        self._cpm_total_bytes_before += bytes_before
+
+        self.pko_offload_kv(
+            request_id=request_id,
+            kv_key=kv_key,
+            kv_val=kv_val,
+            layer_idx=layer_idx,
+            encode_fn=self._cpm_encode_fn,
+        )
+
+        record = self._pko_preempted.get(request_id)
+        bytes_after = record.offload_bytes if record is not None else bytes_before
+        self._cpm_total_bytes_after += bytes_after
+        if record is not None and record.is_compressed:
+            self._cpm_compress_count += 1
+
+    def cpm_restore_with_decompression(
+        self,
+        request_id: str,
+        layer_idx: int,  # noqa: ARG002  (kept for API symmetry with offload)
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """Restore offloaded KV tensors to GPU, applying decompression if needed.
+
+        Delegates to pko_restore_kv() with the registered decode function.
+
+        Args:
+            request_id: Identifier for the request being resumed.
+            layer_idx: Transformer layer index (unused directly; kept for
+                symmetry with cpm_offload_with_compression API).
+
+        Returns:
+            Tuple of (key_tensor, val_tensor) on GPU, or None if not found.
+        """
+        self._cpm_restore_count += 1
+        return self.pko_restore_kv(
+            request_id=request_id,
+            decode_fn=self._cpm_decode_fn,
+        )
+
+    def cpm_stats(self) -> Dict[str, Any]:
+        """Return compression-aware preemption statistics.
+
+        Returns:
+            dict with keys: offload_count, restore_count, compress_count,
+            compression_ratio, total_bytes_before, total_bytes_after,
+            and all fields from pko_scheduling_stats().
+        """
+        ratio = (
+            self._cpm_total_bytes_after / max(1, self._cpm_total_bytes_before)
+        )
+        base_stats = self.pko_scheduling_stats()
+        base_stats.update({
+            "cpm_offload_count": self._cpm_offload_count,
+            "cpm_restore_count": self._cpm_restore_count,
+            "cpm_compress_count": self._cpm_compress_count,
+            "cpm_compression_ratio": ratio,
+            "cpm_total_bytes_before": self._cpm_total_bytes_before,
+            "cpm_total_bytes_after": self._cpm_total_bytes_after,
+        })
+        return base_stats
+
+
+# ---------------------------------------------------------------------------
 # Prior-cycle components (2026-05-03) — preserved for backward compatibility
 # ---------------------------------------------------------------------------
 
@@ -1519,6 +1645,79 @@ class DualMapSchedulerMixin(DualMapRoutingMixin):
             nodes = [DualMapNodeState(node_id="default")]
         DualMapRoutingMixin.__init__(self, nodes=nodes, slo_ttft_ms=slo_ttft_ms)
         self._dualmap_enabled = True
+
+    def sort_by_cache_affinity(
+        self,
+        requests: List[Any],
+        get_request_id: Optional[Callable[[Any], str]] = None,
+        get_token_ids: Optional[Callable[[Any], List[int]]] = None,
+    ) -> List[Any]:
+        """Sort requests by cache affinity (prior-cycle backward-compat method).
+
+        Reorders the given list so that requests whose hash-preferred node has a
+        lower current load come first, approximating cache-locality-first ordering
+        without a full segment index.
+
+        Args:
+            requests: List of vLLM request objects to sort.
+            get_request_id: Optional fn(request) -> str for extracting request ID.
+                Default: uses getattr(req, 'request_id', str(id(req))).
+            get_token_ids: Optional fn(request) -> List[int] for extracting tokens.
+                Default: uses getattr(req, 'prompt_token_ids', []).
+
+        Returns:
+            New list of requests sorted by cache affinity (lower load first).
+        """
+        def _get_rid(req: Any) -> str:
+            if get_request_id is not None:
+                return get_request_id(req)
+            return getattr(req, "request_id", str(id(req)))
+
+        def _get_tids(req: Any) -> List[int]:
+            if get_token_ids is not None:
+                return get_token_ids(req)
+            tids = getattr(req, "prompt_token_ids", None)
+            if tids is not None:
+                return list(tids)
+            tids = getattr(req, "token_ids", None)
+            if tids is not None:
+                return list(tids)
+            return []
+
+        def _affinity_score(req: Any) -> float:
+            rid = _get_rid(req)
+            tids = _get_tids(req)
+            idx = self._node_index_h1(rid)
+            if idx < len(self._nodes):
+                return self._nodes[idx].current_load
+            return float("inf")
+
+        return sorted(requests, key=_affinity_score)
+
+
+def create_cache_hit_aware_queue(
+    segment_index: Any = None,
+    chunk_size: int = 64,
+    fairness_max_wait: int = 10,
+) -> "CacheHitAwareRequestQueue":
+    """Factory function returning a CacheHitAwareRequestQueue instance.
+
+    Backward-compatibility factory for prior-cycle code that calls
+    ``create_cache_hit_aware_queue()`` instead of constructing the class directly.
+
+    Args:
+        segment_index: Optional segment index for hit-rate estimation.
+        chunk_size: Token chunk size used for segment key computation.
+        fairness_max_wait: Maximum scheduling wait steps before forced promotion.
+
+    Returns:
+        A new CacheHitAwareRequestQueue instance.
+    """
+    return CacheHitAwareRequestQueue(
+        segment_index=segment_index,
+        chunk_size=chunk_size,
+        fairness_max_wait=fairness_max_wait,
+    )
 
 
 class CacheHitAwareRequestQueue:
