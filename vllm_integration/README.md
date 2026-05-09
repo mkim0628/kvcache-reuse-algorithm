@@ -917,6 +917,142 @@ attn_hook = VllmAttentionKVHook(kv_manager, chunk_size=128)
 
 ---
 
+## 2026-05-09 Integration: Activity A+B+C Cross-1 (HitAwarePPDRouter + TriangleInequalitySegmentIndex)
+
+### Architecture
+
+This cycle ports the Cross-1 combination validated in Report ①:
+
+```
+Scheduler (HitAwarePPDRouterMixin)
+    │
+    ├─ Turn 1 → P-node always
+    └─ Turn 2+ → TriangleIndex.estimate_hit_probability()
+                 ├─ hit_prob ≥ threshold → D-node (append-prefill)
+                 └─ hit_prob < threshold → P-node
+                 └─ EMA adaptation: raise threshold if actual_hit_rate < target
+
+KVCacheManager (TriangleIndexKVCacheManagerMixin)
+    │
+    ├─ get_computed_blocks(request)
+    │     ├─ Standard vLLM contiguous prefix lookup (unchanged)
+    │     └─ Fallback: TriangleIndex non-contiguous search → annotate request
+    │           request.ppd_noncontiguous_hits = [(segment_key, distance), ...]
+    │           request.ppd_noncontiguous_hit_probability = float
+    │
+    └─ SegmentIndexAdapter (auto-sync)
+          put(key, value) → cache.put() + index.add_embedding()
+          (resolves Report① unresolved issue #4)
+
+AttentionBackend (SpecKVContextGuardCombinedHook)
+    │
+    ├─ ContextIntensiveGuardAttentionHook (density estimation)
+    │     layer._ci_density_score, _ci_min_bits, _ci_density_level
+    └─ SpecKVGammaAttentionHook (gamma selection)
+          layer._speckv_gamma (1..6)
+          High-density → compression_level=0 (FP16) → higher γ
+```
+
+### New Classes (2026-05-09)
+
+**scheduler_patch.py**:
+- `HitAwarePPDRouterMixin` — primary A+B Cross-1 integration
+- `_InlinePPDRouter` — fallback router (no src/ dependency)
+- `make_hit_aware_ppd_scheduler_class(base)` — factory function
+- `patch_scheduler_instance(scheduler, ...)` — monkey-patch helper
+
+**block_manager_patch.py**:
+- `SegmentIndexAdapter` — wraps cache + triangle index; auto-syncs put() calls
+- `TriangleIndexKVCacheManagerMixin` — non-contiguous annotation on get_computed_blocks()
+- `_InlineTriangleIndex` — fallback without src/ dependency (linear scan)
+- `_LightweightSegmentStore` — minimal LRU dict backend
+- `build_triangle_index(capacity_bytes, embedding_dim, leaf_size, use_semantic_backend)` — factory
+
+**attention_backend_patch.py**:
+- `SpecKVGammaAttentionHook` — γ annotation; EMA bias correction via record_verification()
+- `ContextIntensiveGuardAttentionHook` — density-based min_bits annotation
+- `SpecKVContextGuardCombinedHook` — combined hook, executes guard then gamma in sequence
+- `patch_attention_impl_with_combined_hook(model, hook)` — patches all do_kv_cache_update() methods
+
+### Usage Example (2026-05-09)
+
+```python
+from vllm_integration.scheduler_patch import (
+    make_hit_aware_ppd_scheduler_class,
+    patch_scheduler_instance,
+)
+from vllm_integration.block_manager_patch import (
+    make_triangle_index_kv_cache_manager_class,
+    patch_kv_cache_manager_instance,
+    build_triangle_index,
+    SegmentIndexAdapter,
+)
+from vllm_integration.attention_backend_patch import (
+    SpecKVContextGuardCombinedHook,
+    patch_attention_impl_with_combined_hook,
+)
+
+# Step 1: Build the segment index (with optional SegmentIndexAdapter for auto-sync)
+triangle_index = build_triangle_index(
+    capacity_bytes=512 * 1024 * 1024,  # 512 MB
+    embedding_dim=32,
+    leaf_size=8,
+    use_semantic_backend=False,  # True requires src/ on sys.path
+)
+
+# Step 2: Build the KV cache manager class and patch
+from vllm.v1.core.kv_cache_manager import KVCacheManager
+TriKVCacheManager = make_triangle_index_kv_cache_manager_class(KVCacheManager)
+# Or for an existing instance:
+patch_kv_cache_manager_instance(existing_kv_cache_manager, triangle_index)
+
+# Step 3: Build the scheduler class
+from vllm.v1.core.sched.scheduler import Scheduler
+HitAwareScheduler = make_hit_aware_ppd_scheduler_class(Scheduler)
+# Or for an existing instance:
+patch_scheduler_instance(
+    existing_scheduler,
+    segment_index=triangle_index,
+    target_d_node_ratio=0.4,
+    ema_alpha=0.1,
+)
+
+# Step 4: Attach attention hooks (Activity C)
+combined_hook = SpecKVContextGuardCombinedHook()
+patch_attention_impl_with_combined_hook(model, combined_hook)
+
+# Step 5: Per-step:
+#   a. scheduler.pre_schedule_ppd() — annotates requests with ppd_node_type
+#   b. scheduler.schedule() — standard vLLM scheduling
+#   c. Read request.ppd_node_type, request.ppd_noncontiguous_hits for routing
+#   d. combined_hook.write_to_cache() fires automatically via do_kv_cache_update
+#   e. scheduler.record_ppd_hit(request_id, was_hit) — EMA adaptation
+```
+
+### Block Boundary Note
+
+Non-contiguous KV reuse via TriangleIndexKVCacheManagerMixin is **annotation-only**.
+Physical block allocation remains in vLLM's native block pool. The mixin annotates
+`request.ppd_noncontiguous_hits` and `request.ppd_noncontiguous_hit_probability`
+for the scheduler's P/D routing decision. No cross-block segment assembly occurs
+at the GPU kernel level — this is safe and does not violate vLLM's block boundary invariant.
+
+### SegmentIndexAdapter (Resolves Report① Issue #4)
+
+Prior cycles had a manual connection between SemanticBoundarySegmentCache and
+TriangleInequalitySegmentIndex. The `SegmentIndexAdapter` wraps both:
+
+```python
+adapter = SegmentIndexAdapter(cache_backend, triangle_index)
+adapter.put(key, value)   # → cache.put(key, value) + index.add_embedding(key)
+adapter.get(key)          # → cache.get(key)
+```
+
+Every `put()` call now auto-registers the segment embedding in the triangle index.
+No manual synchronization required.
+
+---
+
 ## How to Apply
 
 ### 1. Install
@@ -945,16 +1081,18 @@ The install script automatically runs smoke tests for all activities.
 
 ---
 
-## Performance Expectations (from Report ① 2026-05-04)
+## Performance Expectations (from Report ① 2026-05-09)
 
-| Metric | Standalone (233/233 tests) | vLLM port target |
+| Metric | Standalone (547/547 tests) | vLLM port target |
 |--------|---------------------------|-----------------|
-| Non-contiguous cache hit rate (TTL) | 100% (noncontiguous_ratio=1.0) | ≥ 30% |
-| High-importance segment preservation | 100% | 100% |
-| Residual Key cosine similarity | ≥ 0.99 | ≥ 0.99 |
-| Hit rate delta (important segments) | ≤ 0.0 (0%p) | ≤ 1%p |
-| Scheduling overhead TTFT p50 | < 5ms / 100 reqs | ≤ 5ms / req |
-| on_kv_reuse_event() p50 latency | < 1ms | < 1ms |
+| Non-contiguous cache hit rate | 100% (N=30, noise=0.02, mid-segment query) | ≥ 30% |
+| PPD D-node routing (Turn 2+) | Verified (HitAwarePPDRouter) | Turn 2+ correct |
+| eOptShrinkQ Key MSE (proxy) | 1.05% (< 5%) | < 5% |
+| eOptShrinkQ Val MSE (proxy) | 0.23% (< 5%) | < 5% |
+| SpecKV gamma (FP16 / INT8 / NF4) | 5 / 2 / 3 | NF4 ≤ FP16 |
+| Index search time (N=1000) | ~25.5ms | O(log N) amortized |
+| Scheduling overhead TTFT p50 | O(log N) ≈ 25ms at N=1000 | ≤ 5% overhead |
+| Context guard high-density min_bits | 4.0 | ≥ 4.0 |
 
 ---
 
@@ -971,3 +1109,4 @@ The install script automatically runs smoke tests for all activities.
 | 2026-05-05 | 1/3 | B+C | NQKVCodecPatch (NF4 INT4), DiffAwareKVPatch (block-sparse diff), CompressedKVManager, FireQAttentionPatch (RoPE-aware 2-stage) |
 | **2026-05-06** | **1/3** | **B+C** | **QueryCentricKVCacheManager (ProphetKV dual-stage), TriAttentionCodecWrapper (pre-RoPE trig), QueryCentricTriAttentionKVCacheManager (B+C dual-path), TriAttentionAttentionHook, VllmQueryCentricAttentionWrapper, QueryCentricSchedulerMixin** |
 | **2026-05-08** | **1/3** | **A+C** | **PreemptiveKVOffloadSchedulerMixin (TokenFlow preemption + async offload), CompressedPreemptionMixin (CUDA dual-stream), VllmEOptShrinkQCodec (BBP auto-rank K2/V3), EOptShrinkQAttentionHook, ManifoldKVOutlierScoreHook, StaticDynamicSegmentKVManager (multi-hop invalidation), ManifoldKVWindowedEvictionManager (outlier-based eviction)** |
+| **2026-05-09** | **1/3** | **A+B+C (Cross-1)** | **HitAwarePPDRouterMixin (A+B Cross-1: PPDAppendPrefillRouter + EMA threshold, Turn 2+ D-node routing), TriangleIndexKVCacheManagerMixin (B: O(log N) non-contiguous lookup via TriangleInequalitySegmentIndex), SegmentIndexAdapter (auto-sync cache↔index, resolves Report① issue #4), _InlinePPDRouter + _InlineTriangleIndex (fallback, no src/ dependency), SpecKVGammaAttentionHook (C: γ annotation, FP16/INT8/NF4), ContextIntensiveGuardAttentionHook (C: density-based min_bits gate), SpecKVContextGuardCombinedHook (C: combined A+B+C pipeline), build_triangle_index factory, make_hit_aware_ppd_scheduler_class factory** |

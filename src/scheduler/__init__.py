@@ -4,6 +4,8 @@ from src.scheduler.dag_topology_scheduler import DAGTopologyScheduler
 from src.scheduler.dag_ttl_adjuster import DAGAwareTTLAdjuster
 from src.scheduler.preemptive_kv_offload import PreemptiveKVOffloadScheduler, PreemptionRecord
 from src.scheduler.compressed_preemption import CompressedPreemptionPipeline
+from src.scheduler.ppd_append_prefill_router import PPDAppendPrefillRouter, PPDRoutingDecision
+from src.scheduler.hit_aware_ppd_router import HitAwarePPDRouter
 
 __all__ = [
     "CacheAwareScheduler",
@@ -14,4 +16,7 @@ __all__ = [
     "PreemptiveKVOffloadScheduler",
     "PreemptionRecord",
     "CompressedPreemptionPipeline",
+    "PPDAppendPrefillRouter",
+    "PPDRoutingDecision",
+    "HitAwarePPDRouter",
 ]

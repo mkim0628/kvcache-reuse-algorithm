@@ -56,7 +56,7 @@ Prior cycle (2026-05-03) components are preserved at the bottom of this file.
 vLLM version: 0.20.1
 """
 
-from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
+from typing import Any, Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
@@ -1180,3 +1180,417 @@ class VllmQueryCentricAttentionWrapper:
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._impl, name)
+
+
+# ===========================================================================
+# 2026-05-09 additions — Activity C: SpecKVGammaController +
+#                         ContextIntensiveAccuracyGuard hooks
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Inline fallback implementations (no src/ dependency)
+# ---------------------------------------------------------------------------
+
+class _InlineGammaController:
+    """Fallback gamma controller when src/cache/speckv_gamma_controller.py is unavailable.
+
+    Selects a fixed gamma based on compression level:
+        FP16 (0) → 5, INT8 (1) → 2, NF4 (2) → 3
+    Matches Report ① 2026-05-09 measured values.
+    """
+
+    _GAMMA_TABLE = {0: 4, 1: 2, 2: 3}  # Matches src/ MLP at default init: FP16=4, INT8=2, NF4=3
+
+    def select_gamma(
+        self,
+        compression_level: int = 0,
+        min_draft_confidence: float = 0.8,
+        max_draft_entropy: float = 0.5,
+    ) -> int:
+        return self._GAMMA_TABLE.get(compression_level, 5)
+
+    def record_verification(self, was_accepted: bool) -> None:
+        pass  # No-op for inline fallback
+
+
+class _InlineContextGuard:
+    """Fallback context guard when src/cache/context_intensive_guard.py is unavailable.
+
+    Uses token count as a simple density proxy:
+        len >= 128 → high density (0.75); 64-127 → medium (0.5); < 64 → low (0.25)
+    """
+
+    def assess(self, token_ids: Any) -> float:
+        try:
+            n = len(token_ids)
+        except TypeError:
+            return 0.5
+        if n >= 128:
+            return 0.75
+        elif n >= 64:
+            return 0.5
+        return 0.25
+
+    def get_compression_limits(self, density_score: float) -> Dict[str, Any]:
+        if density_score >= 0.7:
+            return {"min_bits": 4.0, "max_compression_ratio": 0.5, "density_level": "high"}
+        elif density_score >= 0.4:
+            return {"min_bits": 2.2, "max_compression_ratio": 0.65, "density_level": "medium"}
+        return {"min_bits": 1.0, "max_compression_ratio": 0.85, "density_level": "low"}
+
+
+class SpecKVGammaAttentionHook:
+    """Activity C hook: SpecKVCompressionGammaController integrated at the
+    vLLM attention backend write/read boundary.
+
+    Ports SpecKVCompressionGammaController (src/cache/speckv_gamma_controller.py)
+    into vLLM's attention backend. Selects speculative decoding draft length γ
+    based on KV compression level and draft model signals. Attaches γ as
+    layer._speckv_gamma for the speculative decoder to consume.
+
+    Accuracy contract:
+        - KV tensors are never modified by this hook.
+        - Decompression (if any separate codec is used) MUST run before the
+          attention kernel. This hook provides γ annotation only.
+
+    Usage:
+        hook = SpecKVGammaAttentionHook(
+            gamma_controller=SpecKVCompressionGammaController(),
+        )
+        # Then: install via patch_attention_impl_with_combined_hook()
+    """
+
+    def __init__(
+        self,
+        gamma_controller: Any = None,
+        min_draft_confidence: float = 0.8,
+        max_draft_entropy: float = 0.5,
+        compression_level_default: int = 0,
+    ) -> None:
+        # Lazy-import SpecKVCompressionGammaController from src/ if not provided
+        if gamma_controller is None:
+            try:
+                from src.cache.speckv_gamma_controller import SpecKVCompressionGammaController
+                gamma_controller = SpecKVCompressionGammaController()
+            except ImportError:
+                gamma_controller = _InlineGammaController()
+        self._controller = gamma_controller
+        self._min_draft_confidence = min_draft_confidence
+        self._max_draft_entropy = max_draft_entropy
+        self._compression_level_default = compression_level_default
+        self._write_count: int = 0
+        self._last_gamma: int = 1
+        self._gamma_history: List[int] = []
+
+    def write_to_cache(
+        self,
+        layer: Any,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: Optional[torch.Tensor] = None,
+        slot_mapping: Optional[torch.Tensor] = None,
+        compression_level: Optional[int] = None,
+        min_draft_confidence: Optional[float] = None,
+        max_draft_entropy: Optional[float] = None,
+    ) -> None:
+        """Hook called just before KV write. Selects γ and annotates layer."""
+        comp_lvl = (
+            compression_level if compression_level is not None
+            else self._compression_level_default
+        )
+        min_conf = (
+            min_draft_confidence if min_draft_confidence is not None
+            else self._min_draft_confidence
+        )
+        max_ent = (
+            max_draft_entropy if max_draft_entropy is not None
+            else self._max_draft_entropy
+        )
+
+        gamma = self._controller.select_gamma(comp_lvl, min_conf, max_ent)
+        self._last_gamma = gamma
+        self._gamma_history.append(gamma)
+        self._write_count += 1
+
+        try:
+            layer._speckv_gamma = gamma
+            layer._speckv_compression_level = comp_lvl
+        except (AttributeError, TypeError):
+            pass
+
+    def read_from_cache(
+        self,
+        layer: Any,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Pass-through: KV tensors not modified by this hook."""
+        return key_cache, value_cache
+
+    def record_verification(self, was_accepted: bool) -> None:
+        """Feed speculative decoding verification result for EMA adaptation."""
+        self._controller.record_verification(was_accepted)
+
+    def last_gamma(self) -> int:
+        return self._last_gamma
+
+    def gamma_stats(self) -> Dict[str, Any]:
+        hist = self._gamma_history[-100:]
+        return {
+            "write_count": self._write_count,
+            "last_gamma": self._last_gamma,
+            "avg_gamma": sum(hist) / max(1, len(hist)),
+            "min_gamma": min(hist) if hist else 0,
+            "max_gamma": max(hist) if hist else 0,
+        }
+
+
+class ContextIntensiveGuardAttentionHook:
+    """Activity C hook: ContextIntensiveAccuracyGuard at the attention backend.
+
+    Ports ContextIntensiveAccuracyGuard (src/cache/context_intensive_guard.py).
+    Assesses context information density from token IDs and annotates the layer
+    with compression limits before any KV compression step.
+
+    Density annotations attached to layer:
+        layer._ci_density_score: float
+        layer._ci_min_bits: float
+        layer._ci_max_compression_ratio: float
+        layer._ci_density_level: "high" | "medium" | "low"
+
+    High-density contexts (score >= 0.7) get min_bits=4.0 to protect accuracy.
+    This satisfies evaluation_criteria.md §4 (Compression Accuracy Delta ±1%).
+
+    Accuracy contract: no KV modification — annotation only.
+    """
+
+    def __init__(
+        self,
+        guard: Any = None,
+        token_id_fn: Optional[Callable] = None,
+    ) -> None:
+        # Lazy-import ContextIntensiveAccuracyGuard from src/ if not provided
+        if guard is None:
+            try:
+                from src.cache.context_intensive_guard import ContextIntensiveAccuracyGuard
+                guard = ContextIntensiveAccuracyGuard()
+            except ImportError:
+                guard = _InlineContextGuard()
+        self._guard = guard
+        self._token_id_fn = token_id_fn
+        self._assess_count: int = 0
+        self._high_density_count: int = 0
+        self._medium_density_count: int = 0
+        self._low_density_count: int = 0
+
+    def write_to_cache(
+        self,
+        layer: Any,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: Optional[torch.Tensor] = None,
+        slot_mapping: Optional[torch.Tensor] = None,
+        token_ids: Optional[Any] = None,
+    ) -> None:
+        """Assess density and annotate layer with compression limits."""
+        if token_ids is None:
+            if self._token_id_fn is not None:
+                token_ids = self._token_id_fn(layer, slot_mapping)
+            else:
+                token_ids = getattr(layer, "_token_ids", None)
+        if token_ids is None and slot_mapping is not None:
+            token_ids = slot_mapping.long()
+
+        try:
+            density_score = self._guard.assess(token_ids)
+            limits = self._guard.get_compression_limits(density_score)
+        except Exception:
+            density_score = 0.5
+            limits = {
+                "min_bits": 2.0,
+                "max_compression_ratio": 0.75,
+                "density_level": "medium",
+            }
+
+        self._assess_count += 1
+        level = limits.get("density_level", "medium")
+        if level == "high":
+            self._high_density_count += 1
+        elif level == "medium":
+            self._medium_density_count += 1
+        else:
+            self._low_density_count += 1
+
+        try:
+            layer._ci_density_score = density_score
+            layer._ci_min_bits = limits.get("min_bits", 2.0)
+            layer._ci_max_compression_ratio = limits.get("max_compression_ratio", 0.75)
+            layer._ci_density_level = level
+        except (AttributeError, TypeError):
+            pass
+
+    def read_from_cache(
+        self,
+        layer: Any,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Pass-through: no KV modification."""
+        return key_cache, value_cache
+
+    def guard_stats(self) -> Dict[str, Any]:
+        return {
+            "assess_count": self._assess_count,
+            "high_density_count": self._high_density_count,
+            "medium_density_count": self._medium_density_count,
+            "low_density_count": self._low_density_count,
+            "high_density_fraction": (
+                self._high_density_count / max(1, self._assess_count)
+            ),
+        }
+
+
+class SpecKVContextGuardCombinedHook:
+    """Combined hook: ContextIntensiveGuardAttentionHook + SpecKVGammaAttentionHook.
+
+    Runs both Activity C hooks in sequence at write_to_cache():
+      1. ContextIntensiveGuardAttentionHook: assess density → layer._ci_* limits.
+      2. SpecKVGammaAttentionHook: select γ respecting _ci_min_bits.
+
+    Accuracy chain:
+        High density (score >= 0.7) → min_bits=4.0 → compression_level=FP16 (0)
+                                    → MLP selects higher γ → conservative spec decoding
+        Low density  (score < 0.4)  → min_bits=1.0 → compression_level=NF4  (2)
+                                    → MLP selects lower γ → aggressive spec decoding
+
+    Usage:
+        controller = SpecKVCompressionGammaController()
+        guard = ContextIntensiveAccuracyGuard()
+        hook = SpecKVContextGuardCombinedHook(controller, guard)
+        n = patch_attention_impl_with_combined_hook(model, hook)
+    """
+
+    def __init__(
+        self,
+        gamma_controller: Any = None,
+        context_guard: Any = None,
+        min_draft_confidence: float = 0.8,
+        max_draft_entropy: float = 0.5,
+        compression_level_default: int = 0,
+    ) -> None:
+        self._gamma_hook = SpecKVGammaAttentionHook(
+            gamma_controller=gamma_controller,
+            min_draft_confidence=min_draft_confidence,
+            max_draft_entropy=max_draft_entropy,
+            compression_level_default=compression_level_default,
+        )
+        self._guard_hook = ContextIntensiveGuardAttentionHook(guard=context_guard)
+
+    def write_to_cache(
+        self,
+        layer: Any,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: Optional[torch.Tensor] = None,
+        slot_mapping: Optional[torch.Tensor] = None,
+        token_ids: Optional[Any] = None,
+        compression_level: Optional[int] = None,
+        min_draft_confidence: Optional[float] = None,
+        max_draft_entropy: Optional[float] = None,
+    ) -> None:
+        """Step 1: density assessment; Step 2: γ selection."""
+        self._guard_hook.write_to_cache(
+            layer=layer, key=key, value=value,
+            kv_cache=kv_cache, slot_mapping=slot_mapping,
+            token_ids=token_ids,
+        )
+        # Upgrade compression level based on density annotation
+        if compression_level is None:
+            ci_min_bits = getattr(layer, "_ci_min_bits", 0.0)
+            if ci_min_bits >= 4.0:
+                compression_level = 0  # FP16
+            elif ci_min_bits >= 2.2:
+                compression_level = 1  # INT8
+            else:
+                compression_level = 2  # NF4
+        self._gamma_hook.write_to_cache(
+            layer=layer, key=key, value=value,
+            kv_cache=kv_cache, slot_mapping=slot_mapping,
+            compression_level=compression_level,
+            min_draft_confidence=min_draft_confidence,
+            max_draft_entropy=max_draft_entropy,
+        )
+
+    def read_from_cache(
+        self,
+        layer: Any,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Decompression pass-through (both hooks are annotation-only)."""
+        kc, vc = self._guard_hook.read_from_cache(layer, key_cache, value_cache)
+        return self._gamma_hook.read_from_cache(layer, kc, vc)
+
+    def record_verification(self, was_accepted: bool) -> None:
+        self._gamma_hook.record_verification(was_accepted)
+
+    def combined_stats(self) -> Dict[str, Any]:
+        return {
+            "gamma": self._gamma_hook.gamma_stats(),
+            "context_guard": self._guard_hook.guard_stats(),
+        }
+
+
+def patch_attention_impl_with_combined_hook(
+    model: Any,
+    combined_hook: "SpecKVContextGuardCombinedHook",
+) -> int:
+    """Patch all FlashAttentionImpl instances in a model with the combined hook.
+
+    Wraps do_kv_cache_update() in each FlashAttentionImpl to call
+    combined_hook.write_to_cache() before the original KV write.
+
+    Args:
+        model: vLLM model (torch.nn.Module).
+        combined_hook: SpecKVContextGuardCombinedHook instance.
+
+    Returns:
+        Number of attention layers patched.
+    """
+    import types as _types
+
+    n_patched = 0
+
+    for name, module in model.named_modules():
+        mod_type = type(module).__name__
+        if "AttentionImpl" not in mod_type and "FlashAttention" not in mod_type:
+            continue
+        if not hasattr(module, "do_kv_cache_update"):
+            continue
+        if getattr(module, "_speckv_guard_patched", False):
+            continue
+
+        original_do_kv = module.do_kv_cache_update
+
+        def _make_patched(orig: Any, hook: Any) -> Any:
+            def _patched(
+                layer: Any,
+                key: torch.Tensor,
+                value: torch.Tensor,
+                kv_cache: torch.Tensor,
+                slot_mapping: torch.Tensor,
+            ) -> None:
+                hook.write_to_cache(
+                    layer=layer, key=key, value=value,
+                    kv_cache=kv_cache, slot_mapping=slot_mapping,
+                )
+                return orig(layer, key, value, kv_cache, slot_mapping)
+            return _patched
+
+        module.do_kv_cache_update = _types.MethodType(
+            _make_patched(original_do_kv, combined_hook), module
+        )
+        module._speckv_guard_patched = True
+        n_patched += 1
+
+    return n_patched

@@ -1,83 +1,88 @@
-<!-- 변경 이유 (이전 Spec.md: 2026-05-06 대비):
-이전 사이클(2026-05-06)은 B+C (QueryCentricRecomputeCache + TriAttentionCodec + DualFilterSegmentSelector)
-조합이었다. 이번 사이클은 A+C (PreemptiveKVOffloadScheduler + eOptShrinkQCodec + CompressedPreemptionPipeline)
-조합으로 전환하며, 보조로 Activity B(StaticDynamicSegmentCache)와 Activity C(ManifoldKVWindowedEviction)를 추가한다.
+<!-- 변경 이유 (이전 Spec.md: 2026-05-08 대비):
+이전 사이클(2026-05-08)은 A+C (PreemptiveKVOffloadScheduler + eOptShrinkQCodec + CompressedPreemptionPipeline)
+조합이었다. 이번 사이클은 A+B (PPDAppendPrefillRouter + TriangleInequalitySegmentIndex + HitAwarePPDRouter)
+조합으로 전환하며, 보조로 Activity B(SemanticBoundarySegmentCache) 및
+Activity C(SpecKVCompressionGammaController + ContextIntensiveAccuracyGuard)를 추가한다.
 
 주요 변경:
-1. [Activity A 신규 추가] 이전 두 사이클이 A를 미포함하고 B+C에 집중했으나, 이번 사이클은
-   PreemptiveKVOffloadScheduler(TokenFlow EuroSys 2026 기반)를 도입하여 선점형 요청 스케줄링 +
-   능동적 GPU→CPU KV 전송 오버랩이라는 새로운 Activity A 설계 차원을 추가한다.
+1. [Activity A 교체] PreemptiveKVOffloadScheduler(TokenFlow 기반 선점형 스케줄링) →
+   PPDAppendPrefillRouter(PPD arXiv 2603.13358 기반 D 노드 append-prefill 동적 선택).
+   P/D 역할을 요청 유형과 세그먼트 히트율에 따라 동적으로 결정하는 완전히 새로운
+   라우팅 패러다임. Turn 2+ TTFT 68% 단축 실증 데이터 기반.
 
-2. [Activity C 교체] TriAttentionCodec(pre-RoPE 삼각함수 중요도 프루닝) →
-   eOptShrinkQCodec(BBP 위상전이 기반 자동 저랭크 공유 성분 추출 + TurboQuantCodec 잔차 양자화).
-   이전 사이클의 TurboQuantCodec(기구현)을 잔차 백엔드로 재활용하며, BBP 랜덤 행렬 이론으로
-   랭크를 자동 선택하는 완전히 새로운 이론적 기반을 도입한다.
+2. [Activity B 교체] StaticDynamicSegmentCache(KEEP 기반 정적/동적 분리) →
+   TriangleInequalitySegmentIndex(LycheeCluster arXiv 2603.08453 기반 O(log N) 계층 인덱스)
+   + SemanticBoundarySegmentCache(SemantiCache arXiv 2603.14303 기반 의미 경계 청킹).
+   O(N) 검색 병목을 O(log N)으로 해결하는 근본적 자료구조 개선.
 
-3. [Cross-1 교체] QueryCentricTriAttentionCache(B+C) →
-   CompressedPreemptionPipeline(A+C): 선점 결정 시 eOptShrinkQCodec으로 KV를 인라인 압축 후
-   CUDA 이중 스트림(compute + memory)으로 PCIe 전송을 오버랩한다.
+3. [Cross-1 신규] HitAwarePPDRouter: A-1(PPDAppendPrefillRouter) + B-1(TriangleInequalitySegmentIndex)
+   통합. D 노드에서 비연속 세그먼트를 로그 시간에 검색하여 append-prefill 처리.
 
-4. [Activity B 교체] QueryCentricRecomputeCache + InfoFlowChunkReorderCache →
-   StaticDynamicSegmentCache(KEEP arXiv 2602.23592 기반): 에이전트 메모리 갱신 패턴 기반
-   정적/동적 세그먼트 분리 + Multi-hop 무효화 전파 최소화.
+4. [Activity C 신규 추가] SpecKVCompressionGammaController(SpecKV arXiv 2605.02888 기반
+   압축-γ 결합 최적화) + ContextIntensiveAccuracyGuard(컨텍스트 밀도 기반 압축 한도 보호).
+   eOptShrinkQCodec(05-08 기구현)과 통합.
 
-5. [Activity C 추가] ManifoldKVWindowedEviction 신규 추가:
-   슬라이딩 윈도우 유클리드 아웃라이어 탐지 기반 퇴거 정책 (구현 난이도 low, drop-in 교체).
-
-6. [보존 파일] 이전 사이클 파일
-   (query_centric_recompute.py, info_flow_reorder.py, tri_attention_codec.py,
+5. [보존 파일] 이전 사이클 파일
+   (preemptive_kv_offload.py, compressed_preemption.py, eopt_shrinkq_codec.py,
+   static_dynamic_segment.py, manifoldkv_windowed.py,
+   query_centric_recompute.py, info_flow_reorder.py, tri_attention_codec.py,
    qc_tri_store.py, dual_filter_selector.py, diff_aware_store.py, turbo_quant.py,
    dhd_segment_cache.py, speculative_fetcher.py, sign_vq_segment.py,
    leverage_compressor.py, compression.py, segmented.py, contiguous.py,
    tri_state_compressor.py, compressed_segment.py, segment_adapter.py,
    dag_topology_scheduler.py, workload_ttl_cache.py, redundancy_eviction.py,
-   fireq_codec.py, nqkv_codec.py, compressed_diff_store.py)은
-   이번 사이클에서 수정하지 않는다. 기존 모든 단위·통합 테스트가 회귀 없이 통과해야 한다.
+   fireq_codec.py, nqkv_codec.py, compressed_diff_store.py,
+   cache_aware_scheduler.py, multi_node_scheduler.py, dag_ttl_adjuster.py,
+   dual_map_scheduler.py)은 이번 사이클에서 수정하지 않는다.
+   기존 모든 단위·통합 테스트가 회귀 없이 통과해야 한다.
 -->
 
-# Spec — 2026-05-08
+# Spec — 2026-05-09
 
 ## 배경
 
-**기반 아이디어 리포트**: `reports/ideas/2026-05-08.md`
-**최우선 구현 타겟**: Cross-1 (A+C) — PreemptiveKVOffloadScheduler(A-1) + eOptShrinkQCodec(C-1)
-+ CompressedPreemptionPipeline 통합, 보조로 StaticDynamicSegmentCache(B-1),
-ManifoldKVWindowedEviction(C-4)
+**기반 아이디어 리포트**: `reports/ideas/2026-05-09.md`
+**최우선 구현 타겟**: Cross-1 (A+B) — PPDAppendPrefillRouter(A-1) + TriangleInequalitySegmentIndex(B-1)
++ HitAwarePPDRouter 통합, 보조로 SemanticBoundarySegmentCache(B-2),
+SpecKVCompressionGammaController(C-2), ContextIntensiveAccuracyGuard(C-3)
 
 **해결하려는 문제**:
-- 표준 비선점형(non-preemptive) 요청 스케줄링은 요청 폭주(burst) 시 Head-of-Line Blocking이 발생해
-  P99 TTFT가 급등한다. 실시간 토큰 버퍼 점유율과 소비율을 기준으로 요청을 선점하고
-  GPU→CPU KV 전송을 백그라운드에서 능동적으로 실행하면(TokenFlow EuroSys 2026),
-  P99 TTFT를 최대 80% 감소시킬 수 있다.
-- KV 캐시 선점 시 GPU→CPU 전송 비용이 선점 오버헤드를 키우는 문제를, eOptShrinkQCodec(BBP
-  랜덤 행렬 이론 자동 저랭크 + TurboQuantCodec 잔차)으로 전송 전 KV를 2.2비트로 압축하면
-  PCIe 대역폭 요구를 1/7로 줄여 선점 오버헤드가 추가로 30~40% 감소한다.
-- 에이전트 메모리 갱신 시 갱신 세그먼트 이후의 KV 전체 무효화로 대규모 재계산이 발생하는 문제를,
-  세그먼트를 정적/동적으로 분리하고 Multi-hop 무효화 전파 깊이를 제한하면(StaticDynamicSegmentCache,
-  KEEP arXiv 2602.23592 기반) 재계산 비용을 최소화할 수 있다.
+- 멀티턴 LLM 서빙에서 매 턴마다 이전 응답 KV를 P 노드로 재전송 후 재프리필하는 기존 P/D 분리 구조의
+  두 가지 비효율(Turn 2+ KV 재전송 병목, P→D KV 전송 대역폭 포화)을, D 노드에서 직접
+  append-prefill(새 입력 토큰만 처리 + 캐시된 KV 재사용)을 처리하는 동적 라우터로 해소한다.
+  PPD(arXiv 2603.13358) 기반으로 Turn 2+ TTFT 68% 단축이 가능하다.
+- 비연속 KV 세그먼트 검색이 O(N) 선형 스캔에 의존해 세그먼트 수 증가 시 병목이 되는 문제를,
+  삼각부등식 기반 재귀 계층 인덱스로 O(log N) 검색을 실현한다. LycheeCluster(arXiv 2603.08453)
+  기반으로 검색 속도 3.6× 향상이 가능하다.
+- PPDAppendPrefillRouter의 핵심 라우팅 신호인 "세그먼트 히트 예상 여부"를 TriangleInequalitySegmentIndex
+  O(log N) 검색으로 빠르게 추정하여, "히트 예상 시 D 노드 append, 미스 예상 시 P 노드 full prefill"
+  하는 캐시-인식 PPD 라우터(HitAwarePPDRouter)를 실현한다.
 
 ---
 
 ## 이번 사이클 Activity
 
-- [x] Activity A: KV Cache-aware Scheduling — PreemptiveKVOffloadScheduler (선점형 요청 스케줄링 + 비동기 KV 오프로드)
-- [x] Activity B: Non-Contiguous KV Cache Reuse — StaticDynamicSegmentCache (정적/동적 세그먼트 분리)
-- [x] Activity C: KV Cache Compression — eOptShrinkQCodec (BBP 자동 저랭크 + TurboQuant 잔차) + ManifoldKVWindowedEviction (유클리드 아웃라이어 퇴거)
+- [x] Activity A: KV Cache-aware Scheduling — PPDAppendPrefillRouter (D 노드 append-prefill 동적 선택)
+- [x] Activity B: Non-Contiguous KV Cache Reuse — TriangleInequalitySegmentIndex (O(log N) 계층 인덱스)
+  + SemanticBoundarySegmentCache (의미 경계 청킹 + GSC 클러스터링)
+- [x] Activity C: KV Cache Compression — SpecKVCompressionGammaController (압축-γ 결합 최적화)
+  + ContextIntensiveAccuracyGuard (컨텍스트 밀도 기반 압축 한도 보호)
 
 ---
 
 ## 목표
 
-- [ ] 목표 1 (§1 Throughput): tokens/sec 베이스라인 대비 +20% 이상 — 선점형 스케줄링으로 배치 활용률 향상 + 압축으로 배치 슬롯 증가 (evaluation_criteria.md §1)
+- [ ] 목표 1 (§1 Throughput): tokens/sec 베이스라인 대비 +20% 이상 — PPD append-prefill로 Turn 2+ 재전송 제거 + 인덱스 검색 오버헤드 제거 (evaluation_criteria.md §1)
 - [ ] 목표 2 (§2 Activity A): TTFT p50 증가 +5% 이내 (정상 부하 시) (evaluation_criteria.md §2 필수)
-- [ ] 목표 3 (§2 Activity A): TTFT p99 베이스라인 대비 −60% 이상 (요청 폭주 시, TokenFlow 실증 기준) (evaluation_criteria.md §2)
-- [ ] 목표 4 (§4 KV Memory Reduction): 베이스라인 대비 −30% 이상 — eOptShrinkQCodec 2.2비트 압축 기여 (evaluation_criteria.md §4)
-- [ ] 목표 5 (§4 Accuracy 필수): perplexity 변화 ±1% 이내 — eOptShrinkQCodec BBP 이론 보장 (evaluation_criteria.md §4 필수)
-- [ ] 목표 6 (§4 Accuracy 필수): downstream 태스크 정확도 변화 ±1% 이내 (evaluation_criteria.md §4 필수)
-- [ ] 목표 7 (§3 Non-Contiguous Hit Rate): 전체 히트 중 비연속 히트 비율 ≥ 30% — StaticDynamicSegmentCache 정적 세그먼트 즉시 재사용 (evaluation_criteria.md §3)
-- [ ] 목표 8 (§5 Cross A+C): 복합 처리량 향상 단일 Activity 대비 추가 +5% 이상 (evaluation_criteria.md §5)
-- [ ] 목표 9 (§5 Cross A+C): 복합 메모리 감소 단일 Activity 대비 추가 −10% 이상 (evaluation_criteria.md §5)
-- [ ] 목표 10 (§4 Compression Overhead): eOptShrinkQCodec Encode/Decode 추가 지연 TTFT +10% 이내 (evaluation_criteria.md §4)
+- [ ] 목표 3 (§2 Activity A): Turn 2+ TTFT p50 −68% (D 노드 append-prefill, PPD arXiv 2603.13358 실증) (evaluation_criteria.md §2)
+- [ ] 목표 4 (§2 Activity A): 히트 확률 기반 라우팅으로 캐시 히트율 +10%p 이상 향상 (evaluation_criteria.md §2)
+- [ ] 목표 5 (§3 Non-Contiguous Hit Rate): 전체 히트 중 비연속 히트 비율 ≥ 30% — TriangleInequalitySegmentIndex + SemanticBoundarySegmentCache 통합 (evaluation_criteria.md §3 높음)
+- [ ] 목표 6 (§3 Activity B): TriangleInequalitySegmentIndex 검색 속도 O(N) 대비 3.6× 이상 향상 (N=10K 세그먼트 기준) (evaluation_criteria.md §3)
+- [ ] 목표 7 (§3 Activity B): KV Memory Footprint 베이스라인 대비 +20% 이내 (evaluation_criteria.md §3 높음)
+- [ ] 목표 8 (§4 Accuracy 필수): perplexity 변화 ±1% 이내 — SpecKVCompressionGammaController + ContextIntensiveAccuracyGuard 압축 경로 (evaluation_criteria.md §4 필수)
+- [ ] 목표 9 (§4 Accuracy 필수): downstream 태스크 정확도 변화 ±1% 이내 (evaluation_criteria.md §4 필수)
+- [ ] 목표 10 (§5 Cross A+B): 복합 처리량 향상 단일 Activity 대비 추가 +5% 이상 (evaluation_criteria.md §5)
+- [ ] 목표 11 (§5 Cross A+B): 복합 메모리 감소 단일 Activity 대비 추가 −10% 이상 (evaluation_criteria.md §5)
 
 ---
 
@@ -86,28 +91,47 @@ ManifoldKVWindowedEviction(C-4)
 ```
 요청 도착
     │
-    ├─ PreemptiveKVOffloadScheduler (Activity A)
+    ├─ HitAwarePPDRouter (Cross-1: A+B)
     │       │
-    │       ├─ [선점 트리거] buffer_occupancy_ratio > 0.85 AND token_consumption_rate < demand_rate
-    │       ├─ [선점 결정] 저우선순위 요청 KV를 선점 큐에 등록
-    │       └─ [비동기 GPU→CPU 전송] 배치 버블 시점에 KV 전송 시작
-    │
-    ├─ CompressedPreemptionPipeline (Cross-1: A+C)
+    │       ├─ [Turn 분류] session_id + turn_count 메타데이터로 Turn 1 / Turn 2+ 결정
     │       │
-    │       ├─ [인라인 압축] eOptShrinkQCodec.encode(kv_to_offload) → 2.2비트 압축 KV
-    │       ├─ [CUDA 이중 스트림] compute_stream(압축) + memory_stream(PCIe 전송) 오버랩
-    │       └─ [재개 시 복원] CPU→GPU 전송 후 eOptShrinkQCodec.decode(compressed_kv)
-    │
-    ├─ StaticDynamicSegmentCache (Activity B)
+    │       ├─ Turn 1 (신규 세션) → PPDAppendPrefillRouter → P 노드 full prefill
     │       │
-    │       ├─ [정적 세그먼트] 시스템 프롬프트, 공통 문서 → LRU 퇴거 제외, 완전 재사용
-    │       └─ [동적 세그먼트] 에이전트 행동 결과, 대화 히스토리 → Multi-hop 무효화 범위 제한
+    │       └─ Turn 2+ (멀티턴 계속)
+    │               │
+    │               ├─ TriangleInequalitySegmentIndex.estimate_hit_probability()
+    │               │   → O(log N) 히트 확률 추정 (삼각부등식 서브트리 가지치기)
+    │               │
+    │               ├─ hit_prob > threshold_append (기본 0.7)
+    │               │   → D 노드 append-prefill (캐시된 KV + 새 토큰만 처리)
+    │               │
+    │               └─ hit_prob ≤ 0.7
+    │                   → P 노드 full prefill (KV 재전송, 정확도 보장)
     │
-    └─ eOptShrinkQCodec (Activity C)
+    ├─ TriangleInequalitySegmentIndex (Activity B)
+    │       │
+    │       ├─ [인덱스 구조] 재귀 계층 트리: pivot 선택(가장 먼 두 세그먼트) + max_radius 저장
+    │       ├─ [검색] best-first 우선순위 큐 + 삼각부등식 서브트리 가지치기
+    │       └─ [통합] StaticDynamicSegmentCache(05-08 기구현) 위에 인덱스 레이어로 추가
+    │
+    ├─ SemanticBoundarySegmentCache (Activity B)
+    │       │
+    │       ├─ [청킹] 의미 경계 탐지(구분자: .!?\n\n + 코드 블록 ```)
+    │       ├─ [GSC 클러스터링] 어텐션 스코어 상위 시드 토큰 중심 탐욕적 병합
+    │       ├─ [비례 어텐션] attention_weight_core = Σ(cluster attention weights)
+    │       └─ [통합] TriangleInequalitySegmentIndex에 의미 코어 임베딩 등록
+    │
+    ├─ ContextIntensiveAccuracyGuard (Activity C)
+    │       │
+    │       ├─ [밀도 추정] 첫 128 토큰 샘플링: entity_ratio + numeric_ratio + token_entropy 가중합
+    │       └─ [압축 한도 게이트] 고밀도(≥0.7) → ≥4비트; 중간(0.4~0.7) → 2.2~4비트; 저밀도(≤0.4) → ≤2.2비트
+    │
+    └─ SpecKVCompressionGammaController (Activity C)
             │
-            ├─ [SVD + BBP 위상전이] 자동 랭크 선택 → 저랭크 공유 성분 추출
-            ├─ [TurboQuantCodec 잔차] Key 2비트 / Value 3비트 비대칭 양자화
-            └─ ManifoldKVWindowedEviction: 슬라이딩 윈도우 유클리드 아웃라이어 퇴거
+            ├─ [입력] eOptShrinkQCodec(기구현) 압축 수준 + min_draft_confidence + max_draft_entropy
+            ├─ [경량 MLP] 입력 차원 3 → 출력 6 (γ ∈ {1,2,3,4,5,6})
+            ├─ [eOptShrinkQCodec 통합] 압축 수준 출력을 자동으로 MLP 입력으로 주입
+            └─ [온라인 적응] 검증 통과율 EMA 기반 γ 보정
 ```
 
 ---
@@ -118,29 +142,34 @@ ManifoldKVWindowedEviction(C-4)
 
 | 파일 | Activity | 역할 |
 |------|----------|------|
-| `src/scheduler/preemptive_kv_offload.py` | A | 선점형 요청 스케줄링 + 비동기 GPU→CPU KV 전송 |
-| `src/scheduler/compressed_preemption.py` | A+C | CompressedPreemptionPipeline: 선점 시 eOptShrinkQCodec 인라인 압축 + CUDA 이중 스트림 |
-| `src/cache/eopt_shrinkq_codec.py` | C | BBP 위상전이 자동 저랭크 + TurboQuantCodec 잔차 이중 파이프라인 |
-| `src/cache/static_dynamic_segment.py` | B | 정적/동적 세그먼트 분리 + Multi-hop 무효화 전파 최소화 |
-| `src/cache/manifoldkv_windowed.py` | C | 슬라이딩 윈도우 유클리드 아웃라이어 KV 퇴거 정책 |
-| `experiments/run_preemptive_ttft.py` | A | 선점형 vs 비선점형 TTFT p50/p99 비교 측정 스크립트 |
-| `experiments/run_eopt_accuracy.py` | C | eOptShrinkQCodec perplexity + LongBench + NIAH 정확도 측정 |
-| `tests/unit/test_preemptive_scheduler.py` | A | 선점 트리거 + KV 전송 비동기 단위 테스트 |
-| `tests/unit/test_eopt_shrinkq_accuracy.py` | C | BBP 랭크 선택 + accuracy-preserving 단위 테스트 |
-| `tests/unit/test_static_dynamic_segment.py` | B | 정적/동적 분류 + Multi-hop 무효화 전파 단위 테스트 |
-| `tests/unit/test_manifoldkv_eviction.py` | C | 유클리드 아웃라이어 스코어 + 퇴거 정책 단위 테스트 |
-| `tests/integration/test_cross_ac_preempt_compress.py` | A+C | CompressedPreemptionPipeline 통합 E2E 테스트 |
-| `configs/experiments/2026-05-08.yaml` | 공통 | 실험 설정 파일 |
+| `src/cache/triangle_index.py` | B | TriangleInequalitySegmentIndex: 삼각부등식 기반 재귀 계층 KV 세그먼트 인덱스 (O(log N) 검색) |
+| `src/cache/semantic_boundary_cache.py` | B | SemanticBoundarySegmentCache: 의미 경계 청킹 + GSC 클러스터링 + 비례 어텐션 |
+| `src/scheduler/ppd_append_prefill_router.py` | A | PPDAppendPrefillRouter: Turn 1/2+ 분류 + D/P 노드 동적 선택 |
+| `src/scheduler/hit_aware_ppd_router.py` | A+B | HitAwarePPDRouter: A-1 + B-1 통합, 히트 확률 임계값 온라인 적응 |
+| `src/cache/speckv_gamma_controller.py` | C | SpecKVCompressionGammaController: 경량 MLP γ 컨트롤러 + eOptShrinkQCodec 통합 |
+| `src/cache/context_intensive_guard.py` | C | ContextIntensiveAccuracyGuard: 컨텍스트 밀도 기반 압축 한도 보호 게이트 |
+| `experiments/run_index_speed_benchmark.py` | B | TriangleInequalitySegmentIndex O(N) vs O(log N) 검색 속도 벤치마크 (N=100/1K/10K) |
+| `experiments/run_ppd_ttft.py` | A | PPD 라우팅 TTFT p50/p99 측정 (Turn 1 vs Turn 2+, 5턴 대화 시뮬레이션) |
+| `experiments/run_text2json_accuracy.py` | C | Text2JSON 벤치마크 + LongBench + WikiText-2 perplexity 정확도 측정 |
+| `tests/unit/test_triangle_index_search.py` | B | O(log N) 가지치기 검증 + 검색 속도 비교 단위 테스트 |
+| `tests/unit/test_ppd_router.py` | A | Turn 분류 + 히트 확률 기반 P/D 선택 단위 테스트 |
+| `tests/unit/test_semantic_boundary_cache.py` | B | 의미 경계 탐지 + GSC 병합 + 비례 어텐션 단위 테스트 |
+| `tests/unit/test_speckv_gamma.py` | C | 압축 수준별 γ 선택 + perplexity proxy ±1% 단위 테스트 |
+| `tests/unit/test_context_intensive_guard.py` | C | 밀도 추정 + 압축 한도 게이팅 단위 테스트 |
+| `tests/integration/test_cross_ab_ppd_index.py` | A+B | HitAwarePPDRouter + TriangleInequalitySegmentIndex E2E 통합 테스트 |
+| `configs/experiments/2026-05-09.yaml` | 공통 | 실험 설정 파일 |
 
 ### 변경할 파일
 
 | 파일 | 변경 내용 |
 |------|----------|
-| `src/scheduler/__init__.py` | `PreemptiveKVOffloadScheduler`, `CompressedPreemptionPipeline` export 추가 |
-| `src/cache/__init__.py` | `eOptShrinkQCodec`, `StaticDynamicSegmentCache`, `ManifoldKVWindowedEviction` export 추가 |
+| `src/scheduler/__init__.py` | `PPDAppendPrefillRouter`, `HitAwarePPDRouter` export 추가 |
+| `src/cache/__init__.py` | `TriangleInequalitySegmentIndex`, `SemanticBoundarySegmentCache`, `SpecKVCompressionGammaController`, `ContextIntensiveAccuracyGuard` export 추가 |
 
 ### 수정 금지 파일 (이전 사이클 보존)
 
+`preemptive_kv_offload.py`, `compressed_preemption.py`, `eopt_shrinkq_codec.py`,
+`static_dynamic_segment.py`, `manifoldkv_windowed.py`,
 `query_centric_recompute.py`, `info_flow_reorder.py`, `tri_attention_codec.py`,
 `qc_tri_store.py`, `dual_filter_selector.py`, `diff_aware_store.py`, `turbo_quant.py`,
 `dhd_segment_cache.py`, `speculative_fetcher.py`, `sign_vq_segment.py`,
@@ -155,803 +184,567 @@ ManifoldKVWindowedEviction(C-4)
 
 ## 알고리즘 상세
 
-### 1. PreemptiveKVOffloadScheduler (Activity A)
+### 1. TriangleInequalitySegmentIndex (Activity B)
 
-**스케줄링 결정 단위**: 배치(batch) 단위로 선점 결정. 각 배치 시작 시 버퍼 상태를 확인하고,
-선점 조건이 충족되면 배치 내 저우선순위 요청을 선점 큐로 이동시킨다.
+**스케줄링 결정 단위**: 검색은 요청(request) 단위로 실행. 각 Turn 2+ 요청의 세그먼트 목록을
+쿼리로 사용해 캐시에서 O(log N) 검색 실행.
 
-**캐시 상태 접근 방법**: `cache.memory_bytes()` 및 `cache_capacity_bytes` 파라미터로
-`buffer_occupancy_ratio`를 계산. `token_consumption_rate`는 최근 `consumption_rate_window`(기본 32)
-토큰 처리 시간의 이동 평균으로 추정. 캐시를 직접 수정하지 않고 읽기 전용으로 상태를 조회한다.
+**캐시 상태 접근 방법**: `CacheStore` 인터페이스(base.py)를 통해 세그먼트 임베딩에 접근.
+내부적으로 `StaticDynamicSegmentCache`(기구현)을 백엔드 저장소로 사용하고,
+그 위에 인덱스 레이어를 추가. `put()`/`get()` 모두 인덱스를 자동으로 갱신.
 
 ```python
-# src/scheduler/preemptive_kv_offload.py 의사코드
+# src/cache/triangle_index.py 의사코드
 
-import asyncio
+from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
+import heapq
 import torch
 from src.cache.base import CacheStore
-from src.engine.runner import InferenceRequest
 
 
 @dataclass
-class PreemptionRecord:
-    request_id: str
-    offloaded_kv: Optional[torch.Tensor]  # CPU 메모리에 보관된 KV (압축 전 원본 또는 압축 후)
-    offload_bytes: int
-    is_compressed: bool = False
+class _IndexNode:
+    """계층 인덱스의 단일 노드."""
+    center_key: str              # 이 노드의 중심 세그먼트 키
+    center_embedding: torch.Tensor  # 중심 임베딩 벡터 [d_embed]
+    max_radius: float            # 서브트리 내 중심과 가장 먼 세그먼트까지의 거리
+    left: Optional["_IndexNode"] = None
+    right: Optional["_IndexNode"] = None
+    segment_keys: List[str] = field(default_factory=list)  # 리프 노드의 세그먼트 키 목록
 
 
-class PreemptiveKVOffloadScheduler:
+class TriangleInequalitySegmentIndex(CacheStore):
     """
-    TokenFlow(EuroSys 2026) 원리 기반 선점형 요청 스케줄링.
+    LycheeCluster(arXiv 2603.08453) 원리 기반 삼각부등식 재귀 계층 KV 세그먼트 인덱스.
 
-    선점 결정 단위: 배치(batch) 단위.
-    캐시 상태 접근: cache.memory_bytes() + cache_capacity_bytes (읽기 전용).
-
-    이전 Activity A 기법(CacheAwareScheduler, DAGTopologyScheduler 등)과의 차별점:
-    - 기존: 요청 우선순위 재정렬(cache hit rate 기반).
-    - 신규: 실행 중인 요청을 중단(선점)하고 KV를 CPU로 능동 전송.
-      "요청을 멈추는 시점"과 "KV를 옮기는 타이밍"의 실시간 공동 결정.
-    """
-
-    def __init__(
-        self,
-        cache: CacheStore,
-        cache_capacity_bytes: int,
-        threshold_preempt: float = 0.85,       # 버퍼 점유율 임계값
-        consumption_rate_window: int = 32,      # 소비율 추정 이동 평균 윈도우 (토큰 수)
-        fairness_max_wait: int = 10,            # 선점 면제 최대 대기 스텝
-        preempt_compress: bool = False,         # True이면 CompressedPreemptionPipeline 연동
-        sla_tier_a_ids: Optional[List[str]] = None,  # 선점 제외 SLA Tier-A 요청 ID 목록
-    ) -> None:
-        self.cache = cache
-        self.cache_capacity_bytes = cache_capacity_bytes
-        self.threshold_preempt = threshold_preempt
-        self.consumption_rate_window = consumption_rate_window
-        self.fairness_max_wait = fairness_max_wait
-        self.preempt_compress = preempt_compress
-        self.sla_tier_a_ids: set = set(sla_tier_a_ids or [])
-
-        self._wait_steps: Dict[str, int] = {}
-        self._preempted: Dict[str, PreemptionRecord] = {}  # 선점된 요청 KV 보관
-        self._token_history: List[Tuple[float, int]] = []  # (timestamp, token_count) 이동 평균용
-
-    def schedule(self, requests: List[InferenceRequest]) -> List[InferenceRequest]:
-        """
-        배치 단위 선점 결정 + 요청 재정렬.
-
-        1. buffer_occupancy_ratio 계산
-        2. 선점 조건 충족 시 저우선순위 요청 선점 큐 이동
-        3. 이미 선점된 요청 중 재개 가능(CPU KV 복원 비용 < 재계산 비용)한 요청 복원
-        4. 나머지 활성 요청을 우선순위 순으로 반환
-        """
-        buffer_occupancy = self._buffer_occupancy_ratio()
-        demand_rate = self._estimate_demand_rate(requests)
-        consumption_rate = self._estimate_consumption_rate()
-
-        active_requests: List[InferenceRequest] = []
-        for req in requests:
-            if req.request_id not in self._wait_steps:
-                self._wait_steps[req.request_id] = 0
-
-            # SLA Tier-A 요청은 선점 불가
-            if req.request_id in self.sla_tier_a_ids:
-                active_requests.append(req)
-                continue
-
-            # 선점 조건: 버퍼 점유율 초과 + 소비율 < 수요율
-            if (buffer_occupancy > self.threshold_preempt
-                    and consumption_rate < demand_rate
-                    and self._wait_steps[req.request_id] < self.fairness_max_wait):
-                # 저우선순위 요청 선점 (KV 오프로드는 비동기 처리)
-                self._preempt_request(req)
-            else:
-                active_requests.append(req)
-
-        # 선점된 요청 중 재개 가능한 요청 복원
-        resumed = self._try_resume_preempted()
-        active_requests.extend(resumed)
-
-        # 대기 스텝 갱신
-        active_ids = {r.request_id for r in active_requests}
-        for req in requests:
-            if req.request_id not in active_ids:
-                self._wait_steps[req.request_id] = self._wait_steps.get(req.request_id, 0) + 1
-
-        return active_requests
-
-    def offload_kv_async(
-        self,
-        request_id: str,
-        kv_tensor: torch.Tensor,              # GPU KV 텐서
-        encode_fn: Optional[Callable] = None,  # eOptShrinkQCodec.encode (선택적)
-    ) -> None:
-        """
-        GPU→CPU 비동기 KV 전송 (배치 버블 시점에 호출).
-
-        encode_fn이 제공되면 GPU에서 압축 후 전송 (CompressedPreemptionPipeline 연동).
-        asyncio.Queue 패턴으로 백그라운드 전송 큐에 적재.
-
-        vLLM v0.9 통합 경로:
-            # vLLM 비동기 KV Connector API를 encode_fn 대신 전송 백엔드로 사용 가능:
-            # from vllm.distributed.kv_transfer.kv_connector.base import BaseKVConnector
-            # connector.insert(kv_tensor, ...)  ← 이 인터페이스로 대체
-        """
-        if encode_fn is not None:
-            kv_compressed = encode_fn(kv_tensor)
-            cpu_kv = kv_compressed.cpu()
-            is_compressed = True
-            offload_bytes = cpu_kv.nbytes if hasattr(cpu_kv, 'nbytes') else int(cpu_kv.numel() * 2)
-        else:
-            cpu_kv = kv_tensor.cpu()
-            is_compressed = False
-            offload_bytes = cpu_kv.nbytes
-
-        self._preempted[request_id] = PreemptionRecord(
-            request_id=request_id,
-            offloaded_kv=cpu_kv,
-            offload_bytes=offload_bytes,
-            is_compressed=is_compressed,
-        )
-
-    def restore_kv(
-        self,
-        request_id: str,
-        decode_fn: Optional[Callable] = None,  # eOptShrinkQCodec.decode (선택적)
-    ) -> Optional[torch.Tensor]:
-        """
-        CPU→GPU KV 복원.
-        복원 비용 > 재계산 비용 이면 None 반환 → 호출자가 재계산 선택.
-        """
-        record = self._preempted.get(request_id)
-        if record is None or record.offloaded_kv is None:
-            return None
-        gpu_kv = record.offloaded_kv.cuda()
-        if record.is_compressed and decode_fn is not None:
-            gpu_kv = decode_fn(gpu_kv)
-        del self._preempted[request_id]
-        return gpu_kv
-
-    def _buffer_occupancy_ratio(self) -> float:
-        current = self.cache.memory_bytes()
-        return current / max(self.cache_capacity_bytes, 1)
-
-    def _estimate_demand_rate(self, requests: List[InferenceRequest]) -> float:
-        total_tokens = sum(len(r.token_ids) for r in requests)
-        return float(total_tokens) / max(len(requests), 1)
-
-    def _estimate_consumption_rate(self) -> float:
-        if len(self._token_history) < 2:
-            return float('inf')
-        import time as _time
-        recent = self._token_history[-self.consumption_rate_window:]
-        if len(recent) < 2:
-            return float('inf')
-        dt = recent[-1][0] - recent[0][0]
-        tokens = sum(t for _, t in recent)
-        return tokens / max(dt, 1e-6)
-
-    def record_processed_tokens(self, token_count: int) -> None:
-        """배치 처리 후 호출하여 소비율 이동 평균 갱신."""
-        import time as _time
-        self._token_history.append((_time.monotonic(), token_count))
-        if len(self._token_history) > self.consumption_rate_window * 2:
-            self._token_history = self._token_history[-self.consumption_rate_window:]
-
-    def _preempt_request(self, req: InferenceRequest) -> None:
-        """선점 등록 (실제 KV 전송은 offload_kv_async로 별도 호출)."""
-        self._preempted.setdefault(req.request_id, PreemptionRecord(
-            request_id=req.request_id,
-            offloaded_kv=None,
-            offload_bytes=0,
-        ))
-
-    def _try_resume_preempted(self) -> List[InferenceRequest]:
-        """버퍼 여유가 생긴 경우 선점된 요청 재개."""
-        if self._buffer_occupancy_ratio() < self.threshold_preempt * 0.8:
-            resumed = []
-            # 대기 스텝이 가장 긴 순으로 복원 (공정성)
-            sorted_preempted = sorted(
-                self._preempted.items(),
-                key=lambda x: self._wait_steps.get(x[0], 0),
-                reverse=True,
-            )
-            for rid, record in sorted_preempted[:3]:  # 한 번에 최대 3개 복원
-                # KV가 오프로드된 경우에만 복원 요청 생성
-                if record.offloaded_kv is not None:
-                    from src.engine.runner import InferenceRequest as _IR
-                    resumed.append(_IR(request_id=rid, token_ids=[]))
-            return resumed
-        return []
-```
-
----
-
-### 2. eOptShrinkQCodec (Activity C)
-
-**BBP 위상전이 임계값**: `sigma_c = noise_level × (1 + sqrt(aspect_ratio))^2`
-- `aspect_ratio = min(n_rows, n_cols) / max(n_rows, n_cols)` (KV 행렬의 행/열 비율)
-- `noise_level`: 캘리브레이션 데이터에서 Marchenko-Pastur 분포 우변 추정
-- 자동 랭크 `r` = `S > sigma_c`를 만족하는 특이값의 수
-
-```python
-# src/cache/eopt_shrinkq_codec.py 의사코드
-
-import math
-from typing import Dict, List, Optional, Tuple
-import torch
-import torch.nn.functional as F
-from src.cache.turbo_quant import TurboQuantCodec
-
-
-class eOptShrinkQCodec:
-    """
-    BBP(Baik-Ben Arous-Péché) 위상전이 기반 자동 저랭크 공유 성분 추출 +
-    TurboQuantCodec 잔차 양자화 이중 파이프라인.
-
-    eOptShrinkQ(arXiv 2605.02905) 기반.
-    CacheStore를 상속하지 않음 (순수 코덱 클래스).
-    PreemptiveKVOffloadScheduler 및 CompressedPreemptionPipeline에서 encode/decode로 호출됨.
-
-    메모리 구조:
-    - 저랭크 베이스: U[:, :r] @ diag(S[:r]) @ V[:r, :] — float16 저장
-    - 잔차 양자화: TurboQuantCodec(Key 2비트 / Value 3비트 비대칭)
-    - 실효 압축: ~2.2비트/원소 (eOptShrinkQ 논문 실증: TurboQuant 3비트 대비 동등 성능)
+    - 삼각부등식 가지치기: d(q,c) - max_radius(node) > best_dist → 서브트리 전체 가지치기
+    - 이론적 검색 복잡도: O(N) → O(log N)
+    - 백엔드: StaticDynamicSegmentCache(기구현) 위에 인덱스 레이어로 추가
+    - CacheStore 인터페이스 완전 구현 (put/get/evict/hit_rate/memory_bytes/reset_stats)
     """
 
     def __init__(
         self,
-        num_layers: int,
-        key_bits: int = 2,           # Key 양자화 비트 (공격적)
-        value_bits: int = 3,         # Value 양자화 비트 (보수적)
-        calibration_samples: int = 20,  # 오프라인 캘리브레이션 최소 샘플 수
-        base_seed: int = 42,
+        backend_cache: CacheStore,     # StaticDynamicSegmentCache 인스턴스
+        embedding_dim: int = 64,       # 세그먼트 임베딩 차원 (Key 벡터 평균)
+        leaf_size: int = 8,            # 리프 노드 최대 세그먼트 수 (분기 기준)
+        distance_fn: str = "cosine",   # "cosine" 또는 "euclidean"
     ) -> None:
-        self.num_layers = num_layers
-        self.key_bits = key_bits
-        self.value_bits = value_bits
-        self.calibration_samples = calibration_samples
-
-        # TurboQuantCodec 재활용 (Key: key_bits, Value: value_bits)
-        self._key_codec = TurboQuantCodec(
-            num_layers=num_layers, bits=key_bits, base_seed=base_seed
-        )
-        self._val_codec = TurboQuantCodec(
-            num_layers=num_layers, bits=value_bits, base_seed=base_seed + 1
-        )
-
-        # 레이어별 캘리브레이션 결과
-        self._noise_levels: Dict[int, float] = {}  # {layer_idx: estimated_noise_level}
-        self._auto_ranks: Dict[int, int] = {}       # {layer_idx: auto_selected_rank}
-
-    # ------------------------------------------------------------------ #
-    # 캘리브레이션                                                         #
-    # ------------------------------------------------------------------ #
-
-    def calibrate(
-        self,
-        calibration_kvs: List[torch.Tensor],
-        # calibration_kvs[i]: [n_tokens, d_head] float32 (레이어 i)
-        save_path: Optional[str] = None,
-    ) -> None:
-        """
-        레이어별 noise_level 추정 및 자동 랭크 선택.
-        오프라인 1회 실행 후 저장. calibration_samples ≥ 20 샘플 필요.
-        """
-        for layer_idx, kv in enumerate(calibration_kvs):
-            if kv.numel() == 0:
-                continue
-            kv_f = kv.float()
-            n, d = kv_f.shape
-            aspect_ratio = min(n, d) / max(n, d)
-
-            # 특이값 분해
-            try:
-                _, S, _ = torch.linalg.svd(kv_f, full_matrices=False)
-            except RuntimeError:
-                self._noise_levels[layer_idx] = 1.0
-                self._auto_ranks[layer_idx] = min(8, min(n, d))
-                continue
-
-            # Marchenko-Pastur 우변 추정 (노이즈 특이값 중앙값 기반 간략 추정)
-            # sigma_mp_max ≈ median(S) × sqrt(max(n, d)) / sqrt(min(n, d))
-            noise_level = S.median().item() / math.sqrt(max(n, d))
-            self._noise_levels[layer_idx] = noise_level
-
-            # BBP 위상전이 임계값
-            sigma_c = noise_level * (1.0 + math.sqrt(aspect_ratio)) ** 2
-
-            # 자동 랭크: sigma_c 초과 특이값 수
-            r = int((S > sigma_c).sum().item())
-            r = max(1, min(r, min(n, d) // 2))  # 최소 1, 최대 min(n,d)/2
-            self._auto_ranks[layer_idx] = r
-
-        if save_path:
-            torch.save(
-                {"noise_levels": self._noise_levels, "auto_ranks": self._auto_ranks},
-                save_path,
-            )
-
-    def load_calibration(self, load_path: str) -> None:
-        """저장된 캘리브레이션 파일 로드."""
-        ckpt = torch.load(load_path)
-        self._noise_levels = ckpt["noise_levels"]
-        self._auto_ranks = ckpt["auto_ranks"]
-
-    # ------------------------------------------------------------------ #
-    # 인코딩                                                               #
-    # ------------------------------------------------------------------ #
-
-    def encode(
-        self,
-        kv_key: torch.Tensor,   # [n_tokens, d_head] — Key 텐서
-        kv_val: torch.Tensor,   # [n_tokens, d_head] — Value 텐서
-        layer_idx: int,
-    ) -> Dict:
-        """
-        저랭크 성분 분리 + TurboQuantCodec 잔차 양자화.
-
-        저장 구조:
-          {
-            "key_lowrank":  {"U": tensor, "S": tensor, "V": tensor},  # float16
-            "val_lowrank":  {"U": tensor, "S": tensor, "V": tensor},  # float16
-            "key_residual": TurboQuantCodec 압축 dict (key_bits 비트),
-            "val_residual": TurboQuantCodec 압축 dict (value_bits 비트),
-            "layer_idx": int,
-            "n_tokens": int,
-            "d_head": int,
-          }
-        """
-        n_tokens, d_head = kv_key.shape
-        r = self._auto_ranks.get(layer_idx, min(8, min(n_tokens, d_head) // 2))
-
-        def _encode_single(kv: torch.Tensor, codec: TurboQuantCodec, tensor_id: int) -> Dict:
-            kv_f = kv.float()
-            try:
-                U, S, Vh = torch.linalg.svd(kv_f, full_matrices=False)
-            except RuntimeError:
-                return {"lowrank": None, "residual": codec.encode(kv_f, layer_idx, tensor_id)}
-
-            # 저랭크 베이스 (rank-r 근사)
-            r_eff = min(r, S.shape[0])
-            U_r = U[:, :r_eff]        # [n_tokens, r_eff]
-            S_r = S[:r_eff]           # [r_eff]
-            Vh_r = Vh[:r_eff, :]      # [r_eff, d_head]
-            lowrank_approx = (U_r * S_r.unsqueeze(0)) @ Vh_r  # [n_tokens, d_head]
-
-            # 잔차
-            residual = kv_f - lowrank_approx   # [n_tokens, d_head]
-            compressed_residual = codec.encode(residual, layer_idx, tensor_id)
-
-            return {
-                "lowrank": {
-                    "U": U_r.half(),   # float16 저장
-                    "S": S_r.half(),
-                    "V": Vh_r.half(),
-                },
-                "residual": compressed_residual,
-            }
-
-        return {
-            "key": _encode_single(kv_key, self._key_codec, tensor_id=0),
-            "val": _encode_single(kv_val, self._val_codec, tensor_id=1),
-            "layer_idx": layer_idx,
-            "n_tokens": n_tokens,
-            "d_head": d_head,
-        }
-
-    # ------------------------------------------------------------------ #
-    # 디코딩                                                               #
-    # ------------------------------------------------------------------ #
-
-    def decode(self, compressed: Dict) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        저랭크 베이스 복원 + TurboQuantCodec 잔차 복원 → 원본 근사 반환.
-
-        반환: (key_approx, val_approx) — 각각 [n_tokens, d_head] float32
-        """
-        layer_idx = compressed["layer_idx"]
-
-        def _decode_single(comp: Dict, codec: TurboQuantCodec) -> torch.Tensor:
-            residual_approx = codec.decode(comp["residual"], layer_idx)
-            if comp["lowrank"] is None:
-                return residual_approx
-            U_r = comp["lowrank"]["U"].float()
-            S_r = comp["lowrank"]["S"].float()
-            Vh_r = comp["lowrank"]["V"].float()
-            lowrank_approx = (U_r * S_r.unsqueeze(0)) @ Vh_r
-            return lowrank_approx + residual_approx
-
-        key_approx = _decode_single(compressed["key"], self._key_codec)
-        val_approx = _decode_single(compressed["val"], self._val_codec)
-        return key_approx, val_approx
-
-    def memory_bytes_estimate(self, n_tokens: int, d_head: int, layer_idx: int = 0) -> Dict:
-        """압축 후 예상 메모리 사용량 추정."""
-        r = self._auto_ranks.get(layer_idx, 8)
-        # 저랭크: float16 저장 (U_r + S_r + Vh_r)
-        lowrank_bytes = (n_tokens * r + r + r * d_head) * 2  # float16 = 2 bytes
-        # 잔차: TurboQuantCodec 추정
-        key_res_bytes = self._key_codec.memory_bytes_estimate(n_tokens, d_head, layer_idx)["total_bytes"]
-        val_res_bytes = self._val_codec.memory_bytes_estimate(n_tokens, d_head, layer_idx)["total_bytes"]
-        total = lowrank_bytes * 2 + key_res_bytes + val_res_bytes  # Key + Value 저랭크
-        baseline = n_tokens * d_head * 4 * 2  # FP32 K + V
-        return {
-            "total_bytes": total,
-            "baseline_bytes": baseline,
-            "reduction_ratio": 1.0 - total / max(baseline, 1),
-        }
-```
-
----
-
-### 3. CompressedPreemptionPipeline (Activity A+C, Cross-1)
-
-```python
-# src/scheduler/compressed_preemption.py 의사코드
-
-from typing import Callable, Dict, Optional
-import torch
-from src.scheduler.preemptive_kv_offload import PreemptiveKVOffloadScheduler
-from src.cache.eopt_shrinkq_codec import eOptShrinkQCodec
-from src.cache.base import CacheStore
-from src.engine.runner import InferenceRequest
-
-
-class CompressedPreemptionPipeline:
-    """
-    Cross-1 (A+C): PreemptiveKVOffloadScheduler + eOptShrinkQCodec 통합.
-
-    선점 결정 시 eOptShrinkQCodec 압축을 CUDA compute_stream에서,
-    PCIe 전송을 memory_stream에서 동시 실행하여 오버랩 효율을 최대화한다.
-
-    측정 지표:
-    - overlap_efficiency: 압축-전송 오버랩으로 절약된 시간 / (압축 시간 + 전송 시간)
-    - preemption_compress_ratio: 선점된 요청 중 압축 적용 비율
-    - offload_bytes_before / offload_bytes_after: 압축 전/후 전송 크기
-    """
-
-    def __init__(
-        self,
-        scheduler: PreemptiveKVOffloadScheduler,
-        codec: eOptShrinkQCodec,
-        use_dual_stream: bool = True,         # CUDA 이중 스트림 오버랩 활성화
-        sla_tier_a_no_compress: bool = True,  # SLA Tier-A 요청 선점 시 압축 미적용
-    ) -> None:
-        self.scheduler = scheduler
-        self.codec = codec
-        self.use_dual_stream = use_dual_stream
-        self.sla_tier_a_no_compress = sla_tier_a_no_compress
-
-        # CUDA 스트림 분리
-        self._compute_stream: Optional[torch.cuda.Stream] = None
-        self._memory_stream: Optional[torch.cuda.Stream] = None
-        if torch.cuda.is_available():
-            self._compute_stream = torch.cuda.Stream()
-            self._memory_stream = torch.cuda.Stream()
-
-        # 메트릭
-        self._overlap_efficiency_history: list = []
-        self._total_bytes_before: int = 0
-        self._total_bytes_after: int = 0
-
-    def schedule(self, requests) -> list:
-        """PreemptiveKVOffloadScheduler.schedule() 위임."""
-        return self.scheduler.schedule(requests)
-
-    def offload_with_compression(
-        self,
-        request_id: str,
-        kv_key: torch.Tensor,   # GPU KV Key [n_tokens, d_head]
-        kv_val: torch.Tensor,   # GPU KV Value [n_tokens, d_head]
-        layer_idx: int,
-    ) -> None:
-        """
-        CUDA 이중 스트림 압축-전송 파이프라인.
-
-        compute_stream: eOptShrinkQCodec.encode(kv_key, kv_val, layer_idx)
-        memory_stream:  CPU로 PCIe 전송 (압축 완료 이벤트 대기 후 실행)
-
-        오버랩 효율 측정:
-        - t_compress: encode() 실행 시간
-        - t_transfer: .cpu() 전송 시간
-        - overlap_efficiency = max(0, 1 - max(t_compress, t_transfer) / (t_compress + t_transfer))
-        """
-        import time
-        bytes_before = kv_key.nbytes + kv_val.nbytes
-        self._total_bytes_before += bytes_before
-
-        if self.use_dual_stream and self._compute_stream is not None:
-            # compute_stream에서 압축
-            t0 = time.monotonic()
-            with torch.cuda.stream(self._compute_stream):
-                compressed = self.codec.encode(kv_key, kv_val, layer_idx)
-            torch.cuda.synchronize()
-            t_compress = time.monotonic() - t0
-
-            # memory_stream에서 CPU 전송 (압축 완료 이벤트 사용)
-            compress_event = torch.cuda.Event()
-            compress_event.record(self._compute_stream)
-            t1 = time.monotonic()
-            with torch.cuda.stream(self._memory_stream):
-                self._memory_stream.wait_event(compress_event)
-                # 압축된 딕셔너리의 모든 텐서를 CPU로 이동
-                compressed_cpu = _move_dict_to_cpu(compressed)
-            torch.cuda.synchronize()
-            t_transfer = time.monotonic() - t1
-
-            # 오버랩 효율 기록
-            total_seq = t_compress + t_transfer
-            overlap_eff = max(0.0, 1.0 - max(t_compress, t_transfer) / max(total_seq, 1e-9))
-            self._overlap_efficiency_history.append(overlap_eff)
-        else:
-            # 이중 스트림 비활성화 시 순차 처리
-            compressed = self.codec.encode(kv_key, kv_val, layer_idx)
-            compressed_cpu = _move_dict_to_cpu(compressed)
-
-        # 압축 후 크기 측정
-        bytes_after = sum(
-            t.nbytes for t in _flatten_tensors(compressed_cpu)
-        )
-        self._total_bytes_after += bytes_after
-
-        # PreemptiveKVOffloadScheduler에 압축된 KV 등록
-        self.scheduler._preempted[request_id].offloaded_kv = compressed_cpu  # type: ignore
-        self.scheduler._preempted[request_id].is_compressed = True
-        self.scheduler._preempted[request_id].offload_bytes = bytes_after
-
-    def restore_with_decompression(
-        self,
-        request_id: str,
-        layer_idx: int,
-    ) -> Optional[tuple]:
-        """
-        CPU→GPU 전송 후 eOptShrinkQCodec.decode() 복원.
-        반환: (key_approx, val_approx) 또는 None (재계산 선택 시).
-        """
-        record = self.scheduler._preempted.get(request_id)
-        if record is None or record.offloaded_kv is None:
-            return None
-        compressed_gpu = _move_dict_to_gpu(record.offloaded_kv)
-        key_approx, val_approx = self.codec.decode(compressed_gpu)
-        del self.scheduler._preempted[request_id]
-        return key_approx, val_approx
-
-    def overlap_efficiency(self) -> float:
-        """최근 오버랩 효율의 이동 평균."""
-        if not self._overlap_efficiency_history:
-            return 0.0
-        return sum(self._overlap_efficiency_history[-32:]) / len(self._overlap_efficiency_history[-32:])
-
-    def compression_ratio(self) -> float:
-        """압축 전 대비 압축 후 크기 비율."""
-        if self._total_bytes_before == 0:
-            return 0.0
-        return 1.0 - self._total_bytes_after / self._total_bytes_before
-
-
-def _move_dict_to_cpu(d) -> dict:
-    """재귀적으로 딕셔너리 내 모든 텐서를 CPU로 이동."""
-    if isinstance(d, torch.Tensor):
-        return d.cpu()
-    if isinstance(d, dict):
-        return {k: _move_dict_to_cpu(v) for k, v in d.items()}
-    return d
-
-
-def _move_dict_to_gpu(d) -> dict:
-    """재귀적으로 딕셔너리 내 모든 텐서를 GPU로 이동."""
-    if isinstance(d, torch.Tensor):
-        return d.cuda() if torch.cuda.is_available() else d
-    if isinstance(d, dict):
-        return {k: _move_dict_to_gpu(v) for k, v in d.items()}
-    return d
-
-
-def _flatten_tensors(d) -> list:
-    """딕셔너리 내 모든 텐서를 평탄화."""
-    if isinstance(d, torch.Tensor):
-        return [d]
-    if isinstance(d, dict):
-        result = []
-        for v in d.values():
-            result.extend(_flatten_tensors(v))
-        return result
-    return []
-```
-
----
-
-### 4. StaticDynamicSegmentCache (Activity B)
-
-```python
-# src/cache/static_dynamic_segment.py 의사코드
-
-from typing import Dict, List, Optional, Set
-import torch
-from src.cache.base import CacheStore
-
-
-class StaticDynamicSegmentCache(CacheStore):
-    """
-    KEEP(arXiv 2602.23592) 원리 기반 에이전트 메모리 갱신 패턴 기반 정적/동적 세그먼트 분리.
-
-    - 정적 세그먼트(Static): 시스템 프롬프트, 공통 문서 등 갱신 없는 세그먼트.
-      LRU 퇴거 대상에서 제외. 반복 재사용 → 비연속 히트율 향상.
-    - 동적 세그먼트(Dynamic): 에이전트 행동 결과, 대화 히스토리 등 갱신 빈도 높은 세그먼트.
-      갱신 시 max_invalidation_range 이내의 이후 세그먼트만 무효화 (Multi-hop 전파 제한).
-
-    CacheStore 인터페이스 완전 구현. 기존 Runner의 get()/put() API와 호환.
-    """
-
-    def __init__(
-        self,
-        capacity_bytes: int,
-        max_invalidation_range: int = 2,  # 동적 세그먼트 갱신 시 무효화할 이후 세그먼트 최대 수
-        max_recompute_hops: int = 2,       # Multi-hop 재계산 전파 깊이 제한
-    ) -> None:
-        self.capacity_bytes = capacity_bytes
-        self.max_invalidation_range = max_invalidation_range
-        self.max_recompute_hops = max_recompute_hops
-
-        self._static_store: Dict[str, torch.Tensor] = {}   # 정적 세그먼트 KV
-        self._dynamic_store: Dict[str, torch.Tensor] = {}  # 동적 세그먼트 KV
-        self._static_keys: Set[str] = set()                 # 정적으로 등록된 키 집합
-        self._lru_order: List[str] = []                     # 동적 세그먼트 LRU 순서
-
-        self._hit_count: int = 0
-        self._miss_count: int = 0
-        self._segment_order: List[str] = []  # 삽입 순서 (무효화 범위 계산용)
+        self._backend = backend_cache
+        self._embedding_dim = embedding_dim
+        self._leaf_size = leaf_size
+        self._distance_fn = distance_fn
+
+        self._embeddings: Dict[str, torch.Tensor] = {}  # key → 세그먼트 임베딩 [d_embed]
+        self._root: Optional[_IndexNode] = None
+        self._dirty: bool = False  # 인덱스 재구성 필요 여부
 
     # ------------------------------------------------------------------ #
     # CacheStore 인터페이스 구현                                           #
     # ------------------------------------------------------------------ #
 
     def put(self, key: str, value: torch.Tensor) -> None:
-        """기본 삽입: 동적 세그먼트로 등록. mark_static()으로 정적 승격 가능."""
-        if key in self._static_keys:
-            self._static_store[key] = value
-        else:
-            self._dynamic_store[key] = value
-            if key not in self._lru_order:
-                self._lru_order.append(key)
-            if key not in self._segment_order:
-                self._segment_order.append(key)
-        self._maybe_evict()
+        """세그먼트 저장 + 임베딩 추출 + 인덱스 업데이트."""
+        self._backend.put(key, value)
+        # 임베딩: Key 텐서의 평균 벡터 [d_embed]
+        embedding = self._extract_embedding(value)
+        self._embeddings[key] = embedding
+        self._dirty = True  # 다음 검색 시 인덱스 재구성
 
     def get(self, key: str) -> Optional[torch.Tensor]:
-        if key in self._static_store:
-            self._hit_count += 1
-            return self._static_store[key]
-        if key in self._dynamic_store:
-            self._hit_count += 1
-            # LRU 갱신
-            if key in self._lru_order:
-                self._lru_order.remove(key)
-                self._lru_order.append(key)
-            return self._dynamic_store[key]
-        self._miss_count += 1
-        return None
+        """직접 키 조회 (인덱스 우회, 정확한 키 알 때 사용)."""
+        return self._backend.get(key)
 
     def evict(self) -> int:
-        """동적 세그먼트 LRU 퇴거 (정적 세그먼트 제외)."""
-        if not self._lru_order:
-            return 0
-        evict_key = self._lru_order.pop(0)
-        kv = self._dynamic_store.pop(evict_key, None)
-        if evict_key in self._segment_order:
-            self._segment_order.remove(evict_key)
-        return kv.nbytes if kv is not None else 0
+        """백엔드 캐시 퇴거 + 인덱스에서 해당 키 제거."""
+        freed = self._backend.evict()
+        # 퇴거된 키를 임베딩 저장소에서도 제거
+        current_keys = self._get_backend_keys()
+        evicted_keys = set(self._embeddings.keys()) - set(current_keys)
+        for k in evicted_keys:
+            self._embeddings.pop(k, None)
+        if evicted_keys:
+            self._dirty = True
+        return freed
 
     def hit_rate(self) -> float:
-        total = self._hit_count + self._miss_count
-        return self._hit_count / total if total > 0 else 0.0
+        return self._backend.hit_rate()
 
     def memory_bytes(self) -> int:
-        static_bytes = sum(v.nbytes for v in self._static_store.values())
-        dynamic_bytes = sum(v.nbytes for v in self._dynamic_store.values())
-        return static_bytes + dynamic_bytes
+        embedding_bytes = sum(e.nbytes for e in self._embeddings.values())
+        return self._backend.memory_bytes() + embedding_bytes
 
     def reset_stats(self) -> None:
-        self._hit_count = 0
-        self._miss_count = 0
+        self._backend.reset_stats()
 
     # ------------------------------------------------------------------ #
-    # 정적/동적 분류 API                                                   #
+    # 핵심 검색 API                                                        #
     # ------------------------------------------------------------------ #
 
-    def mark_static(self, key: str) -> None:
-        """세그먼트를 정적으로 승격. 동적 저장소에 있으면 이동."""
-        self._static_keys.add(key)
-        if key in self._dynamic_store:
-            self._static_store[key] = self._dynamic_store.pop(key)
-            if key in self._lru_order:
-                self._lru_order.remove(key)
-
-    def mark_dynamic(self, key: str) -> None:
-        """세그먼트를 동적으로 전환."""
-        self._static_keys.discard(key)
-        if key in self._static_store:
-            self._dynamic_store[key] = self._static_store.pop(key)
-            if key not in self._lru_order:
-                self._lru_order.append(key)
-
-    def update_segment(self, key: str, new_value: torch.Tensor) -> List[str]:
+    def search_nearest(
+        self,
+        query_embedding: torch.Tensor,  # [d_embed]
+        top_k: int = 5,
+        max_distance: float = 1.0,
+    ) -> List[Tuple[str, float]]:
         """
-        동적 세그먼트 갱신 + Multi-hop 무효화 범위 최소화.
-        갱신된 세그먼트 이후 max_invalidation_range 개 세그먼트만 무효화.
+        삼각부등식 기반 best-first 탐색으로 top_k 최근접 세그먼트 반환.
 
-        반환: 무효화된 세그먼트 키 목록 (재계산 필요).
+        반환: [(key, distance), ...] 거리 오름차순 정렬.
+
+        알고리즘:
+        1. 인덱스가 dirty이면 _rebuild_index() 호출
+        2. 우선순위 큐에 루트 노드 추가 (초기 거리 0)
+        3. 큐에서 최소 거리 노드를 꺼내며:
+           a. 리프 노드이면 세그먼트 키를 후보에 추가
+           b. 내부 노드이면 자식 노드로 재귀 탐색
+           c. 삼각부등식 조건 검사: d(q, node.center) - node.max_radius > current_best → 가지치기
+        4. top_k 개 수집 후 반환
         """
-        # 정적 세그먼트는 갱신 불가
-        if key in self._static_keys:
-            raise ValueError(f"정적 세그먼트 '{key}'는 update_segment로 갱신 불가. mark_dynamic() 먼저 호출.")
+        if self._dirty or self._root is None:
+            self._rebuild_index()
+        if self._root is None:
+            return []
 
-        # 갱신 적용
-        self._dynamic_store[key] = new_value
+        results: List[Tuple[float, str]] = []  # (distance, key) min-heap
+        # 우선순위 큐: (lower_bound_distance, node)
+        pq: List[Tuple[float, _IndexNode]] = []
+        heapq.heappush(pq, (0.0, self._root))
 
-        # 무효화 범위: 삽입 순서 기준 이후 max_invalidation_range 개 세그먼트
-        invalidated = []
-        if key in self._segment_order:
-            idx = self._segment_order.index(key)
-            invalidation_end = min(idx + 1 + self.max_invalidation_range, len(self._segment_order))
-            for inv_key in self._segment_order[idx + 1 : invalidation_end]:
-                if inv_key in self._dynamic_store and inv_key not in self._static_keys:
-                    del self._dynamic_store[inv_key]
-                    invalidated.append(inv_key)
-                    if inv_key in self._lru_order:
-                        self._lru_order.remove(inv_key)
+        while pq and len(results) < top_k * 2:
+            lb_dist, node = heapq.heappop(pq)
 
-        return invalidated
+            # 삼각부등식 가지치기:
+            # 현재 best 거리보다 이 서브트리의 하한이 크면 탐색 불필요
+            best_so_far = results[top_k - 1][0] if len(results) >= top_k else float("inf")
+            if lb_dist > best_so_far:
+                break
+
+            if node.left is None and node.right is None:
+                # 리프 노드: 세그먼트들의 실제 거리 계산
+                for seg_key in node.segment_keys:
+                    if seg_key in self._embeddings:
+                        dist = self._distance(query_embedding, self._embeddings[seg_key])
+                        if dist <= max_distance:
+                            heapq.heappush(results, (-dist, seg_key))
+                            if len(results) > top_k:
+                                heapq.heappop(results)
+            else:
+                # 내부 노드: 자식 노드 탐색 후보 추가
+                for child in [node.left, node.right]:
+                    if child is not None:
+                        child_dist = self._distance(query_embedding, child.center_embedding)
+                        # 삼각부등식 하한: d(q, child_center) - child.max_radius
+                        lower_bound = max(0.0, child_dist - child.max_radius)
+                        if lower_bound <= best_so_far:
+                            heapq.heappush(pq, (lower_bound, child))
+
+        # 결과 정렬 (거리 오름차순)
+        final = [(-d, k) for d, k in results]
+        final.sort(key=lambda x: x[0])
+        return [(k, d) for d, k in final[:top_k]]
+
+    def estimate_hit_probability(
+        self,
+        query_segments: List[torch.Tensor],  # 쿼리 세그먼트 KV 텐서 목록
+        threshold_distance: float = 0.3,
+    ) -> float:
+        """
+        Turn 2+ 요청의 D 노드 캐시 히트 확률 O(log N) 추정.
+        PPDAppendPrefillRouter의 라우팅 결정에 사용.
+
+        각 쿼리 세그먼트에 대해 최근접 세그먼트 검색 후
+        threshold_distance 이내인 세그먼트가 있으면 히트로 카운트.
+        hit_probability = 히트 세그먼트 수 / 전체 쿼리 세그먼트 수.
+        """
+        if not query_segments or not self._embeddings:
+            return 0.0
+        hits = 0
+        for seg_tensor in query_segments:
+            query_emb = self._extract_embedding(seg_tensor)
+            nearest = self.search_nearest(query_emb, top_k=1, max_distance=threshold_distance)
+            if nearest and nearest[0][1] <= threshold_distance:
+                hits += 1
+        return hits / len(query_segments)
 
     # ------------------------------------------------------------------ #
-    # 내부 헬퍼                                                            #
+    # 인덱스 재구성                                                        #
     # ------------------------------------------------------------------ #
 
-    def _maybe_evict(self) -> None:
-        """용량 초과 시 동적 세그먼트 LRU 퇴거."""
-        while self.memory_bytes() > self.capacity_bytes and self._lru_order:
-            self.evict()
+    def _rebuild_index(self) -> None:
+        """
+        전체 세그먼트 임베딩으로 재귀 계층 인덱스 재구성.
+
+        pivot 선택: 각 분기에서 가장 먼 두 세그먼트를 pivot으로 선택.
+        max_radius 저장: subtree 내 중심과 가장 먼 세그먼트까지의 거리.
+        """
+        keys = list(self._embeddings.keys())
+        if not keys:
+            self._root = None
+            self._dirty = False
+            return
+        self._root = self._build_node(keys)
+        self._dirty = False
+
+    def _build_node(self, keys: List[str]) -> _IndexNode:
+        """재귀적 인덱스 노드 구성."""
+        if len(keys) <= self._leaf_size:
+            # 리프 노드
+            embeddings = torch.stack([self._embeddings[k] for k in keys])
+            center_emb = embeddings.mean(dim=0)
+            # 임시 키를 center로 사용 (가장 가까운 실제 키 선택)
+            dists = [self._distance(center_emb, self._embeddings[k]) for k in keys]
+            center_key = keys[int(torch.tensor(dists).argmin().item())]
+            max_radius = max(dists) if dists else 0.0
+            return _IndexNode(
+                center_key=center_key,
+                center_embedding=center_emb,
+                max_radius=max_radius,
+                segment_keys=keys,
+            )
+
+        # 가장 먼 두 세그먼트를 pivot으로 선택
+        pivot_a_key, pivot_b_key = self._select_pivots(keys)
+        emb_a = self._embeddings[pivot_a_key]
+        emb_b = self._embeddings[pivot_b_key]
+
+        # 각 세그먼트를 더 가까운 pivot 쪽으로 분할
+        left_keys: List[str] = []
+        right_keys: List[str] = []
+        for k in keys:
+            d_a = self._distance(self._embeddings[k], emb_a)
+            d_b = self._distance(self._embeddings[k], emb_b)
+            if d_a <= d_b:
+                left_keys.append(k)
+            else:
+                right_keys.append(k)
+
+        # 균형 보장: 한쪽이 빈 경우 절반으로 분할
+        if not left_keys or not right_keys:
+            half = len(keys) // 2
+            left_keys, right_keys = keys[:half], keys[half:]
+
+        # 현재 노드의 중심 = 전체 평균
+        all_embs = torch.stack([self._embeddings[k] for k in keys])
+        center_emb = all_embs.mean(dim=0)
+        dists_all = [self._distance(center_emb, self._embeddings[k]) for k in keys]
+        center_key = keys[int(torch.tensor(dists_all).argmin().item())]
+        max_radius = max(dists_all) if dists_all else 0.0
+
+        node = _IndexNode(
+            center_key=center_key,
+            center_embedding=center_emb,
+            max_radius=max_radius,
+        )
+        node.left = self._build_node(left_keys)
+        node.right = self._build_node(right_keys)
+        return node
+
+    def _select_pivots(self, keys: List[str]) -> Tuple[str, str]:
+        """가장 먼 두 세그먼트 키 반환 (O(N²) 샘플링, 최대 64개 샘플)."""
+        sample = keys[:64]  # 대규모 집합에서 샘플링
+        max_dist = -1.0
+        pivot_a, pivot_b = sample[0], sample[-1]
+        for i in range(len(sample)):
+            for j in range(i + 1, len(sample)):
+                d = self._distance(self._embeddings[sample[i]], self._embeddings[sample[j]])
+                if d > max_dist:
+                    max_dist = d
+                    pivot_a, pivot_b = sample[i], sample[j]
+        return pivot_a, pivot_b
+
+    def _distance(self, a: torch.Tensor, b: torch.Tensor) -> float:
+        """두 임베딩 사이의 거리 (코사인 또는 유클리드)."""
+        a_f = a.float()
+        b_f = b.float()
+        if self._distance_fn == "cosine":
+            cos_sim = torch.nn.functional.cosine_similarity(
+                a_f.unsqueeze(0), b_f.unsqueeze(0)
+            ).item()
+            return 1.0 - cos_sim  # 거리 = 1 - 유사도
+        else:  # euclidean
+            return torch.norm(a_f - b_f).item()
+
+    def _extract_embedding(self, kv_tensor: torch.Tensor) -> torch.Tensor:
+        """KV 텐서에서 임베딩 추출: 평균 Key 벡터 [d_embed]."""
+        if kv_tensor.dim() == 1:
+            return kv_tensor.float()
+        return kv_tensor.float().mean(dim=0)
+
+    def _get_backend_keys(self) -> List[str]:
+        """백엔드 캐시의 현재 키 목록 (StaticDynamicSegmentCache 호환)."""
+        backend = self._backend
+        keys = []
+        if hasattr(backend, "_static_store"):
+            keys.extend(backend._static_store.keys())
+        if hasattr(backend, "_dynamic_store"):
+            keys.extend(backend._dynamic_store.keys())
+        return keys
 ```
 
 ---
 
-### 5. ManifoldKVWindowedEviction (Activity C)
+### 2. PPDAppendPrefillRouter (Activity A)
+
+**스케줄링 결정 단위**: 요청(request) 단위로 Turn 1 / Turn 2+ 분류 후 D/P 노드 선택.
+
+**캐시 상태 접근 방법**: `TriangleInequalitySegmentIndex.estimate_hit_probability()`로
+D 노드 캐시 히트 가능성을 O(log N) 추정. 캐시를 직접 수정하지 않고 읽기 전용으로 조회.
 
 ```python
-# src/cache/manifoldkv_windowed.py 의사코드
+# src/scheduler/ppd_append_prefill_router.py 의사코드
 
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+import torch
+from src.cache.triangle_index import TriangleInequalitySegmentIndex
+
+
+@dataclass
+class PPDRoutingDecision:
+    request_id: str
+    turn: int                    # 1 = Turn 1, 2+ = Turn 2 이상
+    node_type: str               # "P" (full prefill) 또는 "D" (append-prefill)
+    hit_probability: float       # D 노드 캐시 히트 예상 확률
+    threshold_used: float        # 라우팅 결정 시 사용된 임계값
+
+
+class PPDAppendPrefillRouter:
+    """
+    PPD(arXiv 2603.13358) 기반 D 노드 append-prefill 동적 선택 라우터.
+
+    스케줄링 결정 단위: 요청(request).
+    캐시 상태 접근: TriangleInequalitySegmentIndex.estimate_hit_probability() (읽기 전용).
+
+    이전 Activity A 기법과의 차별점:
+    - PreemptiveKVOffloadScheduler: 실행 중 요청 선점 + GPU→CPU 전송 타이밍 결정.
+    - PPDAppendPrefillRouter: P/D 역할 자체를 요청 유형과 세그먼트 히트율에 따라 동적 결정.
+    """
+
+    def __init__(
+        self,
+        segment_index: TriangleInequalitySegmentIndex,
+        threshold_append: float = 0.7,       # D 노드 선택 히트 확률 임계값
+        threshold_distance: float = 0.3,     # 히트 판정 최대 거리
+        slo_ttft_budget_ms: float = 200.0,   # SLO TTFT 예산 (ms). 임박 시 임계값 하향.
+        slo_aggressive_factor: float = 0.9,  # SLO 임박 시 threshold_append 승수
+    ) -> None:
+        self.segment_index = segment_index
+        self.threshold_append = threshold_append
+        self.threshold_distance = threshold_distance
+        self.slo_ttft_budget_ms = slo_ttft_budget_ms
+        self.slo_aggressive_factor = slo_aggressive_factor
+
+        self._session_turns: Dict[str, int] = {}  # session_id → 현재 턴 수
+
+    def route(
+        self,
+        request_id: str,
+        session_id: str,
+        input_segments: List[torch.Tensor],  # 이번 요청의 KV 세그먼트 목록
+        remaining_ttft_ms: Optional[float] = None,  # 현재 TTFT 예산 잔여 (ms)
+    ) -> PPDRoutingDecision:
+        """
+        단일 요청에 대한 P/D 노드 라우팅 결정.
+
+        1. turn_count = session_turns.get(session_id, 0) + 1
+        2. Turn 1 → P 노드 (full prefill, KV 초기 생성)
+        3. Turn 2+:
+           a. segment_index.estimate_hit_probability(input_segments) → hit_prob
+           b. SLO 임박 여부 확인 → threshold 조정
+           c. hit_prob > threshold_append → D 노드 append-prefill
+           d. hit_prob ≤ threshold_append → P 노드 full prefill
+        4. session_turns 갱신
+        """
+        turn = self._session_turns.get(session_id, 0) + 1
+        self._session_turns[session_id] = turn
+
+        # Turn 1: 항상 P 노드
+        if turn == 1:
+            return PPDRoutingDecision(
+                request_id=request_id,
+                turn=turn,
+                node_type="P",
+                hit_probability=0.0,
+                threshold_used=self.threshold_append,
+            )
+
+        # Turn 2+: 히트 확률 추정
+        hit_prob = self.segment_index.estimate_hit_probability(
+            input_segments, threshold_distance=self.threshold_distance
+        )
+
+        # SLO 기반 임계값 조정: TTFT SLO 임박 시 더 공격적으로 D 노드 선택
+        effective_threshold = self.threshold_append
+        if remaining_ttft_ms is not None and remaining_ttft_ms < self.slo_ttft_budget_ms * 0.3:
+            effective_threshold *= self.slo_aggressive_factor
+
+        node_type = "D" if hit_prob > effective_threshold else "P"
+        return PPDRoutingDecision(
+            request_id=request_id,
+            turn=turn,
+            node_type=node_type,
+            hit_probability=hit_prob,
+            threshold_used=effective_threshold,
+        )
+
+    def reset_session(self, session_id: str) -> None:
+        """세션 종료 시 턴 카운터 초기화."""
+        self._session_turns.pop(session_id, None)
+```
+
+---
+
+### 3. HitAwarePPDRouter (Activity A+B, Cross-1)
+
+```python
+# src/scheduler/hit_aware_ppd_router.py 의사코드
+
+from typing import Dict, List, Optional, Tuple
+import torch
+from src.scheduler.ppd_append_prefill_router import PPDAppendPrefillRouter, PPDRoutingDecision
+from src.cache.triangle_index import TriangleInequalitySegmentIndex
+
+
+class HitAwarePPDRouter:
+    """
+    Cross-1 (A+B): PPDAppendPrefillRouter + TriangleInequalitySegmentIndex 통합.
+
+    - 히트 확률 임계값 온라인 적응: 실제 D 노드 히트율 피드백으로 threshold_append EMA 갱신
+    - Turn 1 / Turn 2+ 히트율 분리 측정
+    - SemanticBoundarySegmentCache(B-2)와 통합: 의미 경계 청크 임베딩으로 히트 예측 정밀도 향상
+
+    측정 지표:
+    - d_node_ratio: Turn 2+ 중 D 노드 선택 비율
+    - actual_hit_rate_d: D 노드에서 실제 세그먼트 히트 비율
+    - threshold_history: threshold_append 온라인 적응 이력
+    """
+
+    def __init__(
+        self,
+        ppd_router: PPDAppendPrefillRouter,
+        segment_index: TriangleInequalitySegmentIndex,
+        ema_alpha: float = 0.1,          # 임계값 EMA 갱신 계수
+        min_threshold: float = 0.3,      # threshold_append 하한
+        max_threshold: float = 0.95,     # threshold_append 상한
+        target_hit_rate: float = 0.7,    # 목표 D 노드 실제 히트율
+    ) -> None:
+        self.ppd_router = ppd_router
+        self.segment_index = segment_index
+        self.ema_alpha = ema_alpha
+        self.min_threshold = min_threshold
+        self.max_threshold = max_threshold
+        self.target_hit_rate = target_hit_rate
+
+        # 측정 통계
+        self._turn1_count: int = 0
+        self._turn2plus_count: int = 0
+        self._d_node_count: int = 0
+        self._d_node_actual_hits: int = 0
+        self._threshold_history: List[float] = []
+
+    def route(
+        self,
+        request_id: str,
+        session_id: str,
+        input_segments: List[torch.Tensor],
+        remaining_ttft_ms: Optional[float] = None,
+    ) -> PPDRoutingDecision:
+        """라우팅 결정 후 통계 갱신."""
+        decision = self.ppd_router.route(
+            request_id, session_id, input_segments, remaining_ttft_ms
+        )
+        if decision.turn == 1:
+            self._turn1_count += 1
+        else:
+            self._turn2plus_count += 1
+            if decision.node_type == "D":
+                self._d_node_count += 1
+        return decision
+
+    def record_actual_hit(self, request_id: str, was_hit: bool) -> None:
+        """
+        D 노드 처리 후 실제 히트 여부 피드백으로 threshold_append 온라인 적응.
+
+        실제 히트율 < target_hit_rate → threshold_append 상향 (더 보수적)
+        실제 히트율 ≥ target_hit_rate → threshold_append 하향 (더 공격적)
+        EMA: threshold = (1-α)*threshold + α*(adjustment)
+        """
+        if was_hit:
+            self._d_node_actual_hits += 1
+
+        # 최소 10회 D 노드 처리 후 적응 시작
+        if self._d_node_count >= 10:
+            actual_hit_rate = self._d_node_actual_hits / self._d_node_count
+            current = self.ppd_router.threshold_append
+            if actual_hit_rate < self.target_hit_rate:
+                # 히트율 낮음 → 임계값 상향 (D 노드 선택 줄임)
+                new_threshold = current + self.ema_alpha * (current * 0.1)
+            else:
+                # 히트율 충분 → 임계값 하향 (D 노드 선택 늘림)
+                new_threshold = current - self.ema_alpha * (current * 0.05)
+
+            new_threshold = max(self.min_threshold, min(self.max_threshold, new_threshold))
+            self.ppd_router.threshold_append = new_threshold
+            self._threshold_history.append(new_threshold)
+
+    def d_node_ratio(self) -> float:
+        """Turn 2+ 중 D 노드 선택 비율."""
+        if self._turn2plus_count == 0:
+            return 0.0
+        return self._d_node_count / self._turn2plus_count
+
+    def actual_hit_rate_d(self) -> float:
+        """D 노드에서 실제 히트 비율."""
+        if self._d_node_count == 0:
+            return 0.0
+        return self._d_node_actual_hits / self._d_node_count
+```
+
+---
+
+### 4. SemanticBoundarySegmentCache (Activity B)
+
+```python
+# src/cache/semantic_boundary_cache.py 의사코드
+
+import re
 from typing import Dict, List, Optional, Tuple
 import torch
 from src.cache.base import CacheStore
 
 
-class ManifoldKVWindowedEviction(CacheStore):
+class SemanticBoundarySegmentCache(CacheStore):
     """
-    ManifoldKV(arXiv 2602.08343) + WindowedManifoldKV 기반 유클리드 아웃라이어 퇴거.
+    SemantiCache(arXiv 2603.14303) 원리 기반 의미 경계 청킹 + GSC 클러스터링 + 비례 어텐션.
 
-    기존 퇴거 정책(코사인 유사도 기반)이 스케일(크기) 정보를 무시해 의미론적으로
-    중요한 토큰을 퇴거하는 문제를, 슬라이딩 윈도우 로컬 중심 기준 유클리드 거리로
-    아웃라이어 스코어를 계산해 해소한다.
+    - 의미 경계 탐지: 구분자(.!?\n\n + 코드 블록 ```) 기반 규칙
+    - GSC(Greedy Seed-based Clustering): 어텐션 스코어 상위 시드 토큰 중심 탐욕 병합
+    - 비례 어텐션: attention_weight_core = Σ(cluster attention weights) (합산, 평균 아님)
 
-    기존 CompressedSegmentCache.evict() 메서드에 drop-in 교체 가능.
-    `outlier_score_fn`을 외부에서 주입하면 기존 퇴거 정책을 그대로 교체.
+    CacheStore 인터페이스 완전 구현.
+    TriangleInequalitySegmentIndex와 통합: 의미 코어 임베딩으로 인덱스 구성 시 정밀도 향상.
     """
+
+    # 의미 경계 패턴 (컴파일 상수)
+    _BOUNDARY_PATTERN = re.compile(r"(?<=[.!?])\s+|(?<=\n\n)|(?<=```)")
 
     def __init__(
         self,
         capacity_bytes: int,
-        window_size: int = 4096,      # 슬라이딩 윈도우 크기 (토큰 수)
-        evict_ratio: float = 0.2,     # 퇴거 대상 비율 (아웃라이어 스코어 하위 비율)
+        min_cluster_size: int = 3,      # GSC 최소 클러스터 크기
+        max_merge_ratio: float = 0.7,   # 최대 병합 비율 (세그먼트 내 토큰의 최대 70% 병합)
+        attention_threshold: float = 0.1,  # 시드 토큰 어텐션 스코어 임계값
     ) -> None:
         self.capacity_bytes = capacity_bytes
-        self.window_size = window_size
-        self.evict_ratio = evict_ratio
+        self.min_cluster_size = min_cluster_size
+        self.max_merge_ratio = max_merge_ratio
+        self.attention_threshold = attention_threshold
 
-        self._store: Dict[str, torch.Tensor] = {}     # key → KV 텐서 [n_tokens, d_head]
-        self._key_vectors: Dict[str, torch.Tensor] = {}  # key → K 벡터 (스코어 계산용)
+        self._store: Dict[str, torch.Tensor] = {}   # key → 의미 코어 KV 텐서
+        self._lru_order: List[str] = []
         self._hit_count: int = 0
         self._miss_count: int = 0
 
@@ -960,32 +753,27 @@ class ManifoldKVWindowedEviction(CacheStore):
     # ------------------------------------------------------------------ #
 
     def put(self, key: str, value: torch.Tensor) -> None:
-        """
-        value: [n_tokens, d_head] KV 텐서.
-        K 벡터는 value 자체로 간주 (Key 텐서 저장 시).
-        """
+        """의미 코어 KV만 저장 (GSC 병합 후 크기 감소)."""
         self._store[key] = value
-        self._key_vectors[key] = value  # K 벡터 = KV 텐서 자체
+        if key in self._lru_order:
+            self._lru_order.remove(key)
+        self._lru_order.append(key)
         self._maybe_evict()
 
     def get(self, key: str) -> Optional[torch.Tensor]:
         if key in self._store:
             self._hit_count += 1
+            self._lru_order.remove(key)
+            self._lru_order.append(key)
             return self._store[key]
         self._miss_count += 1
         return None
 
     def evict(self) -> int:
-        """유클리드 아웃라이어 스코어 하위 토큰 보유 세그먼트 퇴거."""
-        if not self._store:
+        if not self._lru_order:
             return 0
-        scores = self._compute_outlier_scores()
-        if not scores:
-            return 0
-        # 아웃라이어 스코어가 가장 낮은 (덜 두드러진) 세그먼트 퇴거
-        worst_key = min(scores, key=scores.get)
-        kv = self._store.pop(worst_key, None)
-        self._key_vectors.pop(worst_key, None)
+        evict_key = self._lru_order.pop(0)
+        kv = self._store.pop(evict_key, None)
         return kv.nbytes if kv is not None else 0
 
     def hit_rate(self) -> float:
@@ -1000,92 +788,401 @@ class ManifoldKVWindowedEviction(CacheStore):
         self._miss_count = 0
 
     # ------------------------------------------------------------------ #
-    # 유클리드 아웃라이어 스코어 계산                                       #
+    # 의미 경계 청킹 + GSC API                                            #
     # ------------------------------------------------------------------ #
 
-    def _compute_outlier_scores(self) -> Dict[str, float]:
+    def detect_semantic_boundaries(self, text: str) -> List[int]:
         """
-        세그먼트별 유클리드 아웃라이어 스코어 계산.
-
-        알고리즘:
-        1. 모든 세그먼트의 K 벡터를 하나로 연결 → [total_tokens, d_head]
-        2. 슬라이딩 윈도우(window_size)로 이동하며 로컬 중심(centroid) 계산
-        3. 각 토큰의 아웃라이어 스코어 = ||k_i - centroid(window)||_2 (torch.cdist 활용)
-        4. 세그먼트별 평균 아웃라이어 스코어 반환
-
-        수식: outlier_score(k_i, window) = ||k_i - mean(k_{window})||_2
-        스코어가 높을수록 두드러진 (의미론적으로 중요한) 토큰.
-        퇴거 시 스코어 낮은 세그먼트 우선 제거.
+        텍스트에서 의미 경계 위치(토큰 인덱스 추정) 반환.
+        구분자: 문장 끝(.!?), 단락(\n\n), 코드 블록(```)
         """
-        scores: Dict[str, float] = {}
-        keys_list = list(self._key_vectors.keys())
-        if not keys_list:
-            return scores
+        positions = [0]
+        for match in self._BOUNDARY_PATTERN.finditer(text):
+            positions.append(match.start())
+        return sorted(set(positions))
 
-        # 모든 K 벡터 연결
-        all_kvs = []
-        seg_ranges: List[Tuple[str, int, int]] = []  # (key, start_idx, end_idx)
-        cursor = 0
-        for key in keys_list:
-            kv = self._key_vectors[key]
-            if kv.dim() == 1:
-                kv = kv.unsqueeze(0)
-            all_kvs.append(kv.float())
-            seg_ranges.append((key, cursor, cursor + kv.shape[0]))
-            cursor += kv.shape[0]
-
-        if not all_kvs:
-            return scores
-
-        all_k = torch.cat(all_kvs, dim=0)  # [total_tokens, d_head]
-        total_tokens, d_head = all_k.shape
-
-        # 슬라이딩 윈도우 중심 계산 + 유클리드 거리
-        token_scores = torch.zeros(total_tokens)
-        for win_start in range(0, total_tokens, self.window_size):
-            win_end = min(win_start + self.window_size, total_tokens)
-            window_k = all_k[win_start:win_end]  # [win_len, d_head]
-            centroid = window_k.mean(dim=0, keepdim=True)  # [1, d_head]
-            # torch.cdist: [win_len, 1] 유클리드 거리
-            dists = torch.cdist(window_k, centroid).squeeze(-1)  # [win_len]
-            token_scores[win_start:win_end] = dists
-
-        # 세그먼트별 평균 스코어
-        for key, start, end in seg_ranges:
-            scores[key] = token_scores[start:end].mean().item()
-
-        return scores
-
-    def outlier_score_fn(self, key_vectors: torch.Tensor) -> torch.Tensor:
+    def apply_gsc_clustering(
+        self,
+        kv_tensor: torch.Tensor,          # [n_tokens, d_head] KV 텐서
+        attention_scores: torch.Tensor,   # [n_tokens] 어텐션 스코어
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        외부 호출용 스코어 함수. 기존 evict() 정책에 drop-in 교체 인터페이스.
+        GSC 클러스터링으로 의미 코어 KV 생성.
 
-        Args:
-            key_vectors: [n_tokens, d_head]
-        Returns:
-            scores: [n_tokens] — 각 토큰의 유클리드 아웃라이어 스코어
+        1. 시드 토큰 선택: attention_scores > attention_threshold 이고 상위 (1 - max_merge_ratio) 비율
+        2. 각 비-시드 토큰을 가장 가까운 시드 클러스터에 할당 (코사인 유사도 기준)
+        3. 클러스터 병합: core_kv = Σ(attention_weight_t * kv_t) / Σ(attention_weight_t) for t in cluster
+        4. 비례 어텐션: attention_weight_core = Σ(attention_weights in cluster) (합산)
+
+        반환: (core_kv [n_cores, d_head], core_attention_weights [n_cores])
         """
-        kv = key_vectors.float()
-        n_tokens, d_head = kv.shape
-        token_scores = torch.zeros(n_tokens)
-        for win_start in range(0, n_tokens, self.window_size):
-            win_end = min(win_start + self.window_size, n_tokens)
-            window_k = kv[win_start:win_end]
-            centroid = window_k.mean(dim=0, keepdim=True)
-            dists = torch.cdist(window_k, centroid).squeeze(-1)
-            token_scores[win_start:win_end] = dists
-        return token_scores
+        n_tokens, d_head = kv_tensor.shape
+        max_seeds = max(1, int(n_tokens * (1 - self.max_merge_ratio)))
+
+        # 시드 선택: 어텐션 스코어 상위 토큰
+        _, seed_indices = torch.topk(attention_scores, k=max_seeds)
+        seed_indices = seed_indices.sort().values
+
+        seed_kv = kv_tensor[seed_indices]  # [n_seeds, d_head]
+        seed_attn = attention_scores[seed_indices]
+
+        # 각 토큰을 가장 가까운 시드에 할당
+        cluster_sums = seed_kv.clone() * seed_attn.unsqueeze(-1)  # [n_seeds, d_head]
+        cluster_attn_sums = seed_attn.clone()  # [n_seeds]
+        cluster_counts = torch.ones(len(seed_indices), dtype=torch.int32)
+
+        seed_set = set(seed_indices.tolist())
+        for t in range(n_tokens):
+            if t in seed_set:
+                continue
+            # 가장 가까운 시드 클러스터 찾기 (코사인 유사도)
+            sims = torch.nn.functional.cosine_similarity(
+                kv_tensor[t].unsqueeze(0), seed_kv
+            )
+            nearest_seed_idx = sims.argmax().item()
+
+            # 클러스터 합산 (가중 평균용)
+            cluster_sums[nearest_seed_idx] += kv_tensor[t] * attention_scores[t]
+            # 비례 어텐션: 합산 (평균 아님)
+            cluster_attn_sums[nearest_seed_idx] += attention_scores[t]
+            cluster_counts[nearest_seed_idx] += 1
+
+        # 의미 코어: 가중 평균
+        core_kv = cluster_sums / cluster_attn_sums.unsqueeze(-1).clamp(min=1e-9)
+        core_attn_weights = cluster_attn_sums  # 비례 어텐션 합산값
+
+        return core_kv, core_attn_weights
+
+    def put_with_gsc(
+        self,
+        key: str,
+        kv_tensor: torch.Tensor,          # [n_tokens, d_head]
+        attention_scores: torch.Tensor,   # [n_tokens]
+    ) -> None:
+        """GSC 클러스터링 후 의미 코어만 저장."""
+        core_kv, _ = self.apply_gsc_clustering(kv_tensor, attention_scores)
+        self.put(key, core_kv)
 
     def _maybe_evict(self) -> None:
-        while self.memory_bytes() > self.capacity_bytes and self._store:
+        while self.memory_bytes() > self.capacity_bytes and self._lru_order:
             self.evict()
+```
+
+---
+
+### 5. SpecKVCompressionGammaController (Activity C)
+
+```python
+# src/cache/speckv_gamma_controller.py 의사코드
+
+from typing import Dict, List, Optional, Tuple
+import torch
+import torch.nn as nn
+
+
+class _GammaMLP(nn.Module):
+    """경량 MLP γ 선택기: 입력 차원 4 → 출력 6 (γ ∈ {1,2,3,4,5,6})."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        # 입력: [압축수준_onehot(3), min_confidence(1), max_entropy(1)] = 5차원
+        # → 은닉층 16 → 출력 6 (γ logits)
+        self.net = nn.Sequential(
+            nn.Linear(5, 16),
+            nn.ReLU(),
+            nn.Linear(16, 6),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class SpecKVCompressionGammaController:
+    """
+    SpecKV(arXiv 2605.02888) 기반 압축 수준별 최적 추측 길이(γ) 자동 선택.
+
+    - 입력: 압축 수준(FP16=0/INT8=1/NF4=2), min_draft_confidence, max_draft_entropy
+    - 출력: γ ∈ {1, 2, 3, 4, 5, 6}
+    - eOptShrinkQCodec(기구현) 압축 수준 출력을 자동으로 MLP 입력으로 주입
+    - 온라인 적응: 검증 통과율 EMA 기반 γ 보정
+
+    accuracy-preserving 근거:
+    - 압축 수준 높을수록 γ 낮춤 → 검증 통과율 유지 → 정확도 보호
+    - draft 신호(min_confidence, max_entropy)로 현재 배치의 최적 γ 실시간 추정
+    """
+
+    # 압축 수준 매핑
+    COMPRESSION_FP16 = 0
+    COMPRESSION_INT8 = 1
+    COMPRESSION_NF4 = 2
+
+    def __init__(
+        self,
+        base_seed: int = 42,
+        ema_alpha: float = 0.05,           # 온라인 EMA 보정 계수
+        target_verification_rate: float = 0.7,  # 목표 검증 통과율
+    ) -> None:
+        torch.manual_seed(base_seed)
+        self._mlp = _GammaMLP()
+        self._mlp.eval()
+
+        self.ema_alpha = ema_alpha
+        self.target_verification_rate = target_verification_rate
+
+        # 온라인 적응 상태
+        self._verification_history: List[bool] = []
+        self._gamma_bias: float = 0.0  # γ 보정값 (양수 = 상향)
+
+        # 프로파일링 데이터 버퍼 (MLP 학습용)
+        self._profile_buffer: List[Tuple] = []  # [(compression_level, min_conf, max_ent, optimal_gamma), ...]
+
+    def select_gamma(
+        self,
+        compression_level: int,          # COMPRESSION_FP16/INT8/NF4
+        min_draft_confidence: float,     # draft 모델의 최소 토큰 신뢰도
+        max_draft_entropy: float,        # draft 모델의 최대 토큰 엔트로피
+    ) -> int:
+        """
+        MLP로 최적 γ 선택 (온라인 EMA 보정 포함).
+
+        반환: γ ∈ {1, 2, 3, 4, 5, 6}
+        """
+        # 입력 특성 구성
+        onehot = torch.zeros(3)
+        onehot[compression_level] = 1.0
+        x = torch.cat([onehot, torch.tensor([min_draft_confidence, max_draft_entropy])])
+
+        with torch.no_grad():
+            logits = self._mlp(x.unsqueeze(0)).squeeze(0)  # [6]
+        gamma_idx = logits.argmax().item()
+        gamma = int(gamma_idx) + 1  # {1,...,6}
+
+        # EMA 보정 적용 (실제 검증 통과율 기반)
+        gamma = max(1, min(6, gamma + round(self._gamma_bias)))
+        return gamma
+
+    def record_verification(self, was_accepted: bool) -> None:
+        """
+        추측 디코딩 검증 결과 피드백으로 온라인 γ 보정.
+
+        통과율 < target → γ 하향 보정 (더 보수적)
+        통과율 ≥ target → γ 상향 보정 (더 공격적)
+        """
+        self._verification_history.append(was_accepted)
+        recent = self._verification_history[-50:]  # 최근 50회
+        if len(recent) >= 10:
+            actual_rate = sum(recent) / len(recent)
+            if actual_rate < self.target_verification_rate:
+                self._gamma_bias -= self.ema_alpha
+            else:
+                self._gamma_bias += self.ema_alpha
+            self._gamma_bias = max(-2.0, min(2.0, self._gamma_bias))
+
+    def integrate_with_eopt(
+        self,
+        eopt_codec,  # eOptShrinkQCodec 인스턴스
+        min_draft_confidence: float,
+        max_draft_entropy: float,
+    ) -> int:
+        """
+        eOptShrinkQCodec(기구현) 압축 수준을 자동으로 MLP 입력으로 주입.
+
+        eOptShrinkQCodec의 key_bits를 기준으로 압축 수준 결정:
+        - key_bits ≥ 4: FP16 수준 (COMPRESSION_FP16)
+        - key_bits == 3: INT8 수준 (COMPRESSION_INT8)
+        - key_bits <= 2: NF4 수준 (COMPRESSION_NF4)
+        """
+        key_bits = getattr(eopt_codec, "key_bits", 3)
+        if key_bits >= 4:
+            compression_level = self.COMPRESSION_FP16
+        elif key_bits == 3:
+            compression_level = self.COMPRESSION_INT8
+        else:
+            compression_level = self.COMPRESSION_NF4
+        return self.select_gamma(compression_level, min_draft_confidence, max_draft_entropy)
+
+    def collect_profile_record(
+        self,
+        compression_level: int,
+        min_draft_confidence: float,
+        max_draft_entropy: float,
+        optimal_gamma: int,
+    ) -> None:
+        """프로파일링 데이터 수집 (최소 512개 레코드 후 MLP 재학습 가능)."""
+        self._profile_buffer.append(
+            (compression_level, min_draft_confidence, max_draft_entropy, optimal_gamma)
+        )
+
+    def train_mlp_from_profile(self, epochs: int = 50) -> float:
+        """
+        수집된 프로파일링 데이터로 MLP 학습.
+        최소 512개 레코드 필요. 반환: 최종 훈련 손실.
+        """
+        if len(self._profile_buffer) < 512:
+            return float("inf")
+        self._mlp.train()
+        optimizer = torch.optim.Adam(self._mlp.parameters(), lr=1e-3)
+        criterion = nn.CrossEntropyLoss()
+        final_loss = float("inf")
+        for _ in range(epochs):
+            total_loss = 0.0
+            for rec in self._profile_buffer:
+                comp_lvl, min_conf, max_ent, opt_gamma = rec
+                onehot = torch.zeros(3)
+                onehot[comp_lvl] = 1.0
+                x = torch.cat([onehot, torch.tensor([min_conf, max_ent])]).unsqueeze(0)
+                target = torch.tensor([opt_gamma - 1], dtype=torch.long)
+                logits = self._mlp(x)
+                loss = criterion(logits, target)
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                total_loss += loss.item()
+            final_loss = total_loss / max(len(self._profile_buffer), 1)
+        self._mlp.eval()
+        return final_loss
+```
+
+---
+
+### 6. ContextIntensiveAccuracyGuard (Activity C)
+
+```python
+# src/cache/context_intensive_guard.py 의사코드
+
+from typing import Dict, Optional, Tuple
+import torch
+
+
+class ContextIntensiveAccuracyGuard:
+    """
+    KV Cache Offloading for Context-Intensive Tasks(arXiv 2604.08426) 기반
+    컨텍스트 정보 밀도 추정 + 압축 비율 자동 조정 게이트.
+
+    - 고밀도 컨텍스트(≥0.7): 최대 4비트 압축 (정확도 보호)
+    - 중간 밀도(0.4~0.7): 2.2~4비트 (정상 eOptShrinkQ 동작)
+    - 저밀도(≤0.4): ≤2.2비트 공격적 압축 허용
+
+    eOptShrinkQCodec(기구현) 및 ManifoldKVWindowedEviction(기구현)과의 게이트 인터페이스 구현.
+    """
+
+    def __init__(
+        self,
+        w1: float = 0.3,            # entity_ratio 가중치
+        w2: float = 0.3,            # numeric_ratio 가중치
+        w3: float = 0.4,            # token_entropy 가중치
+        sample_tokens: int = 128,   # 밀도 추정 샘플 토큰 수 (첫 N 토큰)
+        threshold_high: float = 0.7,    # 고밀도 임계값
+        threshold_low: float = 0.4,     # 저밀도 임계값
+    ) -> None:
+        self.w1 = w1
+        self.w2 = w2
+        self.w3 = w3
+        self.sample_tokens = sample_tokens
+        self.threshold_high = threshold_high
+        self.threshold_low = threshold_low
+
+    def assess(self, token_ids: torch.Tensor) -> float:
+        """
+        첫 sample_tokens 개 토큰 샘플링으로 컨텍스트 밀도 스코어 반환 [0.0, 1.0].
+
+        context_density_score = w1 * entity_ratio + w2 * numeric_ratio + w3 * token_entropy
+
+        entity_ratio: 어휘 ID 기준 희귀 토큰 비율 (ID > 50000 비율로 근사)
+        numeric_ratio: 숫자·기호 토큰 비율 (ID 10~100 범위 비율로 근사)
+        token_entropy: 토큰 ID 분포의 엔트로피 (정규화)
+        """
+        sample = token_ids[:self.sample_tokens].float()
+        n = len(sample)
+        if n == 0:
+            return 0.5  # 기본값
+
+        # entity_ratio: 희귀 어휘 토큰 비율 (고유 명사 근사)
+        entity_ratio = (sample > 50000).float().mean().item()
+
+        # numeric_ratio: 숫자·기호 범위 토큰 비율
+        numeric_ratio = ((sample >= 10) & (sample <= 100)).float().mean().item()
+
+        # token_entropy: 샘플 내 토큰 ID 분포 엔트로피 (정규화)
+        token_counts = torch.bincount(sample.long().clamp(0, 100000), minlength=1)
+        probs = token_counts.float() / n
+        probs = probs[probs > 0]
+        entropy = -(probs * probs.log()).sum().item()
+        max_entropy = torch.log(torch.tensor(float(n))).item()
+        normalized_entropy = entropy / max(max_entropy, 1e-9)
+
+        score = self.w1 * entity_ratio + self.w2 * numeric_ratio + self.w3 * normalized_entropy
+        return float(min(1.0, max(0.0, score)))
+
+    def get_compression_limits(
+        self,
+        density_score: float,
+    ) -> Dict[str, float]:
+        """
+        밀도 스코어 기반 압축 파라미터 한도 반환.
+
+        반환:
+          {
+            "min_bits": 하한 비트 수 (이 이상 비트로만 압축),
+            "max_compression_ratio": 최대 압축 비율 (0~1, 높을수록 더 공격적),
+            "density_level": "high" | "medium" | "low",
+          }
+        """
+        if density_score >= self.threshold_high:
+            return {
+                "min_bits": 4.0,
+                "max_compression_ratio": 0.5,
+                "density_level": "high",
+            }
+        elif density_score >= self.threshold_low:
+            return {
+                "min_bits": 2.2,
+                "max_compression_ratio": 0.75,
+                "density_level": "medium",
+            }
+        else:
+            return {
+                "min_bits": 1.0,
+                "max_compression_ratio": 0.9,
+                "density_level": "low",
+            }
+
+    def gate_eopt_codec(
+        self,
+        eopt_codec,              # eOptShrinkQCodec 인스턴스
+        token_ids: torch.Tensor,
+    ) -> Dict:
+        """
+        eOptShrinkQCodec(기구현)에 밀도 기반 압축 파라미터 자동 주입.
+        고밀도 컨텍스트에서 압축 비트 수를 4비트 이상으로 제한.
+        반환: 적용된 파라미터 딕셔너리.
+        """
+        score = self.assess(token_ids)
+        limits = self.get_compression_limits(score)
+        original_key_bits = getattr(eopt_codec, "key_bits", 2)
+        original_val_bits = getattr(eopt_codec, "value_bits", 3)
+
+        min_bits = limits["min_bits"]
+        new_key_bits = max(int(min_bits), original_key_bits)
+        new_val_bits = max(int(min_bits), original_val_bits)
+
+        # 파라미터 임시 조정 (컨텍스트별)
+        applied = {
+            "density_score": score,
+            "density_level": limits["density_level"],
+            "original_key_bits": original_key_bits,
+            "original_val_bits": original_val_bits,
+            "applied_key_bits": new_key_bits,
+            "applied_val_bits": new_val_bits,
+        }
+        return applied
 ```
 
 ---
 
 ## Activity C — Accuracy Preservation 검증 계획
 
-Activity C(eOptShrinkQCodec + ManifoldKVWindowedEviction)를 포함하므로
+Activity C(SpecKVCompressionGammaController + ContextIntensiveAccuracyGuard)를 포함하므로
 다음 정확도 보존 검증이 **필수**이다 (evaluation_criteria.md §4 필수 항목).
 
 ### perplexity 측정
@@ -1095,234 +1192,235 @@ Activity C(eOptShrinkQCodec + ManifoldKVWindowedEviction)를 포함하므로
 | 모델 | GPT-2 (small, 117M) — 추가 라이선스 없이 재현 가능 |
 | 데이터셋 | WikiText-2 (test split, 표준 벤치마크) |
 | 측정 방법 | stride=512, max_length=1024 sliding window perplexity |
-| 허용 오차 | ±1% 이내 (예: 베이스라인 30.0 → 압축 후 29.7~30.3 허용) |
-| 압축 설정 범위 | key_bits=2/value_bits=3 (기본), key_bits=3/value_bits=4 (완화) 각각 측정 |
-| 비교 대상 | (a) 전체 KV 원본 (베이스라인), (b) eOptShrinkQCodec key_bits=2/val_bits=3, (c) eOptShrinkQCodec key_bits=3/val_bits=4 |
+| 허용 오차 | ±1% 이내 (베이스라인 대비 perplexity 변화) |
+| 압축 설정 범위 | (a) 베이스라인(비압축), (b) SpecKVGamma + eOptShrinkQ 2.2비트, (c) ContextIntensiveGuard 고밀도(4비트) |
+| 비교 대상 | 압축 수준별 γ=4 고정 vs SpecKVGammaController 자동 선택 γ |
 
 ### 태스크 정확도 측정
 
 | 항목 | 상세 |
 |------|------|
 | 벤치마크 | LongBench 8개 서브태스크 (HotpotQA, 2WikiMultiHopQA, MuSiQue, GovReport, QMSum, MultiFieldQA-en, MultiFieldQA-zh, TriviaQA) |
-| 추가 벤치마크 | 멀티-니들 NIAH (Needle-in-A-Haystack, 다중 키 검색 시나리오) |
+| 추가 벤치마크 | **Text2JSON** (arXiv 2604.08426 컨텍스트-집약 태스크, ContextIntensiveAccuracyGuard 검증 필수) |
 | 허용 오차 | ±1% 이내 |
-| 측정 스크립트 | `experiments/run_eopt_accuracy.py` |
-| 캘리브레이션 | 학습 데이터에서 무작위 20개 요청으로 레이어별 noise_level 추정 (단 1회 오프라인) |
+| 측정 스크립트 | `experiments/run_text2json_accuracy.py` |
 
-### accuracy-preserving 이론 근거 (eOptShrinkQCodec)
+### accuracy-preserving 이론 근거
 
-1. **BBP 위상전이의 이론적 보장**: BBP 임계값 위 특이값은 신호 성분(정보 보존), 아래는 노이즈 성분 → 자동 랭크 선택의 통계적 일관성(consistency) 보장
-2. **잔차 내적 편향 근-제로**: 저랭크 성분 분리 후 잔차는 `E[residual^T · lowrank] ≈ 0` → TurboQuantCodec 잔차 양자화 왜곡 최소
-3. **eOptShrinkQ 실증**: arXiv 2605.02905에서 Llama-3.1-8B, Ministral-8B LongBench 16개 태스크, 2.2비트에서 TurboQuant 3비트 동등/우수 달성. 멀티-니들 NIAH에서 FP16 비압축과 동등.
+1. **SpecKV 압축-γ 결합 최적화**: 압축 수준 높아질수록 γ 낮춤 → 검증 통과율 유지 → 정확도 저하 방지 (SpecKV arXiv 2605.02888 실증: FP16/INT8/NF4 수준별 최적 γ 도출)
+2. **ContextIntensiveAccuracyGuard 밀도 적응**: 고밀도 컨텍스트에서 4비트 하한 제한 → "정보가 많은 컨텍스트는 덜 압축"이라는 원칙으로 정확도 보호
+3. **Text2JSON 검증**: arXiv 2604.08426이 기존 방법들의 컨텍스트-집약 태스크 정확도 저하를 체계적으로 문서화. ContextIntensiveAccuracyGuard가 이 저하를 방지하는지 실질적으로 검증.
 
-### 검증 테스트
+### 검증 테스트 파일
 
-**파일**: `tests/unit/test_eopt_shrinkq_accuracy.py`
+**파일**: `tests/unit/test_speckv_gamma.py`
 
 ```python
-# tests/unit/test_eopt_shrinkq_accuracy.py 의사코드
+# tests/unit/test_speckv_gamma.py 핵심 테스트 케이스
 
-def test_bbp_rank_selection_consistency():
-    """
-    동일 노이즈 수준에서 BBP 자동 랭크 선택이 일관성을 가짐을 검증.
-    서로 다른 시드로 생성된 동일 분포 데이터에서 랭크 선택 결과의 분산이 작아야 함.
-    """
-    codec = eOptShrinkQCodec(num_layers=1, key_bits=2, value_bits=3)
-    ranks = []
-    for seed in range(10):
-        torch.manual_seed(seed)
-        # 랭크-4 신호 + 노이즈 (합성 KV)
-        signal = torch.randn(64, 4) @ torch.randn(4, 32)  # rank-4
-        noise = torch.randn(64, 32) * 0.1
-        kv = signal + noise
-        codec.calibrate([kv])
-        ranks.append(codec._auto_ranks.get(0, 0))
-    # 랭크 선택 결과의 표준편차가 2 이하 (일관성)
-    import statistics
-    assert statistics.stdev(ranks) <= 2, f"BBP 랭크 선택 불일관: ranks={ranks}"
+def test_high_compression_selects_lower_gamma():
+    """NF4 압축(높은 압축)에서 γ가 FP16 대비 낮거나 같음을 검증."""
+    ctrl = SpecKVCompressionGammaController(base_seed=42)
+    gamma_fp16 = ctrl.select_gamma(SpecKVCompressionGammaController.COMPRESSION_FP16, 0.9, 0.1)
+    gamma_nf4 = ctrl.select_gamma(SpecKVCompressionGammaController.COMPRESSION_NF4, 0.9, 0.1)
+    assert gamma_nf4 <= gamma_fp16, f"NF4 γ({gamma_nf4}) > FP16 γ({gamma_fp16})"
 
-def test_residual_bias_near_zero():
-    """
-    저랭크 성분 분리 후 잔차의 내적 편향이 근-제로임을 검증.
-    |E[residual^T · lowrank]| < 1e-3 검증.
-    """
-    codec = eOptShrinkQCodec(num_layers=1, key_bits=2, value_bits=3)
-    torch.manual_seed(42)
-    kv = torch.randn(128, 64)
-    codec.calibrate([kv])
-    r = codec._auto_ranks.get(0, 4)
+def test_gamma_in_valid_range():
+    """γ가 항상 {1,...,6} 범위임을 검증."""
+    ctrl = SpecKVCompressionGammaController(base_seed=42)
+    for comp_lvl in [0, 1, 2]:
+        for min_conf in [0.1, 0.5, 0.9]:
+            gamma = ctrl.select_gamma(comp_lvl, min_conf, 1.0 - min_conf)
+            assert 1 <= gamma <= 6, f"γ={gamma} 범위 초과"
 
-    U, S, Vh = torch.linalg.svd(kv.float(), full_matrices=False)
-    lowrank = (U[:, :r] * S[:r].unsqueeze(0)) @ Vh[:r, :]
-    residual = kv.float() - lowrank
-
-    # 잔차와 저랭크 성분의 내적 편향
-    bias = (residual * lowrank).mean().abs().item()
-    assert bias < 0.1, f"잔차 내적 편향 초과: {bias:.6f}"
-
-def test_encode_decode_roundtrip_cosine_similarity():
-    """
-    encode → decode 왕복 후 코사인 유사도가 0.90 이상임을 검증.
-    (perplexity ±1% 허용 오차와 상관된 proxy 메트릭)
-    """
-    codec = eOptShrinkQCodec(num_layers=2, key_bits=2, value_bits=3)
-    torch.manual_seed(42)
-    calibration_kvs = [torch.randn(64, 32) for _ in range(20)]
-    codec.calibrate(calibration_kvs)
-
-    kv_key = torch.randn(128, 32)
-    kv_val = torch.randn(128, 32)
-    compressed = codec.encode(kv_key, kv_val, layer_idx=0)
-    key_approx, val_approx = codec.decode(compressed)
-
-    cos_key = torch.nn.functional.cosine_similarity(
-        kv_key.flatten().unsqueeze(0), key_approx.flatten().unsqueeze(0)
-    ).item()
-    cos_val = torch.nn.functional.cosine_similarity(
-        kv_val.flatten().unsqueeze(0), val_approx.flatten().unsqueeze(0)
-    ).item()
-    assert cos_key >= 0.85, f"Key 코사인 유사도 낮음: {cos_key:.4f}"
-    assert cos_val >= 0.85, f"Value 코사인 유사도 낮음: {cos_val:.4f}"
-
-def test_memory_reduction_at_least_30_percent():
-    """
-    eOptShrinkQCodec 압축 후 메모리가 베이스라인 대비 30% 이상 감소함을 검증.
-    (evaluation_criteria.md §4 KV Memory Reduction 기준)
-    """
-    codec = eOptShrinkQCodec(num_layers=1, key_bits=2, value_bits=3)
-    torch.manual_seed(42)
-    codec.calibrate([torch.randn(64, 64) for _ in range(20)])
-    est = codec.memory_bytes_estimate(n_tokens=512, d_head=64, layer_idx=0)
-    assert est["reduction_ratio"] >= 0.30, \
-        f"메모리 감소율 미달: {est['reduction_ratio']:.2%} < 30%"
+def test_online_adaptation_lowers_gamma_on_low_pass_rate():
+    """검증 통과율 낮으면 γ 보정값이 하향 조정됨을 검증."""
+    ctrl = SpecKVCompressionGammaController(base_seed=42, ema_alpha=0.2)
+    for _ in range(20):
+        ctrl.record_verification(was_accepted=False)  # 0% 통과율
+    assert ctrl._gamma_bias < 0.0, f"γ_bias={ctrl._gamma_bias:.4f} (기대: 음수)"
 
 def test_perplexity_proxy_within_tolerance():
-    """
-    합성 KV로 perplexity proxy(MSE 상대 오차)가 ±1% 이내임을 검증.
-    실제 perplexity는 experiments/run_eopt_accuracy.py에서 측정.
-    """
-    codec = eOptShrinkQCodec(num_layers=1, key_bits=3, value_bits=4)  # 완화 설정
+    """압축 후 재구성 MSE 상대 오차 < 5% (perplexity ±1% proxy)."""
+    from src.cache.eopt_shrinkq_codec import eOptShrinkQCodec
+    codec = eOptShrinkQCodec(num_layers=1, key_bits=3, value_bits=4)
     torch.manual_seed(42)
     codec.calibrate([torch.randn(64, 32) for _ in range(20)])
-
     kv_key = torch.randn(256, 32)
     kv_val = torch.randn(256, 32)
     compressed = codec.encode(kv_key, kv_val, layer_idx=0)
     key_approx, val_approx = codec.decode(compressed)
-
-    # MSE 상대 오차 (perplexity proxy)
     mse_key = ((kv_key - key_approx) ** 2).mean() / (kv_key ** 2).mean()
     mse_val = ((kv_val - val_approx) ** 2).mean() / (kv_val ** 2).mean()
-    assert mse_key.item() < 0.05, f"Key MSE 상대 오차 초과: {mse_key.item():.4f}"
-    assert mse_val.item() < 0.05, f"Value MSE 상대 오차 초과: {mse_val.item():.4f}"
+    assert mse_key.item() < 0.05
+    assert mse_val.item() < 0.05
 ```
 
-### CompressedPreemptionPipeline A+C 복합 정확도 검증
+**파일**: `tests/unit/test_context_intensive_guard.py`
 
-Activity A+C 통합 시 선점-압축-복원 사이클이 정확도에 미치는 영향을 추가 검증한다.
+```python
+# tests/unit/test_context_intensive_guard.py 핵심 테스트 케이스
 
-| 항목 | 기준 |
-|------|------|
-| 압축 후 재개 정확도 | decode 후 코사인 유사도 ≥ 0.85 |
-| SLA Tier-A 선점 제외 | sla_tier_a_ids에 포함된 요청은 선점 큐에 등록 안 됨 |
-| A+C 복합 정확도 | ±1% 이내 (evaluation_criteria.md §5 필수) |
+def test_high_density_limits_compression_to_4bit():
+    """고밀도 컨텍스트(score≥0.7)에서 min_bits ≥ 4.0임을 검증."""
+    guard = ContextIntensiveAccuracyGuard()
+    limits = guard.get_compression_limits(0.8)
+    assert limits["min_bits"] >= 4.0
+    assert limits["density_level"] == "high"
 
-**파일**: `tests/integration/test_cross_ac_preempt_compress.py`
+def test_low_density_allows_aggressive_compression():
+    """저밀도 컨텍스트(score≤0.4)에서 min_bits ≤ 2.2임을 검증."""
+    guard = ContextIntensiveAccuracyGuard()
+    limits = guard.get_compression_limits(0.2)
+    assert limits["min_bits"] <= 2.2
+    assert limits["density_level"] == "low"
+
+def test_assess_returns_valid_range():
+    """assess() 결과가 [0.0, 1.0] 범위임을 검증."""
+    guard = ContextIntensiveAccuracyGuard()
+    token_ids = torch.randint(0, 100000, (200,))
+    score = guard.assess(token_ids)
+    assert 0.0 <= score <= 1.0
+
+def test_gate_eopt_codec_raises_bits_in_high_density():
+    """고밀도 컨텍스트에서 eOptShrinkQ의 key_bits가 4 이상으로 조정됨을 검증."""
+    from src.cache.eopt_shrinkq_codec import eOptShrinkQCodec
+    guard = ContextIntensiveAccuracyGuard(threshold_high=0.0)  # 항상 고밀도
+    codec = eOptShrinkQCodec(num_layers=1, key_bits=2, value_bits=3)
+    token_ids = torch.randint(50001, 100000, (128,))  # 고밀도 토큰
+    applied = guard.gate_eopt_codec(codec, token_ids)
+    assert applied["applied_key_bits"] >= 4
+```
 
 ---
 
 ## 설정 파라미터
 
 ```yaml
-# configs/experiments/2026-05-08.yaml
+# configs/experiments/2026-05-09.yaml
 experiment:
-  date: "2026-05-08"
-  activity: "A+C"
-  description: "PreemptiveKVOffloadScheduler + eOptShrinkQCodec + CompressedPreemptionPipeline (A+C Cross-1), 보조: StaticDynamicSegmentCache(B), ManifoldKVWindowedEviction(C)"
+  date: "2026-05-09"
+  activity: "A+B+C"
+  description: >
+    HitAwarePPDRouter (Cross-1: A+B): PPDAppendPrefillRouter + TriangleInequalitySegmentIndex +
+    SemanticBoundarySegmentCache. 보조: SpecKVCompressionGammaController(C) +
+    ContextIntensiveAccuracyGuard(C).
 
 scheduler:
-  type: "preemptive_kv_offload"
-  cache_capacity_bytes: 4294967296     # 4 GiB
-  threshold_preempt: 0.85              # 버퍼 점유율 선점 임계값
-  consumption_rate_window: 32          # 소비율 이동 평균 윈도우 (토큰 수)
-  fairness_max_wait: 10                # 선점 면제 최대 대기 스텝
-  preempt_compress: true               # CompressedPreemptionPipeline 연동
-  sla_tier_a_ids: []                   # SLA Tier-A 선점 제외 요청 ID (기본 빈 목록)
+  type: "hit_aware_ppd_router"
+  threshold_append: 0.7              # D 노드 선택 히트 확률 임계값
+  threshold_distance: 0.3           # 히트 판정 최대 세그먼트 거리
+  slo_ttft_budget_ms: 200.0         # TTFT SLO 예산 (ms)
+  slo_aggressive_factor: 0.9        # SLO 임박 시 threshold_append 승수
+  ema_alpha: 0.1                    # 임계값 EMA 갱신 계수
+  min_threshold: 0.3                # threshold_append 하한
+  max_threshold: 0.95               # threshold_append 상한
+  target_hit_rate: 0.7              # 목표 D 노드 실제 히트율
 
-compression:
-  method: "eopt_shrinkq"               # eOptShrinkQCodec
-  key_bits: 2                          # Key 양자화 비트 (공격적)
-  value_bits: 3                        # Value 양자화 비트 (보수적)
-  calibration_samples: 20              # 오프라인 캘리브레이션 최소 샘플 수
-  calibration_save_path: "results/2026-05-08/eopt_calibration.pt"
-
-compressed_preemption:
-  use_dual_stream: true                # CUDA 이중 스트림 오버랩
-  sla_tier_a_no_compress: true         # SLA Tier-A 선점 시 압축 미적용
+index:
+  type: "triangle_inequality"
+  embedding_dim: 64                 # 세그먼트 임베딩 차원
+  leaf_size: 8                      # 리프 노드 최대 세그먼트 수
+  distance_fn: "cosine"             # "cosine" 또는 "euclidean"
 
 cache:
-  type: "static_dynamic_segment"       # StaticDynamicSegmentCache
-  capacity_bytes: 4294967296           # 4 GiB
-  max_invalidation_range: 2            # 동적 세그먼트 갱신 시 무효화 이후 세그먼트 최대 수
-  max_recompute_hops: 2                # Multi-hop 재계산 전파 깊이 제한
+  type: "semantic_boundary"
+  capacity_bytes: 4294967296        # 4 GiB
+  min_cluster_size: 3               # GSC 최소 클러스터 크기
+  max_merge_ratio: 0.7              # 최대 병합 비율
+  attention_threshold: 0.1          # 시드 토큰 어텐션 스코어 임계값
 
-eviction:
-  policy: "manifoldkv_windowed"        # ManifoldKVWindowedEviction
-  window_size: 4096                    # 슬라이딩 윈도우 크기 (토큰 수)
-  evict_ratio: 0.2                     # 퇴거 대상 하위 비율
+compression:
+  gamma_controller:
+    enabled: true
+    base_seed: 42
+    ema_alpha: 0.05
+    target_verification_rate: 0.7
+  context_guard:
+    enabled: true
+    w1: 0.3                         # entity_ratio 가중치
+    w2: 0.3                         # numeric_ratio 가중치
+    w3: 0.4                         # token_entropy 가중치
+    sample_tokens: 128
+    threshold_high: 0.7
+    threshold_low: 0.4
+  eopt_backend:
+    key_bits: 2
+    value_bits: 3
+    calibration_samples: 20
+    calibration_save_path: "results/2026-05-09/eopt_calibration.pt"
+
+benchmark:
+  index_speed:
+    segment_counts: [100, 1000, 10000]
+    trials: 10
+  ppd_ttft:
+    num_turns: 5                    # 멀티턴 시뮬레이션 턴 수
+    num_sessions: 100
+  accuracy:
+    datasets: ["wikitext2", "longbench", "text2json"]
+    wikitext2_stride: 512
+    wikitext2_max_length: 1024
 
 seed: 42
-results_dir: "results/2026-05-08"
+results_dir: "results/2026-05-09"
 ```
 
 ---
 
 ## 테스트 요구사항
 
-- [ ] `tests/unit/test_preemptive_scheduler.py`
-  - `test_preempt_trigger_above_threshold`: buffer_occupancy > 0.85 시 선점 트리거 검증
-  - `test_no_preempt_below_threshold`: 정상 부하 시 선점 미발생 검증
-  - `test_sla_tier_a_not_preempted`: SLA Tier-A 요청 선점 제외 검증
-  - `test_fairness_max_wait_respected`: fairness_max_wait 초과 시 선점 면제 검증
-  - `test_offload_kv_async_cpu_move`: offload_kv_async() 후 KV가 CPU 메모리에 있음 검증
-  - `test_restore_kv_returns_gpu_tensor`: restore_kv() 후 KV가 GPU 텐서임 검증
-  - `test_buffer_occupancy_ratio_calculation`: buffer_occupancy_ratio() 계산 정확성
-
-- [ ] `tests/unit/test_eopt_shrinkq_accuracy.py`
-  - `test_bbp_rank_selection_consistency`: BBP 랭크 선택 일관성 (위 의사코드 참조)
-  - `test_residual_bias_near_zero`: 잔차 내적 편향 근-제로 (위 의사코드 참조)
-  - `test_encode_decode_roundtrip_cosine_similarity`: 왕복 코사인 유사도 ≥ 0.85
-  - `test_memory_reduction_at_least_30_percent`: 메모리 감소 ≥ 30%
-  - `test_perplexity_proxy_within_tolerance`: MSE 상대 오차 < 5%
-  - `test_key_value_asymmetric_bits`: Key 2비트 / Value 3비트 비대칭 적용 검증
-  - `test_calibrate_save_load_roundtrip`: 캘리브레이션 저장·로드 왕복 검증
-  - `test_auto_rank_positive`: 자동 선택된 랭크가 1 이상임 검증
-
-- [ ] `tests/unit/test_static_dynamic_segment.py`
-  - `test_put_get_basic`: 기본 put/get 동작
-  - `test_mark_static_excludes_from_eviction`: 정적 세그먼트가 evict() 대상 제외됨
-  - `test_mark_dynamic_restores_eviction_eligibility`: mark_dynamic() 후 퇴거 가능
-  - `test_update_segment_invalidates_range`: 갱신 후 max_invalidation_range 이내 무효화
-  - `test_update_segment_rejects_static`: 정적 세그먼트 갱신 시 ValueError
-  - `test_multi_hop_depth_limit`: max_invalidation_range 초과 세그먼트 미무효화
-  - `test_hit_rate_tracking`: hit_rate() 정확성
+- [ ] `tests/unit/test_triangle_index_search.py`
+  - `test_search_returns_nearest_segment`: 알려진 최근접 세그먼트를 정확히 반환
+  - `test_triangle_inequality_pruning_reduces_nodes`: 가지치기로 탐색 노드 수가 전체의 50% 미만
+  - `test_search_speed_olog_n_vs_linear`: N=100/1K/10K에서 삼각인덱스 검색이 선형 검색보다 빠름
+  - `test_rebuild_on_dirty`: dirty 상태에서 자동 인덱스 재구성 검증
+  - `test_estimate_hit_probability_range`: estimate_hit_probability() 결과 [0.0, 1.0] 검증
   - `test_cachestore_interface`: CacheStore 추상 메서드 전부 구현 검증
+  - `test_put_get_evict_roundtrip`: put/get/evict 기본 동작 검증
+  - `test_evict_removes_from_embeddings`: evict() 후 임베딩 저장소에서도 제거됨 검증
 
-- [ ] `tests/unit/test_manifoldkv_eviction.py`
-  - `test_outlier_score_euclidean_distance`: 유클리드 거리 기반 스코어 계산 정확성
-  - `test_high_outlier_not_evicted`: 아웃라이어 스코어 높은 토큰 세그먼트 보존 검증
-  - `test_low_outlier_evicted_first`: 아웃라이어 스코어 낮은 세그먼트 우선 퇴거
-  - `test_windowed_centroid_vs_global`: 슬라이딩 윈도우 중심 vs 전역 중심 차이 검증
-  - `test_outlier_score_fn_shape`: outlier_score_fn() 반환 형태 [n_tokens] 검증
+- [ ] `tests/unit/test_ppd_router.py`
+  - `test_turn1_always_routes_to_p_node`: Turn 1 요청은 항상 P 노드
+  - `test_turn2_high_hit_prob_routes_to_d_node`: hit_prob > threshold → D 노드
+  - `test_turn2_low_hit_prob_routes_to_p_node`: hit_prob ≤ threshold → P 노드
+  - `test_slo_aggressive_lowers_threshold`: SLO 임박 시 threshold 하향 조정
+  - `test_session_turn_counter_increments`: 동일 session_id에서 turn 카운터 증가
+  - `test_reset_session_clears_counter`: reset_session() 후 카운터 초기화
+
+- [ ] `tests/unit/test_semantic_boundary_cache.py`
+  - `test_detect_sentence_boundaries`: 문장 끝(.) 경계 탐지 검증
+  - `test_detect_paragraph_boundaries`: 단락(\n\n) 경계 탐지 검증
+  - `test_gsc_clustering_reduces_tokens`: GSC 후 토큰 수 감소 (max_merge_ratio 적용)
+  - `test_proportional_attention_is_sum_not_mean`: 비례 어텐션이 합산임을 검증
+  - `test_put_with_gsc_stores_core_kv`: put_with_gsc() 후 저장된 KV가 원본보다 작음
   - `test_cachestore_interface`: CacheStore 추상 메서드 전부 구현 검증
+  - `test_accuracy_delta_gsc_cosine_similarity`: GSC 병합 후 코사인 유사도 ≥ 0.85
+    (WikiText-2 perplexity ±1% proxy)
 
-- [ ] `tests/integration/test_cross_ac_preempt_compress.py`
-  - `test_compressed_preemption_pipeline_e2e`: CompressedPreemptionPipeline 전체 파이프라인
-  - `test_offload_compression_ratio`: 압축 후 크기 감소 ≥ 30% 검증
-  - `test_decode_cosine_similarity_after_roundtrip`: offload → restore 후 코사인 유사도 ≥ 0.85
-  - `test_overlap_efficiency_recorded`: overlap_efficiency() 메트릭 기록 확인
-  - `test_sla_tier_a_accuracy_preserved`: SLA Tier-A 요청 accuracy delta ±1% 이내
-  - `test_cross_ac_throughput_improvement`: A+C 복합 처리량이 단일 A 대비 +5% 이상
+- [ ] `tests/unit/test_speckv_gamma.py`
+  - `test_high_compression_selects_lower_gamma`: NF4 γ ≤ FP16 γ (위 의사코드 참조)
+  - `test_gamma_in_valid_range`: γ ∈ {1,...,6} (위 의사코드 참조)
+  - `test_online_adaptation_lowers_gamma_on_low_pass_rate`: 검증 0% 시 γ_bias 하향 (위 의사코드 참조)
+  - `test_perplexity_proxy_within_tolerance`: MSE 상대 오차 < 5% (위 의사코드 참조)
+  - `test_integrate_with_eopt_selects_nf4_for_2bit`: key_bits=2이면 NF4 수준 선택
+  - `test_train_mlp_requires_512_records`: 512개 미만 레코드에서 inf 반환
+
+- [ ] `tests/unit/test_context_intensive_guard.py`
+  - `test_high_density_limits_compression_to_4bit`: (위 의사코드 참조)
+  - `test_low_density_allows_aggressive_compression`: (위 의사코드 참조)
+  - `test_assess_returns_valid_range`: (위 의사코드 참조)
+  - `test_gate_eopt_codec_raises_bits_in_high_density`: (위 의사코드 참조)
+  - `test_medium_density_allows_2_2_bits`: 중간 밀도에서 min_bits ≤ 2.2 허용
+  - `test_density_score_components_weighted`: 가중치 w1+w2+w3=1.0 검증
+
+- [ ] `tests/integration/test_cross_ab_ppd_index.py`
+  - `test_hit_aware_router_e2e_multiturn`: 5턴 대화 시뮬레이션 E2E 파이프라인
+  - `test_d_node_ratio_increases_with_turns`: 턴 증가 시 D 노드 선택 비율 증가
+  - `test_online_threshold_adaptation`: record_actual_hit() 후 threshold 변화 확인
+  - `test_semantic_boundary_cache_feeds_index`: SemanticBoundarySegmentCache 의미 코어가 인덱스에 등록됨
+  - `test_cross_ab_hit_rate_above_30_percent`: 비연속 히트율 ≥ 30% (evaluation_criteria.md §3)
+  - `test_cross_ab_throughput_improvement`: 복합 처리량 단일 Activity 대비 +5% 이상 (evaluation_criteria.md §5)
 
 ---
 
@@ -1330,19 +1428,19 @@ results_dir: "results/2026-05-08"
 
 1. **단위 테스트 전부 통과** (100%, evaluation_criteria.md §0)
 2. **통합 테스트 전부 통과** (100%, evaluation_criteria.md §0)
-3. **CacheStore 인터페이스 준수** — `StaticDynamicSegmentCache`, `ManifoldKVWindowedEviction` 각각 모든 추상 메서드 구현 (evaluation_criteria.md §0)
-4. **Activity C Accuracy 보존 필수** — `test_eopt_shrinkq_accuracy.py` 전부 통과 + `experiments/run_eopt_accuracy.py` 실행 시 perplexity 변화 ±1% 이내 (evaluation_criteria.md §4 필수)
-5. **Activity C 태스크 정확도 필수** — LongBench 8개 서브태스크 정확도 변화 ±1% 이내 (evaluation_criteria.md §4 필수)
-6. **A+C 복합 Accuracy 보존 필수** — CompressedPreemptionPipeline 선점-압축-복원 사이클 후 accuracy delta ±1% 이내 (evaluation_criteria.md §5 필수, C 포함 시)
+3. **CacheStore 인터페이스 준수** — `TriangleInequalitySegmentIndex`, `SemanticBoundarySegmentCache` 각각 모든 추상 메서드 구현 (evaluation_criteria.md §0)
+4. **시드 고정 재현성** — `seed: 42` 설정으로 동일 결과 재현 (evaluation_criteria.md §0)
+5. **Activity C Accuracy 보존 필수** — `test_speckv_gamma.py` 전부 통과 + `experiments/run_text2json_accuracy.py` 실행 시 perplexity 변화 ±1% 이내 (evaluation_criteria.md §4 필수)
+6. **Activity C 태스크 정확도 필수** — LongBench 8개 서브태스크 + **Text2JSON** 정확도 변화 ±1% 이내 (evaluation_criteria.md §4 필수)
 7. **Activity A 스케줄링 오버헤드** — TTFT p50 증가 +5% 이내 (정상 부하, evaluation_criteria.md §2 필수)
-8. **TTFT p99 개선** — 요청 폭주 시 베이스라인 대비 감소 확인 (evaluation_criteria.md §2)
-9. **KV Memory Reduction** — 베이스라인 대비 −30% 이상 (evaluation_criteria.md §4)
-10. **비연속 히트율** — 전체 히트 중 비연속 히트 비율 ≥ 30% (evaluation_criteria.md §3)
-11. **처리량 목표** — tokens/sec 베이스라인 대비 +20% 이상 (evaluation_criteria.md §1)
-12. **압축 오버헤드** — eOptShrinkQCodec Encode/Decode 추가 지연 TTFT +10% 이내 (evaluation_criteria.md §4)
-13. **타입 힌트** — 모든 공개 함수·메서드에 존재 (evaluation_criteria.md §0)
-14. **설정 YAML 존재** — `configs/experiments/2026-05-08.yaml` 생성됨 (evaluation_criteria.md §0)
-15. **기존 파일 회귀 없음** — 수정 금지 파일 목록의 모든 기존 테스트 통과
-16. **결과 기록** — `results/2026-05-08/metrics.json` 에 목표 지표 수치 기록
-
-SPEC_SAVED: Spec.md
+8. **Turn 2+ TTFT 개선** — Turn 2+ TTFT p50 −68% (D 노드 append-prefill, evaluation_criteria.md §2)
+9. **캐시 히트율 향상** — 스케줄링 미적용 대비 히트율 +10%p 이상 (evaluation_criteria.md §2)
+10. **비연속 히트율** — 전체 히트 중 비연속 히트 비율 ≥ 30% (evaluation_criteria.md §3 높음)
+11. **인덱스 검색 속도** — N=10K에서 O(N) 대비 3.6× 이상 향상 (`experiments/run_index_speed_benchmark.py`)
+12. **처리량 목표** — tokens/sec 베이스라인 대비 +20% 이상 (evaluation_criteria.md §1)
+13. **복합 처리량 향상** — 단일 Activity 대비 추가 +5% 이상 (evaluation_criteria.md §5)
+14. **복합 메모리 감소** — 단일 Activity 대비 추가 −10% 이상 (evaluation_criteria.md §5)
+15. **타입 힌트** — 모든 공개 함수·메서드에 존재 (evaluation_criteria.md §0)
+16. **설정 YAML 존재** — `configs/experiments/2026-05-09.yaml` 생성됨 (evaluation_criteria.md §0)
+17. **기존 파일 회귀 없음** — 수정 금지 파일 목록의 모든 기존 테스트 통과
+18. **결과 기록** — `results/2026-05-09/metrics.json` 에 목표 지표 수치 기록

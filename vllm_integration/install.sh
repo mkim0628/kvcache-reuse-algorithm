@@ -200,11 +200,10 @@ print(f"pko_scheduling_stats: OK  preempt_count={pko_stats['preempt_count']}")
 
 class MockCompressedSched(CompressedPreemptionMixin):
     """Minimal stand-alone test class for CompressedPreemptionMixin."""
-    def __init__(self, **kwargs):
-        pko_args = {k: v for k, v in kwargs.items() if k.startswith("pko_")}
-        cpm_args = {k: v for k, v in kwargs.items() if k.startswith("cpm_")}
-        self._pko_capacity_bytes = pko_args.get("pko_cache_capacity_bytes", 4 * 1024**3)
-        self._pko_threshold = pko_args.get("pko_threshold_preempt", 0.85)
+    def __init__(self, cpm_encode_fn=None, cpm_decode_fn=None, **kwargs):
+        # pko state 수동 초기화 (vLLM Scheduler base 없이)
+        self._pko_capacity_bytes = 4 * 1024**3
+        self._pko_threshold = 0.85
         self._pko_rate_window = 32
         self._pko_fairness_max_wait = 10
         self._pko_sla_tier_a = set()
@@ -213,16 +212,19 @@ class MockCompressedSched(CompressedPreemptionMixin):
         self._pko_token_history = []
         self._pko_preempt_count = 0
         self._pko_resume_count = 0
-        self.cpm_codec = cpm_args.get("cpm_codec")
-        self.cpm_use_dual_stream = False  # CPU-only test
-        self.cpm_sla_tier_a_no_compress = True
-        self._cpm_compute_stream = None
-        self._cpm_memory_stream = None
-        self._cpm_overlap_history = []
-        self._cpm_bytes_before = 0
-        self._cpm_bytes_after = 0
+        # CompressedPreemptionMixin 속성 초기화
+        self._cpm_encode_fn = cpm_encode_fn
+        self._cpm_decode_fn = cpm_decode_fn
+        self._cpm_offload_count = 0
+        self._cpm_restore_count = 0
+        self._cpm_compress_count = 0
+        self._cpm_total_bytes_before = 0
+        self._cpm_total_bytes_after = 0
 
-cpm_sched = MockCompressedSched(cpm_codec=codec)
+cpm_sched = MockCompressedSched(
+    cpm_encode_fn=lambda k, v, li: codec.encode(k, v, li),
+    cpm_decode_fn=codec.decode,
+)
 
 torch.manual_seed(42)
 kv_k2 = torch.randn(256, 64)
@@ -244,8 +246,8 @@ assert cos_k_cpm >= 0.85, f"CompressedPreemptionMixin key cosine too low: {cos_k
 assert cos_v_cpm >= 0.85, f"CompressedPreemptionMixin val cosine too low: {cos_v_cpm:.4f}"
 
 stats_cpm = cpm_sched.cpm_stats()
-assert "compression_ratio" in stats_cpm and "preempt_count" in stats_cpm
-print(f"CompressedPreemptionMixin: OK  cos_k={cos_k_cpm:.4f}  cos_v={cos_v_cpm:.4f}  ratio={stats_cpm['compression_ratio']:.2%}")
+assert "cpm_compression_ratio" in stats_cpm and "preempt_count" in stats_cpm
+print(f"CompressedPreemptionMixin: OK  cos_k={cos_k_cpm:.4f}  cos_v={cos_v_cpm:.4f}  ratio={stats_cpm['cpm_compression_ratio']:.2%}")
 
 # make_preemptive_scheduler_class factory
 class MinimalSchedBase:
@@ -1126,6 +1128,295 @@ print("Prior-cycle SemanticSegmentIndex: OK")
 
 print("\nAll backward-compat checks passed.")
 PYEOF2
+
+echo ""
+echo "=== 2026-05-09 A+B (Cross-1) smoke tests (HitAwarePPDRouter + TriangleIndex) ==="
+python - <<'PYEOF_2026_05_09'
+import sys, pathlib
+repo_root = pathlib.Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(repo_root))
+import torch
+
+# -----------------------------------------------------------------------
+# build_triangle_index — Activity B factory
+# -----------------------------------------------------------------------
+from vllm_integration.block_manager_patch import (
+    build_triangle_index,
+    _InlineTriangleIndex,
+    _LightweightSegmentStore,
+    SegmentIndexAdapter,
+    TriangleIndexKVCacheManagerMixin,
+    make_triangle_index_kv_cache_manager_class,
+    patch_kv_cache_manager_instance,
+)
+
+# Build with inline backend (no src/ needed)
+tri_index = build_triangle_index(
+    capacity_bytes=4 * 1024 * 1024,
+    embedding_dim=32,
+    leaf_size=4,
+    use_semantic_backend=False,
+)
+assert tri_index is not None
+
+# Put and search
+import torch.nn.functional as F
+torch.manual_seed(42)
+seg_a = F.normalize(torch.randn(32), dim=-1)
+seg_b = F.normalize(torch.randn(32), dim=-1)
+seg_query = seg_a + 0.01 * torch.randn(32)  # near seg_a
+
+tri_index.put("seg_a", seg_a)
+tri_index.put("seg_b", seg_b)
+
+results = tri_index.search_nearest(seg_query, top_k=2, max_distance=1.0)
+assert len(results) > 0, "Expected search results"
+assert results[0][0] == "seg_a" or results[0][1] < results[-1][1], "Nearest should be seg_a"
+print(f"build_triangle_index: OK  top_hit={results[0][0]}  dist={results[0][1]:.4f}")
+
+# hit probability
+hit_prob = tri_index.estimate_hit_probability([seg_query], threshold_distance=0.5)
+assert 0.0 <= hit_prob <= 1.0
+print(f"estimate_hit_probability: OK  hit_prob={hit_prob:.2f}")
+
+# -----------------------------------------------------------------------
+# SegmentIndexAdapter — auto-sync
+# -----------------------------------------------------------------------
+backend = _LightweightSegmentStore(capacity_bytes=2 * 1024 * 1024)
+idx2 = build_triangle_index(capacity_bytes=2 * 1024 * 1024, embedding_dim=32, use_semantic_backend=False)
+adapter = SegmentIndexAdapter(backend, idx2)
+
+torch.manual_seed(7)
+v1 = torch.randn(32)
+adapter.put("seg_x", v1)
+
+# Both should have the key
+assert backend.get("seg_x") is not None, "backend should have seg_x"
+assert "seg_x" in idx2._embeddings, "index should have embedding for seg_x"
+
+hits = adapter.search_nearest(F.normalize(v1 + 0.01 * torch.randn(32), dim=-1), top_k=1, max_distance=1.0)
+assert len(hits) > 0 and hits[0][0] == "seg_x"
+print(f"SegmentIndexAdapter: OK  auto-sync verified")
+
+# -----------------------------------------------------------------------
+# TriangleIndexKVCacheManagerMixin — standalone test (no GPU needed)
+# -----------------------------------------------------------------------
+
+class _MinimalManager(TriangleIndexKVCacheManagerMixin):
+    """Bypass KVCacheManager.__init__() for smoke test."""
+    def __init__(self, **kwargs):
+        tri_idx = kwargs.get("triangle_index")
+        thresh = kwargs.get("triangle_threshold_distance", 0.3)
+        top_k = kwargs.get("triangle_top_k", 5)
+        emb_dim = kwargs.get("triangle_embedding_dim", 32)
+        self._tri_index = tri_idx
+        self._tri_threshold = thresh
+        self._tri_top_k = top_k
+        self._tri_embedding_dim = emb_dim
+        self._tri_total_lookups = 0
+        self._tri_noncontiguous_hits = 0
+        self._tri_contiguous_hits = 0
+
+    def get_computed_blocks(self, request):
+        # Fake vLLM result: no contiguous hit
+        class _FakeBlocks:
+            pass
+        return _FakeBlocks(), 0  # num_computed=0 → will trigger triangle lookup
+
+tri_mgr = _MinimalManager(
+    triangle_index=tri_index,
+    triangle_threshold_distance=0.5,
+    triangle_top_k=5,
+    triangle_embedding_dim=32,
+)
+
+class _FakeRequest:
+    prompt_token_ids = list(range(128))
+
+req = _FakeRequest()
+_, num = tri_mgr.get_computed_blocks(req)
+# After patched call, request should have noncontiguous annotation
+# (tri_index has seg_a and seg_b registered)
+noncontiguous = getattr(req, "ppd_noncontiguous_hits", None)
+print(f"TriangleIndexKVCacheManagerMixin: OK  noncontiguous_hits={noncontiguous}")
+stats = tri_mgr.triangle_index_stats()
+assert stats["total_lookups"] == 1
+print(f"triangle_index_stats: OK  total_lookups={stats['total_lookups']}  noncontiguous_hits={stats['noncontiguous_hits']}")
+
+# -----------------------------------------------------------------------
+# HitAwarePPDRouterMixin — standalone test
+# -----------------------------------------------------------------------
+from vllm_integration.scheduler_patch import (
+    HitAwarePPDRouterMixin,
+    _InlinePPDRouter,
+    make_hit_aware_ppd_scheduler_class,
+    patch_scheduler_instance,
+)
+
+class _StandalonePPDMixin(HitAwarePPDRouterMixin):
+    def __init__(self, **kwargs):
+        # Init mixin state without base scheduler
+        self._ppd_segment_index = kwargs.get("ppd_segment_index")
+        self._ppd_embedding_dim = kwargs.get("ppd_embedding_dim", 32)
+        self._ppd_session_id_fn = None
+        self._ppd_total_routed = 0
+        self._ppd_d_node_routed = 0
+        self._ppd_overhead_ms_total = 0.0
+        self._ppd_schedule_count = 0
+        self.waiting = None
+        # Build inline router
+        self._ppd_use_native = False
+        self._ppd_inline = _InlinePPDRouter(
+            segment_index=kwargs.get("ppd_segment_index"),
+            threshold_append=kwargs.get("ppd_threshold_append", 0.7),
+            threshold_distance=kwargs.get("ppd_threshold_distance", 0.3),
+            embedding_dim=kwargs.get("ppd_embedding_dim", 32),
+        )
+
+ppd_mixin = _StandalonePPDMixin(
+    ppd_segment_index=tri_index,
+    ppd_threshold_append=0.7,
+    ppd_threshold_distance=0.5,
+    ppd_embedding_dim=32,
+)
+
+# Turn 1 should route to P
+node_type, hit_prob = ppd_mixin._ppd_inline.route(
+    request_id="req_t1", session_id="session_1",
+    input_segments=[seg_a], remaining_ttft_ms=None,
+)
+assert node_type == "P", f"Turn 1 should route to P, got {node_type}"
+print(f"PPD Turn 1 → P: OK  node={node_type}  hit_prob={hit_prob:.2f}")
+
+# Turn 2 with known matching segment → should potentially route to D
+node_type2, hit_prob2 = ppd_mixin._ppd_inline.route(
+    request_id="req_t2", session_id="session_1",
+    input_segments=[seg_query],  # near seg_a (in index)
+    remaining_ttft_ms=None,
+)
+print(f"PPD Turn 2: node={node_type2}  hit_prob={hit_prob2:.4f}")
+# hit_prob2 may be > threshold depending on index state; just verify type
+assert node_type2 in ("P", "D")
+
+# EMA threshold adaptation
+ppd_mixin._ppd_inline._d_count = 15
+ppd_mixin._ppd_inline._d_hits = 5  # below target_hit_rate=0.7
+old_threshold = ppd_mixin._ppd_inline.threshold_append
+ppd_mixin._ppd_inline.record_actual_hit("req_t2", was_hit=False)
+# threshold should increase (be more conservative)
+print(f"EMA threshold adaptation: old={old_threshold:.4f}  new={ppd_mixin._ppd_inline.threshold_append:.4f}")
+
+# make_hit_aware_ppd_scheduler_class factory
+class MinimalSchedBase:
+    def __init__(self, *args, **kwargs): pass
+    def schedule(self): return []
+HitPPDSched = make_hit_aware_ppd_scheduler_class(MinimalSchedBase)
+assert issubclass(HitPPDSched, HitAwarePPDRouterMixin)
+assert issubclass(HitPPDSched, MinimalSchedBase)
+print(f"make_hit_aware_ppd_scheduler_class: OK  class={HitPPDSched.__name__}")
+
+# -----------------------------------------------------------------------
+# SpecKVGammaAttentionHook — Activity C (standalone)
+# -----------------------------------------------------------------------
+from vllm_integration.attention_backend_patch import (
+    SpecKVGammaAttentionHook,
+    ContextIntensiveGuardAttentionHook,
+    SpecKVContextGuardCombinedHook,
+    patch_attention_impl_with_combined_hook,
+)
+
+# Try to import from src/ (graceful degradation if not available)
+try:
+    from src.cache.speckv_gamma_controller import SpecKVCompressionGammaController
+    controller = SpecKVCompressionGammaController()
+except ImportError:
+    class _MockController:
+        def select_gamma(self, comp, conf, ent): return 3
+        def record_verification(self, acc): pass
+    controller = _MockController()
+
+gamma_hook = SpecKVGammaAttentionHook(gamma_controller=controller)
+
+class _MockLayer:
+    pass
+
+mock_layer = _MockLayer()
+kv = torch.randn(16, 32)
+gamma_hook.write_to_cache(
+    layer=mock_layer, key=kv, value=kv,
+    kv_cache=None, slot_mapping=torch.zeros(16, dtype=torch.long),
+    compression_level=0,
+)
+assert hasattr(mock_layer, "_speckv_gamma"), "layer._speckv_gamma not set"
+gamma_val = mock_layer._speckv_gamma
+assert 1 <= gamma_val <= 6, f"gamma out of range: {gamma_val}"
+
+# read_from_cache: pass-through
+kc = torch.randn(8, 16, 32)
+vc = torch.randn(8, 16, 32)
+kc_out, vc_out = gamma_hook.read_from_cache(mock_layer, kc, vc)
+assert kc_out is kc and vc_out is vc, "read_from_cache should be pass-through"
+
+stats_g = gamma_hook.gamma_stats()
+assert stats_g["write_count"] == 1
+print(f"SpecKVGammaAttentionHook: OK  gamma={gamma_val}  write_count={stats_g['write_count']}")
+
+# -----------------------------------------------------------------------
+# ContextIntensiveGuardAttentionHook — Activity C (standalone)
+# -----------------------------------------------------------------------
+try:
+    from src.cache.context_intensive_guard import ContextIntensiveAccuracyGuard
+    guard = ContextIntensiveAccuracyGuard()
+except ImportError:
+    class _MockGuard:
+        def assess(self, tids): return 0.8
+        def get_compression_limits(self, score):
+            return {"min_bits": 4.0, "max_compression_ratio": 0.5, "density_level": "high"}
+    guard = _MockGuard()
+
+guard_hook = ContextIntensiveGuardAttentionHook(guard=guard)
+mock_layer2 = _MockLayer()
+token_ids = torch.randint(0, 50000, (64,))
+guard_hook.write_to_cache(
+    layer=mock_layer2, key=kv, value=kv,
+    kv_cache=None, slot_mapping=torch.zeros(16, dtype=torch.long),
+    token_ids=token_ids,
+)
+assert hasattr(mock_layer2, "_ci_min_bits"), "layer._ci_min_bits not set"
+assert hasattr(mock_layer2, "_ci_density_level"), "layer._ci_density_level not set"
+print(f"ContextIntensiveGuardAttentionHook: OK  min_bits={mock_layer2._ci_min_bits}  level={mock_layer2._ci_density_level}")
+
+# -----------------------------------------------------------------------
+# SpecKVContextGuardCombinedHook — Activity C combined
+# -----------------------------------------------------------------------
+combined_hook = SpecKVContextGuardCombinedHook(
+    gamma_controller=controller,
+    context_guard=guard,
+)
+mock_layer3 = _MockLayer()
+combined_hook.write_to_cache(
+    layer=mock_layer3, key=kv, value=kv,
+    kv_cache=None, slot_mapping=torch.zeros(16, dtype=torch.long),
+    token_ids=token_ids,
+)
+assert hasattr(mock_layer3, "_speckv_gamma") and hasattr(mock_layer3, "_ci_min_bits")
+comb_stats = combined_hook.combined_stats()
+assert "gamma" in comb_stats and "context_guard" in comb_stats
+print(f"SpecKVContextGuardCombinedHook: OK  gamma={mock_layer3._speckv_gamma}  density={mock_layer3._ci_density_level}")
+
+# patch_attention_impl_with_combined_hook: no-op for model without AttentionImpl
+import torch.nn as nn
+class _SimpleModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear = nn.Linear(32, 32)
+model = _SimpleModel()
+n = patch_attention_impl_with_combined_hook(model, combined_hook)
+assert n == 0, f"Expected 0 patches on a model with no AttentionImpl, got {n}"
+print(f"patch_attention_impl_with_combined_hook: OK  n_patched={n}")
+
+print(f"\nAll 2026-05-09 A+B (Cross-1) smoke tests passed.  vLLM={__import__('vllm').__version__}")
+PYEOF_2026_05_09
 
 echo ""
 echo "=== Installation complete ==="

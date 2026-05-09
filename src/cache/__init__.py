@@ -13,6 +13,10 @@ from src.cache.dual_filter_selector import DualFilterSegmentSelector
 from src.cache.eopt_shrinkq_codec import eOptShrinkQCodec
 from src.cache.static_dynamic_segment import StaticDynamicSegmentCache
 from src.cache.manifoldkv_windowed import ManifoldKVWindowedEviction
+from src.cache.triangle_index import TriangleInequalitySegmentIndex
+from src.cache.semantic_boundary_cache import SemanticBoundarySegmentCache
+from src.cache.speckv_gamma_controller import SpecKVCompressionGammaController
+from src.cache.context_intensive_guard import ContextIntensiveAccuracyGuard
 
 __all__ = [
     "CacheStore",
@@ -31,4 +35,8 @@ __all__ = [
     "eOptShrinkQCodec",
     "StaticDynamicSegmentCache",
     "ManifoldKVWindowedEviction",
+    "TriangleInequalitySegmentIndex",
+    "SemanticBoundarySegmentCache",
+    "SpecKVCompressionGammaController",
+    "ContextIntensiveAccuracyGuard",
 ]

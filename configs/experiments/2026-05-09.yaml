@@ -1,0 +1,66 @@
+experiment:
+  date: "2026-05-09"
+  activity: "A+B+C"
+  description: >
+    HitAwarePPDRouter (Cross-1: A+B): PPDAppendPrefillRouter + TriangleInequalitySegmentIndex +
+    SemanticBoundarySegmentCache. 보조: SpecKVCompressionGammaController(C) +
+    ContextIntensiveAccuracyGuard(C).
+
+scheduler:
+  type: "hit_aware_ppd_router"
+  threshold_append: 0.7              # D 노드 선택 히트 확률 임계값
+  threshold_distance: 0.3           # 히트 판정 최대 세그먼트 거리
+  slo_ttft_budget_ms: 200.0         # TTFT SLO 예산 (ms)
+  slo_aggressive_factor: 0.9        # SLO 임박 시 threshold_append 승수
+  ema_alpha: 0.1                    # 임계값 EMA 갱신 계수
+  min_threshold: 0.3                # threshold_append 하한
+  max_threshold: 0.95               # threshold_append 상한
+  target_hit_rate: 0.7              # 목표 D 노드 실제 히트율
+
+index:
+  type: "triangle_inequality"
+  embedding_dim: 64                 # 세그먼트 임베딩 차원
+  leaf_size: 8                      # 리프 노드 최대 세그먼트 수
+  distance_fn: "cosine"             # "cosine" 또는 "euclidean"
+
+cache:
+  type: "semantic_boundary"
+  capacity_bytes: 4294967296        # 4 GiB
+  min_cluster_size: 3               # GSC 최소 클러스터 크기
+  max_merge_ratio: 0.7              # 최대 병합 비율
+  attention_threshold: 0.1          # 시드 토큰 어텐션 스코어 임계값
+
+compression:
+  gamma_controller:
+    enabled: true
+    base_seed: 42
+    ema_alpha: 0.05
+    target_verification_rate: 0.7
+  context_guard:
+    enabled: true
+    w1: 0.3                         # entity_ratio 가중치
+    w2: 0.3                         # numeric_ratio 가중치
+    w3: 0.4                         # token_entropy 가중치
+    sample_tokens: 128
+    threshold_high: 0.7
+    threshold_low: 0.4
+  eopt_backend:
+    key_bits: 2
+    value_bits: 3
+    calibration_samples: 20
+    calibration_save_path: "results/2026-05-09/eopt_calibration.pt"
+
+benchmark:
+  index_speed:
+    segment_counts: [100, 1000, 10000]
+    trials: 10
+  ppd_ttft:
+    num_turns: 5                    # 멀티턴 시뮬레이션 턴 수
+    num_sessions: 100
+  accuracy:
+    datasets: ["wikitext2", "longbench", "text2json"]
+    wikitext2_stride: 512
+    wikitext2_max_length: 1024
+
+seed: 42
+results_dir: "results/2026-05-09"

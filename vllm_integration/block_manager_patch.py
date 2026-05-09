@@ -1937,3 +1937,661 @@ class ManifoldKVWindowedEvictionManager(KVCacheManager):
             "max_outlier_score": max_score,
             "window_size": self._mvwem_window_size,
         }
+
+
+# ===========================================================================
+# 2026-05-09 additions — Activity B (Cross-1): TriangleInequalitySegmentIndex
+#                         integration with vLLM KVCacheManager
+# ===========================================================================
+
+import torch.nn.functional as F  # noqa: E402  (already imported above in some configs)
+
+
+# ---------------------------------------------------------------------------
+# _LightweightSegmentStore — fallback when SemanticBoundarySegmentCache
+# is not importable (no src/ dependency)
+# ---------------------------------------------------------------------------
+
+class _LightweightSegmentStore:
+    """Minimal CacheStore-compatible LRU backend.
+
+    Used as TriangleInequalitySegmentIndex backend when
+    SemanticBoundarySegmentCache is not importable from src/.
+    """
+
+    def __init__(self, capacity_bytes: int = 256 * 1024 * 1024) -> None:
+        self._store: Dict[str, torch.Tensor] = {}
+        self._lru: List[str] = []
+        self._capacity_bytes = capacity_bytes
+        self._hits: int = 0
+        self._misses: int = 0
+
+    def put(self, key: str, value: torch.Tensor) -> None:
+        self._store[key] = value
+        if key in self._lru:
+            self._lru.remove(key)
+        self._lru.append(key)
+        self._maybe_evict()
+
+    def get(self, key: str) -> Optional[torch.Tensor]:
+        if key in self._store:
+            self._hits += 1
+            self._lru.remove(key)
+            self._lru.append(key)
+            return self._store[key]
+        self._misses += 1
+        return None
+
+    def evict(self) -> int:
+        if not self._lru:
+            return 0
+        evict_key = self._lru.pop(0)
+        kv = self._store.pop(evict_key, None)
+        return kv.nbytes if kv is not None else 0
+
+    def hit_rate(self) -> float:
+        total = self._hits + self._misses
+        return self._hits / total if total > 0 else 0.0
+
+    def memory_bytes(self) -> int:
+        return sum(v.nbytes for v in self._store.values())
+
+    def reset_stats(self) -> None:
+        self._hits = 0
+        self._misses = 0
+
+    def keys(self) -> List[str]:
+        return list(self._store.keys())
+
+    def _maybe_evict(self) -> None:
+        while self.memory_bytes() > self._capacity_bytes and self._lru:
+            self.evict()
+
+
+# ---------------------------------------------------------------------------
+# build_triangle_index — convenience factory (Activity B)
+# ---------------------------------------------------------------------------
+
+def build_triangle_index(
+    capacity_bytes: int = 256 * 1024 * 1024,
+    embedding_dim: int = 64,
+    leaf_size: int = 8,
+    use_semantic_backend: bool = True,
+) -> Any:
+    """Build a TriangleInequalitySegmentIndex for Activity B integration.
+
+    Tries to import TriangleInequalitySegmentIndex + SemanticBoundarySegmentCache
+    from src/. Falls back to _InlineTriangleIndex + _LightweightSegmentStore when
+    the src/ package is not on sys.path.
+
+    Args:
+        capacity_bytes: Backend cache capacity in bytes.
+        embedding_dim: Embedding dimensionality.
+        leaf_size: Leaf size for hierarchical index.
+        use_semantic_backend: Use SemanticBoundarySegmentCache if importable.
+
+    Returns:
+        TriangleInequalitySegmentIndex or _InlineTriangleIndex instance.
+    """
+    # Try src/ imports
+    TriangleIdx: Any = None
+    SemanticCache: Any = None
+    try:
+        from src.cache.triangle_index import TriangleInequalitySegmentIndex as _TI
+        TriangleIdx = _TI
+    except ImportError:
+        pass
+    if use_semantic_backend:
+        try:
+            from src.cache.semantic_boundary_cache import SemanticBoundarySegmentCache as _SB
+            SemanticCache = _SB
+        except ImportError:
+            pass
+
+    if SemanticCache is not None:
+        backend = SemanticCache(capacity_bytes=capacity_bytes)
+    else:
+        backend = _LightweightSegmentStore(capacity_bytes=capacity_bytes)
+
+    if TriangleIdx is not None:
+        return TriangleIdx(
+            backend_cache=backend,
+            embedding_dim=embedding_dim,
+            leaf_size=leaf_size,
+        )
+
+    # Fallback: inline index
+    return _InlineTriangleIndex(
+        backend=backend,
+        embedding_dim=embedding_dim,
+        leaf_size=leaf_size,
+    )
+
+
+# ---------------------------------------------------------------------------
+# _InlineTriangleIndex — fallback (no src/ dependency)
+# ---------------------------------------------------------------------------
+
+class _InlineTriangleIndex:
+    """Inline triangle inequality segment index (fallback implementation).
+
+    Provides same API as TriangleInequalitySegmentIndex without src/ dependency.
+    Uses linear scan for small N; sufficient for N < 10K in CPU context.
+    """
+
+    def __init__(
+        self,
+        backend: Any,
+        embedding_dim: int = 64,
+        leaf_size: int = 8,
+        distance_fn: str = "cosine",
+    ) -> None:
+        self._backend = backend
+        self._embedding_dim = embedding_dim
+        self._leaf_size = leaf_size
+        self._distance_fn = distance_fn
+        self._embeddings: Dict[str, torch.Tensor] = {}
+
+    def put(self, key: str, value: torch.Tensor) -> None:
+        self._backend.put(key, value)
+        self._embeddings[key] = self._extract_embedding(value)
+
+    def get(self, key: str) -> Optional[torch.Tensor]:
+        return self._backend.get(key)
+
+    def evict(self) -> int:
+        freed = self._backend.evict()
+        current: Set[str] = set()
+        if hasattr(self._backend, "keys"):
+            current = set(self._backend.keys())
+        elif hasattr(self._backend, "_store"):
+            current = set(self._backend._store.keys())
+        for k in set(self._embeddings.keys()) - current:
+            self._embeddings.pop(k, None)
+        return freed
+
+    def hit_rate(self) -> float:
+        return self._backend.hit_rate()
+
+    def memory_bytes(self) -> int:
+        emb_bytes = sum(e.nbytes for e in self._embeddings.values())
+        return self._backend.memory_bytes() + emb_bytes
+
+    def reset_stats(self) -> None:
+        self._backend.reset_stats()
+
+    def search_nearest(
+        self,
+        query_embedding: torch.Tensor,
+        top_k: int = 5,
+        max_distance: float = 1.0,
+    ) -> List[Tuple[str, float]]:
+        results: List[Tuple[float, str]] = []
+        for key, emb in self._embeddings.items():
+            dist = self._distance(query_embedding, emb)
+            if dist <= max_distance:
+                results.append((dist, key))
+        results.sort(key=lambda x: x[0])
+        return [(k, d) for d, k in results[:top_k]]
+
+    def estimate_hit_probability(
+        self,
+        query_segments: List[torch.Tensor],
+        threshold_distance: float = 0.3,
+    ) -> float:
+        if not query_segments or not self._embeddings:
+            return 0.0
+        hits = 0
+        for seg in query_segments:
+            emb = self._extract_embedding(seg)
+            nearest = self.search_nearest(emb, top_k=1, max_distance=threshold_distance)
+            if nearest and nearest[0][1] <= threshold_distance:
+                hits += 1
+        return hits / len(query_segments)
+
+    def _distance(self, a: torch.Tensor, b: torch.Tensor) -> float:
+        a_f = a.float()
+        b_f = b.float()
+        if self._distance_fn == "cosine":
+            sim = F.cosine_similarity(a_f.unsqueeze(0), b_f.unsqueeze(0)).item()
+            return float(1.0 - sim)
+        return float(torch.norm(a_f - b_f).item())
+
+    def _extract_embedding(self, kv_tensor: torch.Tensor) -> torch.Tensor:
+        d = self._embedding_dim
+        if kv_tensor.dim() == 1:
+            flat = kv_tensor.float()
+        else:
+            flat = kv_tensor.float().mean(dim=0)
+        if flat.shape[0] >= d:
+            return flat[:d]
+        padded = torch.zeros(d)
+        padded[: flat.shape[0]] = flat
+        return padded
+
+
+# ---------------------------------------------------------------------------
+# SegmentIndexAdapter — auto-synchronizes cache backend ↔ triangle index
+# ---------------------------------------------------------------------------
+
+class SegmentIndexAdapter:
+    """Adapter that synchronizes a CacheStore backend with TriangleIndex.
+
+    Resolves unresolved issue #4 from Report ①:
+    'SemanticBoundarySegmentCache ↔ TriangleInequalitySegmentIndex complete
+    integration: currently manual pipeline, no automatic adapter.'
+
+    Every put() call stores to both the cache backend AND registers the
+    embedding in the triangle index, ensuring they stay in sync without
+    manual synchronization.
+
+    Usage:
+        triangle_index = build_triangle_index()
+        semantic_cache = SemanticBoundarySegmentCache(capacity_bytes=256*1024**2)
+
+        adapter = SegmentIndexAdapter(semantic_cache, triangle_index)
+        adapter.put("seg_key", kv_tensor)   # registers in both
+        result = adapter.get("seg_key")     # returns from cache backend
+        hits = adapter.search_nearest(emb)  # delegates to triangle_index
+    """
+
+    def __init__(
+        self,
+        cache_backend: Any,
+        triangle_index: Any,
+    ) -> None:
+        self._cache = cache_backend
+        self._index = triangle_index
+
+    def put(self, key: str, value: torch.Tensor) -> None:
+        """Store in cache AND register in triangle index."""
+        self._cache.put(key, value)
+        self._index.put(key, value)
+
+    def get(self, key: str) -> Optional[torch.Tensor]:
+        return self._cache.get(key)
+
+    def evict(self) -> int:
+        freed = self._cache.evict()
+        self._index.evict()
+        return freed
+
+    def hit_rate(self) -> float:
+        return self._cache.hit_rate()
+
+    def memory_bytes(self) -> int:
+        return self._cache.memory_bytes()
+
+    def reset_stats(self) -> None:
+        self._cache.reset_stats()
+        self._index.reset_stats()
+
+    def search_nearest(
+        self,
+        query_embedding: torch.Tensor,
+        top_k: int = 5,
+        max_distance: float = 1.0,
+    ) -> List[Tuple[str, float]]:
+        return self._index.search_nearest(query_embedding, top_k, max_distance)
+
+    def estimate_hit_probability(
+        self,
+        query_segments: List[torch.Tensor],
+        threshold_distance: float = 0.3,
+    ) -> float:
+        return self._index.estimate_hit_probability(query_segments, threshold_distance)
+
+
+# ---------------------------------------------------------------------------
+# TriangleIndexKVCacheManagerMixin — Activity B vLLM v1 KVCacheManager mixin
+# ---------------------------------------------------------------------------
+
+class TriangleIndexKVCacheManagerMixin:
+    """Mixin for vLLM v1 KVCacheManager adding non-contiguous segment lookup.
+
+    Overrides get_computed_blocks() to fall back to TriangleInequalitySegmentIndex
+    when vLLM's standard prefix-cache finds no contiguous blocks.
+
+    Block boundary constraint (from Activity B integration principles):
+        Physical block allocation is NOT modified. Non-contiguous hits are
+        communicated via request attribute annotations only. The scheduler
+        (HitAwarePPDRouterMixin) reads these annotations for P/D routing.
+
+    Request annotations added by this mixin:
+        request.ppd_noncontiguous_hits: List[Tuple[str, float]]
+            [(segment_key, distance), ...] sorted by ascending distance.
+        request.ppd_noncontiguous_hit_probability: float
+            Fraction of segments with a hit within threshold_distance.
+
+    Usage:
+        from vllm.v1.core.kv_cache_manager import KVCacheManager
+        from vllm_integration.block_manager_patch import (
+            TriangleIndexKVCacheManagerMixin, build_triangle_index
+        )
+
+        class TriKVCacheManager(TriangleIndexKVCacheManagerMixin, KVCacheManager):
+            pass
+
+        tri_index = build_triangle_index(capacity_bytes=512 * 1024 * 1024)
+        kv_manager = TriKVCacheManager(
+            ...,  # standard KVCacheManager args
+            triangle_index=tri_index,
+        )
+    """
+
+    def __init__(
+        self,
+        *args: Any,
+        triangle_index: Optional[Any] = None,
+        triangle_threshold_distance: float = 0.3,
+        triangle_top_k: int = 5,
+        triangle_embedding_dim: int = 64,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self._tri_index = triangle_index
+        self._tri_threshold = triangle_threshold_distance
+        self._tri_top_k = triangle_top_k
+        self._tri_embedding_dim = triangle_embedding_dim
+
+        # Metrics
+        self._tri_total_lookups: int = 0
+        self._tri_noncontiguous_hits: int = 0
+        self._tri_contiguous_hits: int = 0
+
+    def get_computed_blocks(self, request: Any) -> Any:
+        """Override: prefix cache + triangle index fallback for non-contiguous reuse.
+
+        1. Call super().get_computed_blocks() for standard contiguous prefix hit.
+        2. If prefix cache returns num_computed_tokens > 0: track contiguous hit.
+        3. If num_computed_tokens == 0 and triangle index available:
+           - Build segment embeddings from request token IDs.
+           - Query triangle index for nearest cached segments.
+           - Annotate request with non-contiguous hit metadata.
+        4. Return the original (kv_blocks, num_computed_tokens) unchanged.
+           Physical blocks are not modified to respect vLLM block boundaries.
+        """
+        self._tri_total_lookups += 1
+
+        result = super().get_computed_blocks(request)
+
+        # Unpack (KVCacheBlocks, int)
+        if isinstance(result, tuple) and len(result) == 2:
+            kv_blocks, num_computed = result
+        else:
+            return result
+
+        if num_computed > 0:
+            self._tri_contiguous_hits += 1
+            return result
+
+        if self._tri_index is None:
+            return result
+
+        token_ids = self._tri_get_token_ids(request)
+        if not token_ids:
+            return result
+
+        segments = self._tri_tokens_to_segments(token_ids)
+        if not segments:
+            return result
+
+        # Collect nearest segments from the triangle index
+        noncontiguous_hits: List[Tuple[str, float]] = []
+        for seg_emb in segments:
+            nearest = self._tri_index.search_nearest(
+                seg_emb,
+                top_k=self._tri_top_k,
+                max_distance=self._tri_threshold,
+            )
+            noncontiguous_hits.extend(nearest)
+
+        # Deduplicate by key, sort by ascending distance
+        seen: Set[str] = set()
+        deduped: List[Tuple[str, float]] = []
+        for key, dist in sorted(noncontiguous_hits, key=lambda x: x[1]):
+            if key not in seen:
+                seen.add(key)
+                deduped.append((key, dist))
+
+        hit_prob = (
+            len([h for h in deduped if h[1] <= self._tri_threshold])
+            / max(1, len(segments))
+        )
+
+        if deduped:
+            self._tri_noncontiguous_hits += 1
+
+        # Annotate request for downstream scheduler use
+        try:
+            request.ppd_noncontiguous_hits = deduped[: self._tri_top_k]
+            request.ppd_noncontiguous_hit_probability = hit_prob
+        except (AttributeError, TypeError):
+            pass  # vLLM Request frozen in some configs; graceful skip
+
+        return result
+
+    def register_segment(self, key: str, kv_tensor: torch.Tensor) -> None:
+        """Register a new KV segment in the triangle index.
+
+        Call after caching a new KV block to keep the index current.
+        Typical call site: after allocate_slots() completes and new blocks
+        are written to the KV cache.
+
+        Args:
+            key: Segment key (e.g. block hash hex string).
+            kv_tensor: KV tensor [n_tokens, d_head] or [d_embed].
+        """
+        if self._tri_index is not None:
+            self._tri_index.put(key, kv_tensor)
+
+    def non_contiguous_hit_rate(self) -> float:
+        """Fraction of total lookups with a non-contiguous index hit."""
+        if self._tri_total_lookups == 0:
+            return 0.0
+        return self._tri_noncontiguous_hits / self._tri_total_lookups
+
+    def triangle_index_stats(self) -> Dict[str, Any]:
+        """Return triangle index usage statistics."""
+        index_mem = 0
+        if self._tri_index is not None:
+            try:
+                index_mem = self._tri_index.memory_bytes()
+            except Exception:
+                pass
+        return {
+            "total_lookups": self._tri_total_lookups,
+            "contiguous_hits": self._tri_contiguous_hits,
+            "noncontiguous_hits": self._tri_noncontiguous_hits,
+            "non_contiguous_hit_rate": self.non_contiguous_hit_rate(),
+            "index_memory_bytes": index_mem,
+        }
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _tri_get_token_ids(self, request: Any) -> List[int]:
+        token_ids = getattr(request, "prompt_token_ids", None)
+        if token_ids is not None:
+            return list(token_ids)
+        token_ids = getattr(request, "all_token_ids", None)
+        if token_ids is not None:
+            return list(token_ids)
+        return []
+
+    def _tri_tokens_to_segments(
+        self,
+        token_ids: List[int],
+        chunk_size: int = 128,
+    ) -> List[torch.Tensor]:
+        """Convert token IDs to [embedding_dim] segment embedding tensors."""
+        if not token_ids:
+            return []
+        import hashlib
+        import struct
+        d = self._tri_embedding_dim
+        segments: List[torch.Tensor] = []
+        n_chunks = max(1, (len(token_ids) + chunk_size - 1) // chunk_size)
+        for i in range(n_chunks):
+            chunk = token_ids[i * chunk_size: (i + 1) * chunk_size]
+            if not chunk:
+                continue
+            raw = struct.pack(f"{len(chunk)}I", *[max(0, t) for t in chunk])
+            digest = hashlib.sha256(raw).digest()
+            seed = int.from_bytes(digest[:4], "little")
+            g = torch.Generator()
+            g.manual_seed(seed)
+            emb = F.normalize(torch.randn(d, generator=g), dim=-1)
+            segments.append(emb)
+        return segments
+
+
+# ---------------------------------------------------------------------------
+# make_triangle_index_kv_cache_manager_class — factory
+# ---------------------------------------------------------------------------
+
+def make_triangle_index_kv_cache_manager_class(
+    base_manager_class: Any,
+) -> Any:
+    """Create a TriangleIndex-aware KVCacheManager subclass.
+
+    Activity B (Cross-1) integration factory:
+
+        from vllm.v1.core.kv_cache_manager import KVCacheManager
+        from vllm_integration.block_manager_patch import (
+            make_triangle_index_kv_cache_manager_class,
+            build_triangle_index,
+        )
+
+        tri_index = build_triangle_index()
+        TriKVManager = make_triangle_index_kv_cache_manager_class(KVCacheManager)
+        kv_manager = TriKVManager(..., triangle_index=tri_index)
+
+    Returns:
+        New class subclassing TriangleIndexKVCacheManagerMixin + base_manager_class.
+    """
+
+    class TriangleIndexKVCacheManager(  # type: ignore[valid-type]
+        TriangleIndexKVCacheManagerMixin, base_manager_class
+    ):
+        def __init__(
+            self,
+            *args: Any,
+            triangle_index: Optional[Any] = None,
+            triangle_threshold_distance: float = 0.3,
+            triangle_top_k: int = 5,
+            triangle_embedding_dim: int = 64,
+            **kwargs: Any,
+        ) -> None:
+            base_manager_class.__init__(self, *args, **kwargs)
+            TriangleIndexKVCacheManagerMixin.__init__(
+                self,
+                triangle_index=triangle_index,
+                triangle_threshold_distance=triangle_threshold_distance,
+                triangle_top_k=triangle_top_k,
+                triangle_embedding_dim=triangle_embedding_dim,
+            )
+
+    TriangleIndexKVCacheManager.__name__ = (
+        f"TriangleIndex{base_manager_class.__name__}"
+    )
+    TriangleIndexKVCacheManager.__qualname__ = TriangleIndexKVCacheManager.__name__
+    return TriangleIndexKVCacheManager
+
+
+# ---------------------------------------------------------------------------
+# patch_kv_cache_manager_instance — monkey-patch a live KVCacheManager
+# ---------------------------------------------------------------------------
+
+def patch_kv_cache_manager_instance(
+    manager: Any,
+    triangle_index: Optional[Any] = None,
+    threshold_distance: float = 0.3,
+    top_k: int = 5,
+    embedding_dim: int = 64,
+) -> None:
+    """Monkey-patch a live vLLM KVCacheManager with TriangleIndex fallback.
+
+    Use when the manager is already constructed inside LLMEngine and cannot
+    be replaced via subclassing.
+
+    Args:
+        manager: Live vLLM v1 KVCacheManager instance.
+        triangle_index: TriangleInequalitySegmentIndex.
+        threshold_distance: Max cosine distance for a segment hit.
+        top_k: Nearest neighbors per segment lookup.
+        embedding_dim: Token embedding dimensionality.
+    """
+    import types as _types
+
+    if triangle_index is None:
+        triangle_index = build_triangle_index(embedding_dim=embedding_dim)
+
+    # Attach state
+    manager._tri_index = triangle_index
+    manager._tri_threshold = threshold_distance
+    manager._tri_top_k = top_k
+    manager._tri_embedding_dim = embedding_dim
+    manager._tri_total_lookups = 0
+    manager._tri_noncontiguous_hits = 0
+    manager._tri_contiguous_hits = 0
+
+    original_get_computed = manager.get_computed_blocks
+    _mixin_cls = TriangleIndexKVCacheManagerMixin
+
+    def _patched_get_computed(request: Any) -> Any:
+        manager._tri_total_lookups += 1
+        result = original_get_computed(request)
+        if isinstance(result, tuple) and len(result) == 2:
+            kv_blocks, num_computed = result
+        else:
+            return result
+        if num_computed > 0:
+            manager._tri_contiguous_hits += 1
+            return result
+        if manager._tri_index is None:
+            return result
+        token_ids = _mixin_cls._tri_get_token_ids(manager, request)
+        if not token_ids:
+            return result
+        segments = _mixin_cls._tri_tokens_to_segments(manager, token_ids)
+        if not segments:
+            return result
+        hits: List[Tuple[str, float]] = []
+        for seg_emb in segments:
+            nearest = manager._tri_index.search_nearest(
+                seg_emb, top_k=manager._tri_top_k,
+                max_distance=manager._tri_threshold,
+            )
+            hits.extend(nearest)
+        seen: Set[str] = set()
+        deduped: List[Tuple[str, float]] = []
+        for key, dist in sorted(hits, key=lambda x: x[1]):
+            if key not in seen:
+                seen.add(key)
+                deduped.append((key, dist))
+        hit_prob = (
+            len([h for h in deduped if h[1] <= manager._tri_threshold])
+            / max(1, len(segments))
+        )
+        if deduped:
+            manager._tri_noncontiguous_hits += 1
+        try:
+            request.ppd_noncontiguous_hits = deduped[: manager._tri_top_k]
+            request.ppd_noncontiguous_hit_probability = hit_prob
+        except (AttributeError, TypeError):
+            pass
+        return result
+
+    manager.get_computed_blocks = _patched_get_computed
+
+    for method_name in (
+        "register_segment",
+        "non_contiguous_hit_rate",
+        "triangle_index_stats",
+        "_tri_get_token_ids",
+        "_tri_tokens_to_segments",
+    ):
+        fn = getattr(_mixin_cls, method_name)
+        setattr(manager, method_name, _types.MethodType(fn, manager))
