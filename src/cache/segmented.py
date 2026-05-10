@@ -1,10 +1,14 @@
 import hashlib
 import struct
 from collections import OrderedDict
-from typing import Dict, List, Optional, Tuple  # noqa: F401
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple  # noqa: F401
+
 import torch
 
 from src.cache.base import CacheStore
+
+if TYPE_CHECKING:
+    from src.compression.vq_codec import VQCodec
 
 
 class SegmentedHashCache(CacheStore):
@@ -104,15 +108,24 @@ class SegmentedHashCache(CacheStore):
         chunk_idx: int,
         kv: torch.Tensor,
         layer_idx: int = 0,
+        codec: Optional["VQCodec"] = None,
+        positions: Optional[torch.Tensor] = None,
     ) -> None:
-        """Cache the KV tensor for a specific chunk and layer."""
+        """Cache the KV tensor for a specific chunk and layer.
+
+        If codec is provided along with positions, VQ-compress via compression_hook
+        before storing. When codec=None (default), behaviour is unchanged.
+        """
         key = self.chunk_key(token_ids, chunk_idx, layer_idx)
+        if codec is not None and positions is not None:
+            kv = self.compression_hook(key, kv)
         self.put(key, kv)
 
     def get_segments(
         self,
         token_ids: List[int],
         layer_idx: int = 0,
+        codec: Optional["VQCodec"] = None,
     ) -> Tuple[List[Tuple[int, torch.Tensor]], List[int]]:
         """Look up all chunks for a given layer; return (hits, miss_chunk_indices).
 

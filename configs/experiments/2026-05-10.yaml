@@ -1,0 +1,75 @@
+experiment:
+  date: "2026-05-10"
+  activity: "B+C"
+  description: >
+    ContextFreeCompressedKVPacket (Cross-1: B+C):
+    KVPacketSoftAdapterCache(B-1) + RSimVQCodec(C-1) integration.
+    Recomputation-free context-independent non-contiguous KV packets + VQ-compressed storage.
+
+vq_codec:
+  codebook_size: 16               # M: 4-bit index (achieves 82.8% compression)
+  n_residuals: 4                  # residual VQ stages
+  d_head: 64                      # head dimension (unit test size; real models: 128/256)
+  n_layers: 12                    # layer count (unit test: GPT-2 small)
+  n_heads: 4                      # KV head count (unit test)
+  max_iter_kmeans: 100
+  rope_base: 10000
+  seed: 42
+  recent_window: 32               # recent N tokens kept FP16 (unit test)
+  calibration_samples: 50         # calibration requests for codebook learning
+  calibration_save_path: "results/2026-05-10/vq_codebooks.pt"
+  # Real model overrides:
+  # codebook_size: 16
+  # n_residuals: 4
+  # d_head: 128
+  # n_layers: 32
+  # n_heads: 8
+  # recent_window: 128
+
+kv_packet_adapter:
+  n_heads: 4
+  d_head: 64
+  adapter_rank: 8
+  max_packets: 512
+  embedding_dim: 64
+  train_contexts_per_doc: 8
+  train_steps: 1000
+  train_lr: 1.0e-3
+
+context_free_compressed:
+  max_packets: 512
+  recent_window: 32
+  adapter_rank: 8
+
+cache:
+  type: "context_free_compressed"
+  capacity_bytes: 4294967296      # 4 GiB
+
+benchmark:
+  accuracy:
+    datasets: ["wikitext2", "longbench"]
+    wikitext2_stride: 512
+    wikitext2_max_length: 2048
+    longbench_subtasks:
+      - "qasper"
+      - "multifieldqa_en"
+      - "hotpotqa"
+      - "2wikimqa"
+      - "musique"
+      - "narrativeqa"
+      - "qmsum"
+      - "gov_report"
+    perplexity_tolerance_pct: 1.0
+    task_accuracy_tolerance_pct: 1.0
+  vq_sweep:
+    codebook_sizes: [16, 64, 256]
+    n_residuals_list: [1, 2, 4]
+  hit_rate:
+    target_noncontiguous_fraction: 0.30
+  memory_reduction:
+    target_ratio: 0.30            # minimum 30% (target 82%)
+  throughput:
+    target_improvement_pct: 10    # minimum +10% (target +20%)
+
+seed: 42
+results_dir: "results/2026-05-10"

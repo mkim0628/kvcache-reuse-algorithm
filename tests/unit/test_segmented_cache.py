@@ -1,6 +1,7 @@
 import pytest
 import torch
 from src.cache.segmented import SegmentedHashCache
+from src.compression.vq_codec import VQCodec, VQCodebookConfig
 
 
 @pytest.fixture
@@ -138,3 +139,67 @@ def test_lru_fallback_without_importance() -> None:
     oldest_key = keys_ordered[0]
     cache.evict()
     assert oldest_key not in cache._store, "Oldest (LRU) entry should be evicted as fallback"
+
+
+# ---------------------------------------------------------------------------
+# VQCodec integration tests (no hit-rate regression)
+# ---------------------------------------------------------------------------
+
+def _make_vq_codec(n_heads: int = 2, d_head: int = 32) -> VQCodec:
+    cfg = VQCodebookConfig(
+        codebook_size=16,
+        n_residuals=2,
+        d_head=d_head,
+        n_layers=1,
+        n_heads=n_heads,
+        max_iter_kmeans=50,
+        seed=42,
+        recent_window=16,
+    )
+    codec = VQCodec(cfg)
+    # Fit on small calibration data
+    torch.manual_seed(42)
+    calib_k = torch.randn(n_heads * 100, d_head)
+    calib_v = torch.randn(n_heads * 100, d_head)
+    codec.fit(calib_k, calib_v, layer_idx=0)
+    return codec
+
+
+def test_put_segment_with_codec_does_not_crash() -> None:
+    """put_segment() with codec=... and positions=... stores without error."""
+    cache = SegmentedHashCache(chunk_size=4, max_entries=100)
+    codec = _make_vq_codec()
+    token_ids = _token_ids(8)
+    kv = torch.randn(4, 8)
+    positions = torch.arange(4, dtype=torch.long)
+    # Should not raise; codec_hook is identity in base class
+    cache.put_segment(token_ids, 0, kv, layer_idx=0, codec=codec, positions=positions)
+    hits, misses = cache.get_segments(token_ids, layer_idx=0)
+    assert len(hits) == 1, "Segment stored with codec should still be retrievable"
+
+
+def test_put_segment_codec_none_unchanged_hit_rate() -> None:
+    """put_segment with codec=None (default) has identical hit rate to without codec param."""
+    cache = SegmentedHashCache(chunk_size=4, max_entries=100)
+    token_ids = _token_ids(8)
+    kv = torch.randn(4, 8)
+    cache.put_segment(token_ids, 0, kv)
+    cache.put_segment(token_ids, 1, kv)
+    hits, misses = cache.get_segments(token_ids)
+    assert cache.hit_rate() > 0.0, "Hit rate should be positive"
+    assert len(hits) == 2, "Both segments should be hits"
+    assert len(misses) == 0
+
+
+def test_get_segments_codec_param_accepted() -> None:
+    """get_segments() accepts codec= keyword without breaking existing behaviour."""
+    cache = SegmentedHashCache(chunk_size=4, max_entries=100)
+    codec = _make_vq_codec()
+    token_ids = _token_ids(8)
+    kv = torch.randn(4, 8)
+    cache.put_segment(token_ids, 0, kv)
+    # Passing codec= to get_segments should not raise and should return the same result
+    hits_with_codec, _ = cache.get_segments(token_ids, layer_idx=0, codec=codec)
+    hits_without_codec, _ = cache.get_segments(token_ids, layer_idx=0)
+    # Hit counts should match (codec does not affect retrieval in base SegmentedHashCache)
+    assert len(hits_with_codec) == len(hits_without_codec)

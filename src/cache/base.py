@@ -29,3 +29,15 @@ class CacheStore(ABC):
     @abstractmethod
     def reset_stats(self) -> None:
         """Reset hit/miss counters."""
+
+    def compression_hook(
+        self,
+        key: str,
+        value: torch.Tensor,
+    ) -> torch.Tensor:
+        """Optional compression hook called before storing in put().
+
+        Default implementation is identity (no compression).
+        Subclasses with Activity C compression may override to compress value.
+        """
+        return value
