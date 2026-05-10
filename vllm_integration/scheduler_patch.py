@@ -1795,3 +1795,196 @@ class MultiNodeRequestRouter:
         if best_decode:
             result["decode_node"] = best_decode.node_id
         return result
+
+
+# ===========================================================================
+# 2026-05-10 Activity A+B: KVPacketSegmentSchedulerMixin
+# ---------------------------------------------------------------------------
+# Segment-hash-based request reordering for the B+C KVPacket pipeline.
+#
+# Design:
+#   - Before the standard vLLM schedule() step, iterates self.waiting queue.
+#   - For each waiting request, computes a cache-hit score based on how many
+#     of its token_id chunks match existing segments in a KVPacketVQBlockManager.
+#   - Requests with higher hit scores are reordered to the front of the queue
+#     (within the FCFS window) to improve batch-level non-contiguous hit rate.
+#
+# Overhead target: < 5ms per batch for N <= 100 waiting requests.
+# The reordering is done on a Python list copy; the actual waiting queue
+# structure is NOT modified (read-only annotation + list reordering only).
+#
+# vLLM 0.20.2 integration points:
+#   - Subclasses / mixin for vllm.v1.core.sched.scheduler.Scheduler
+#   - Hooks schedule() via pre_schedule_kvp() called at the start of schedule()
+# ===========================================================================
+
+class KVPacketSegmentSchedulerMixin:
+    """Activity A+B: segment-hash-based cache-hit-aware request reordering.
+
+    Parameters
+    ----------
+    kvp_kv_manager : KVPacketVQBlockManager — the packet store to query.
+    kvp_reorder_window : int — max number of waiting requests to inspect (default 32).
+    kvp_chunk_size : int — token chunk size for segment key computation (default 128).
+    kvp_min_hit_score : float — minimum hit score ratio to prefer request (default 0.1).
+    kvp_overhead_budget_ms : float — abort reorder loop if over budget (default 5.0).
+    """
+
+    def __init__(
+        self,
+        kvp_kv_manager: Any = None,
+        kvp_reorder_window: int = 32,
+        kvp_chunk_size: int = 128,
+        kvp_min_hit_score: float = 0.10,
+        kvp_overhead_budget_ms: float = 5.0,
+        **kwargs,
+    ) -> None:
+        self._kvp_sched_manager = kvp_kv_manager
+        self._kvp_reorder_window = kvp_reorder_window
+        self._kvp_chunk_size = kvp_chunk_size
+        self._kvp_min_hit_score = kvp_min_hit_score
+        self._kvp_overhead_budget_ms = kvp_overhead_budget_ms
+        self._kvp_sched_steps: int = 0
+        self._kvp_reorder_count: int = 0
+        self._kvp_total_overhead_ms: float = 0.0
+
+    def pre_schedule_kvp(
+        self,
+        waiting_requests: Optional[List[Any]] = None,
+    ) -> List[Any]:
+        """Score waiting requests by KVPacket segment hit rate; return reordered list.
+
+        Does NOT modify the vLLM waiting queue — returns a reordered copy.
+        Annotates each request with .kvp_hit_score (float in [0, 1]).
+
+        Parameters
+        ----------
+        waiting_requests : list of Request-like objects.
+            If None, tries self.waiting (iterable).
+
+        Returns
+        -------
+        List of requests sorted by hit score (descending), within the reorder window.
+        """
+        import time
+        t0 = time.monotonic()
+        self._kvp_sched_steps += 1
+
+        if waiting_requests is None:
+            try:
+                waiting_requests = list(self.waiting)  # type: ignore[attr-defined]
+            except (AttributeError, TypeError):
+                return []
+
+        window = waiting_requests[: self._kvp_reorder_window]
+        rest = waiting_requests[self._kvp_reorder_window:]
+
+        mgr = self._kvp_sched_manager
+        if mgr is None or not getattr(mgr, "_kvp_enable", False):
+            # No manager or disabled — annotate with 0.0 and return unchanged
+            for req in window:
+                try:
+                    req.kvp_hit_score = 0.0
+                except (AttributeError, TypeError):
+                    pass
+            elapsed_ms = (time.monotonic() - t0) * 1000.0
+            self._kvp_total_overhead_ms += elapsed_ms
+            return waiting_requests
+
+        store = getattr(mgr, "_kvp_store", {})
+        chunk_size = self._kvp_chunk_size
+
+        scored = []
+        for req in window:
+            # Budget guard: abort if overhead too high
+            if (time.monotonic() - t0) * 1000.0 > self._kvp_overhead_budget_ms:
+                try:
+                    req.kvp_hit_score = 0.0
+                except (AttributeError, TypeError):
+                    pass
+                scored.append((0.0, req))
+                continue
+
+            token_ids = getattr(req, "prompt_token_ids", None) or []
+            if not token_ids or not store:
+                score = 0.0
+            else:
+                n_chunks = max(1, len(token_ids) // chunk_size)
+                hits = 0
+                for ci in range(n_chunks):
+                    seg_key = getattr(mgr, "kvp_segment_key", mgr._kvp_segment_key)(
+                        token_ids, ci, layer_idx=0
+                    )
+                    if seg_key in store:
+                        hits += 1
+                score = hits / n_chunks
+
+            try:
+                req.kvp_hit_score = score
+            except (AttributeError, TypeError):
+                pass
+            scored.append((score, req))
+
+        # Stable sort: highest hit_score first (ties keep FCFS order)
+        scored.sort(key=lambda x: -x[0])
+        reordered_window = [r for _, r in scored]
+
+        # Count how many were actually reordered
+        for i, (orig, reord) in enumerate(zip(window, reordered_window)):
+            if orig is not reord:
+                self._kvp_reorder_count += 1
+                break  # count once per step
+
+        elapsed_ms = (time.monotonic() - t0) * 1000.0
+        self._kvp_total_overhead_ms += elapsed_ms
+
+        return reordered_window + rest
+
+    def kvp_scheduling_stats(self) -> dict:
+        """Return KVPacket scheduling statistics."""
+        avg_overhead = (
+            self._kvp_total_overhead_ms / max(1, self._kvp_sched_steps)
+        )
+        return {
+            "schedule_steps": self._kvp_sched_steps,
+            "reorder_count": self._kvp_reorder_count,
+            "avg_overhead_ms": avg_overhead,
+            "reorder_window": self._kvp_reorder_window,
+        }
+
+
+def make_kvp_segment_scheduler_class(base_class: type = None) -> type:
+    """Factory: create a vLLM Scheduler subclass with KVPacketSegmentSchedulerMixin.
+
+    Usage:
+        from vllm.v1.core.sched.scheduler import Scheduler
+        KVPScheduler = make_kvp_segment_scheduler_class(Scheduler)
+    """
+    if base_class is None:
+        try:
+            from vllm.v1.core.sched.scheduler import Scheduler as _Scheduler
+            base_class = _Scheduler
+        except Exception:
+            base_class = object
+
+    class _KVPScheduler(KVPacketSegmentSchedulerMixin, base_class):  # type: ignore[misc]
+        def __init__(self, *args, **kwargs):
+            kvp_args = {
+                k: kwargs.pop(k)
+                for k in list(kwargs.keys())
+                if k.startswith("kvp_")
+            }
+            KVPacketSegmentSchedulerMixin.__init__(self, **kvp_args)
+            try:
+                base_class.__init__(self, *args, **kwargs)
+            except Exception:
+                pass
+
+        def schedule(self, *args, **kwargs):
+            """Wrap schedule() with pre_schedule_kvp() reordering."""
+            self.pre_schedule_kvp()
+            return super().schedule(*args, **kwargs)
+
+    _KVPScheduler.__name__ = f"KVPSegment_{base_class.__name__}"
+    _KVPScheduler.__qualname__ = _KVPScheduler.__name__
+    return _KVPScheduler

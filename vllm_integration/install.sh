@@ -8,6 +8,8 @@
 #   1. Upgrades vLLM to the latest available version (no version pinning).
 #   2. Prints the installed version for record-keeping.
 #   3. Runs smoke tests for:
+#      Activity B+C (2026-05-10):
+#        KVPacketVQBlockManager, VQCodecAttentionHook, KVPacketSegmentSchedulerMixin
 #      Activity A+C (2026-05-08):
 #        PreemptiveKVOffloadSchedulerMixin, CompressedPreemptionMixin,
 #        VllmEOptShrinkQCodec, EOptShrinkQAttentionHook,
@@ -31,6 +33,154 @@ pip install --upgrade vllm --ignore-installed pyjwt 2>/dev/null || pip install -
 
 VLLM_VERSION=$(python -c "import vllm; print(vllm.__version__)")
 echo "vLLM version: ${VLLM_VERSION}"
+
+echo ""
+echo "=== 2026-05-10 B+C smoke tests (KVPacketVQ + VQCodecAttentionHook + KVPScheduler) ==="
+python - <<'PYEOF_2026_05_10'
+import sys, pathlib
+repo_root = pathlib.Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(repo_root))
+import torch
+torch.manual_seed(42)
+
+# -----------------------------------------------------------------------
+# VQCodecAttentionHook — Activity C write/read hooks
+# -----------------------------------------------------------------------
+from vllm_integration.attention_backend_patch import VQCodecAttentionHook
+
+# Identity (no codec)
+hook_off = VQCodecAttentionHook(vq_codec=None, enabled=True)
+kv = torch.randn(80, 2, 4, 32)
+payload = hook_off.write_to_cache(kv, torch.arange(80), layer_idx=0)
+assert not payload.get("compressed"), "No codec -> not compressed"
+result = hook_off.read_from_cache(payload)
+assert result.shape == kv.shape
+print("VQCodecAttentionHook (identity): OK")
+
+# With VQCodec: encode/decode roundtrip (Activity C accuracy contract)
+from src.compression.vq_codec import VQCodec, VQCodebookConfig
+cfg = VQCodebookConfig(codebook_size=64, n_residuals=2, d_head=32, n_heads=4, recent_window=16, seed=42)
+codec = VQCodec(cfg)
+hook = VQCodecAttentionHook(vq_codec=codec, recent_window=16, enabled=True,
+                             warn_compression_threshold=0.10)
+
+kv2 = torch.randn(80, 2, 4, 32).to(torch.float16)
+payload2 = hook.write_to_cache(kv2, torch.arange(80), layer_idx=0)
+assert payload2.get("compressed"), "Expected compressed=True"
+assert payload2["kv_recent_fp16"].shape[0] == 16, "Expected 16 FP16 recent tokens"
+
+# Accuracy contract: decode BEFORE returning (compressed never reaches attn kernel)
+reconstructed = hook.read_from_cache(payload2, layer_idx=0)
+assert reconstructed.shape[0] == 80, f"Expected 80 tokens, got {reconstructed.shape[0]}"
+assert reconstructed.shape[1:] == (2, 4, 32), f"Wrong shape: {reconstructed.shape}"
+
+stats = hook.hook_stats()
+assert stats["encode_count"] == 1 and stats["decode_count"] == 1
+assert stats["actual_compression_ratio"] > 0.10, \
+    f"Compression ratio too low: {stats['actual_compression_ratio']:.2%}"
+print(f"VQCodecAttentionHook (VQCodec): OK  ratio={stats['actual_compression_ratio']:.2%}  "
+      f"encode={stats['encode_count']}  decode={stats['decode_count']}")
+
+# -----------------------------------------------------------------------
+# KVPacketVQBlockManager — Activity B+C standalone
+# -----------------------------------------------------------------------
+from vllm_integration.block_manager_patch import KVPacketVQBlockManager
+from collections import OrderedDict
+
+class MinimalKVPVQManager(KVPacketVQBlockManager):
+    """Bypass KVCacheManager.__init__() for smoke testing."""
+    def __init__(self, **kwargs):
+        self._kvp_n_heads = kwargs.get("kvp_n_heads", 4)
+        self._kvp_d_head = kwargs.get("kvp_d_head", 32)
+        self._kvp_adapter_rank = kwargs.get("kvp_adapter_rank", 4)
+        self._kvp_max_packets = kwargs.get("kvp_max_packets", 16)
+        self._kvp_recent_window = kwargs.get("kvp_recent_window", 16)
+        self._kvp_vq_codec = kwargs.get("kvp_vq_codec", None)
+        self._kvp_enable = kwargs.get("kvp_enable", True)
+        self._kvp_store = OrderedDict()
+        self._kvp_lru = []
+        self._kvp_insertion_order = []
+        self._kvp_hits = 0
+        self._kvp_misses = 0
+        self._kvp_noncontiguous_hits = 0
+        self._kvp_access_order = []
+        self._kvp_compress_count = 0
+        self._kvp_decompress_count = 0
+
+mgr = MinimalKVPVQManager(kvp_n_heads=4, kvp_d_head=32, kvp_adapter_rank=4,
+    kvp_max_packets=16, kvp_recent_window=16, kvp_vq_codec=codec, kvp_enable=True)
+
+# Store 3 segments with the same token_ids the scheduler will use
+req_token_ids = list(range(128))
+kv_seg = torch.randn(80, 2, 4, 32).to(torch.float16)
+key0 = mgr.kvp_store_segment(req_token_ids, chunk_idx=0, kv_block=kv_seg, layer_idx=0)
+key1 = mgr.kvp_store_segment(req_token_ids, chunk_idx=1, kv_block=kv_seg, layer_idx=0)
+key2 = mgr.kvp_store_segment(req_token_ids, chunk_idx=2, kv_block=kv_seg, layer_idx=0)
+assert len(mgr._kvp_store) == 3
+
+# Non-contiguous access: key0 -> key2 (skips key1 in insertion order)
+r0 = mgr.kvp_get_segment(key0, layer_idx=0)
+assert r0 is not None and r0.shape[0] == 84  # rank(4) + 80 tokens
+r2 = mgr.kvp_get_segment(key2, layer_idx=0)
+assert r2 is not None
+assert mgr._kvp_noncontiguous_hits >= 1, f"noncontiguous_hits={mgr._kvp_noncontiguous_hits}"
+
+stats_m = mgr.kvp_stats()
+assert stats_m["hits"] == 2 and stats_m["noncontiguous_hits"] >= 1
+print(f"KVPacketVQBlockManager: OK  hits={stats_m['hits']}  noncontiguous={stats_m['noncontiguous_hits']}  "
+      f"ratio={mgr.kvp_compression_ratio():.2%}")
+
+# pack_segments: concatenate 3 adapted segments without recomputation
+packed = mgr.kvp_pack_segments([key0, key1, key2], layer_idx=0)
+assert packed is not None and packed.shape[0] == 252  # 3 * (4 + 80)
+print(f"kvp_pack_segments: OK  shape={packed.shape}")
+
+# LRU eviction cap
+mgr2 = MinimalKVPVQManager(kvp_max_packets=2, kvp_n_heads=4, kvp_d_head=32, kvp_recent_window=16)
+for ci in range(3):
+    mgr2.kvp_store_segment(list(range(32)), ci, torch.randn(32, 2, 4, 32).to(torch.float16), 0)
+assert len(mgr2._kvp_store) == 2, f"Expected cap at 2, got {len(mgr2._kvp_store)}"
+print(f"LRU eviction: OK  capped_at={len(mgr2._kvp_store)}")
+
+# -----------------------------------------------------------------------
+# KVPacketSegmentSchedulerMixin — Activity A+B
+# -----------------------------------------------------------------------
+from vllm_integration.scheduler_patch import KVPacketSegmentSchedulerMixin
+
+class MockKVPScheduler(KVPacketSegmentSchedulerMixin):
+    def __init__(self, **kwargs): super().__init__(**kwargs)
+
+sched = MockKVPScheduler(kvp_kv_manager=mgr, kvp_reorder_window=10,
+    kvp_chunk_size=64, kvp_overhead_budget_ms=100.0)
+
+class MockRequest:
+    def __init__(self, rid, token_ids):
+        self.request_id = rid
+        self.prompt_token_ids = token_ids
+
+# req_a token_ids match stored segments; req_b does not
+req_a = MockRequest("req_a", list(range(128)))
+req_b = MockRequest("req_b", list(range(1000, 1128)))
+reordered = sched.pre_schedule_kvp([req_b, req_a])  # req_b first in queue
+assert reordered[0].request_id == "req_a", f"Expected req_a first, got {reordered[0].request_id}"
+assert reordered[0].kvp_hit_score > reordered[1].kvp_hit_score
+sched_stats = sched.kvp_scheduling_stats()
+assert sched_stats["avg_overhead_ms"] < 100.0
+print(f"KVPacketSegmentSchedulerMixin: OK  hit_score_a={req_a.kvp_hit_score:.2f}  "
+      f"overhead={sched_stats['avg_overhead_ms']:.2f}ms")
+
+# -----------------------------------------------------------------------
+# apply_all_patches: all 3 components
+# -----------------------------------------------------------------------
+from vllm_integration import apply_all_patches
+result = apply_all_patches(vq_codec=codec, n_heads=4, d_head=32, recent_window=16)
+assert "VQCodecAttentionHook" in result["patches_applied"]
+assert "KVPacketVQBlockManager" in result["patches_applied"]
+assert "KVPacketSegmentSchedulerMixin" in result["patches_applied"]
+print(f"apply_all_patches: OK  patches={result['patches_applied']}  vLLM={result['vllm_version']}")
+
+print(f"\nAll 2026-05-10 B+C smoke tests passed.  vLLM={__import__('vllm').__version__}")
+PYEOF_2026_05_10
 
 echo ""
 echo "=== 2026-05-08 A+C smoke tests (PreemptiveKVOffload + eOptShrinkQ + ManifoldKV + StaticDynamic) ==="

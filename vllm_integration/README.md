@@ -3,10 +3,13 @@
 ## Overview
 
 This package ports the independently-verified A+B+C KV cache pipeline from the
-standalone `src/` implementation into **vLLM 0.20.1**.
+standalone `src/` implementation into **vLLM 0.20.2**.
 
 | Cycle | Activity | Description | Source |
 |-------|----------|-------------|--------|
+| 2026-05-10 | **B** | KVPacketVQBlockManager — KVPacket soft-adapter non-contiguous cache, subclasses KVCacheManager | `src/cache/kv_packet_adapter.py` |
+| 2026-05-10 | **C** | VQCodecAttentionHook — VQ codec write/read hooks (compress-before-store, decompress-before-kernel) | `src/compression/vq_codec.py` |
+| 2026-05-10 | **A** | KVPacketSegmentSchedulerMixin — segment-hash-based request reordering for B+C pipeline | (new) |
 | 2026-05-08 | **A** | PreemptiveKVOffloadSchedulerMixin — TokenFlow preemptive scheduling + async GPU→CPU KV offload | `src/scheduler/preemptive_kv_offload.py` |
 | 2026-05-08 | **C** | VllmEOptShrinkQCodec — BBP auto-rank low-rank (Key 2-bit / Value 3-bit) + TurboQuant residual | `src/cache/eopt_shrinkq_codec.py` |
 | 2026-05-08 | **A+C** | CompressedPreemptionMixin — CUDA dual-stream inline compression during preemption offload | `src/scheduler/compressed_preemption.py` |
@@ -38,13 +41,117 @@ standalone `src/` implementation into **vLLM 0.20.1**.
 
 | Field | Value |
 |-------|-------|
-| vLLM version | **0.20.1** |
+| vLLM version | **0.20.2** |
 | Install command | `pip install --upgrade vllm` |
 | Architecture | v1 (`vllm.v1.*`) |
 | KV cache manager | `vllm.v1.core.kv_cache_manager.KVCacheManager` |
 | Scheduler | `vllm.v1.core.sched.scheduler.Scheduler` |
 | Block pool | `vllm.v1.core.block_pool.BlockPool` |
 | Attention backend | `vllm.v1.attention.backend.AttentionImpl` |
+
+---
+
+## 2026-05-10 Integration: Activity B+C (KVPacketSoftAdapterCache + VQCodec)
+
+### Summary
+
+This cycle ports the B+C pipeline validated in Report ① (2026-05-10):
+- **Non-contiguous hit rate**: 87.5% (baseline 30% target)
+- **KV memory reduction**: 70.3% (baseline 30% target)
+- **Perplexity delta**: ≤ 1% (±1% accuracy preservation contract)
+
+### New Classes
+
+**block_manager_patch.py**:
+- `KVPacketVQBlockManager` — subclasses `KVCacheManager`; adds parallel KVPacket store
+  with SoftTokenAdapter (Activity B) and VQ compression (Activity C).
+  - `kvp_store_segment()` — store segment: VQ-encode old tokens, FP16 recent tokens
+  - `kvp_get_segment()` — retrieve: VQ-decode + adapter.adapt() before returning
+  - `kvp_pack_segments()` — concatenate N adapted segments without recomputation
+  - `get_computed_blocks()` — extended to annotate `request.kvp_noncontiguous_hits`
+- `make_kvp_vq_kv_cache_manager_class(base)` — factory function
+
+**attention_backend_patch.py**:
+- `VQCodecAttentionHook` — write/read hooks for VQ compression
+  - `write_to_cache()` — compress tokens beyond `recent_window` with VQCodec.encode()
+  - `read_from_cache()` — always VQCodec.decode() before returning (accuracy contract)
+  - Runtime warning if compression ratio falls below `warn_compression_threshold`
+
+**scheduler_patch.py**:
+- `KVPacketSegmentSchedulerMixin` — segment-hash-based request reordering
+  - `pre_schedule_kvp()` — score waiting requests by KVPacket hit rate; reorder in place
+  - Target: < 5ms overhead per schedule step for N ≤ 100 requests
+- `make_kvp_segment_scheduler_class(base)` — factory function
+
+### Accuracy Preservation Contract (Activity C)
+
+1. `VQCodecAttentionHook.write_to_cache()`: tokens beyond `recent_window` are
+   VQ-encoded (codes stored as int16). Recent tokens (last N=64) stored in FP16.
+2. `VQCodecAttentionHook.read_from_cache()`: ALWAYS calls `VQCodec.decode()` before
+   returning. Compressed tensors NEVER reach the FlashAttention kernel.
+3. If the observed compression ratio drops below `warn_compression_threshold` (default 30%),
+   a `RuntimeWarning` is raised. This guards the ±1% perplexity constraint.
+4. `KVPacketVQBlockManager.kvp_get_segment()` follows the same decode-before-return contract.
+
+### Integration (single node — Activity B+C)
+
+```python
+from vllm.v1.core.kv_cache_manager import KVCacheManager
+from vllm.v1.core.sched.scheduler import Scheduler
+from vllm_integration import apply_all_patches
+from src.compression.vq_codec import VQCodec, VQCodebookConfig
+
+# Step 1: Create and calibrate VQCodec
+vq_cfg = VQCodebookConfig(codebook_size=256, n_residuals=4, d_head=128,
+                           n_heads=32, recent_window=64, seed=42)
+vq_codec = VQCodec(vq_cfg)
+# vq_codec.fit(calibration_keys, calibration_vals, layer_idx=0)
+
+# Step 2: Apply all patches
+patches = apply_all_patches(
+    vq_codec=vq_codec,
+    n_heads=32,
+    d_head=128,
+    recent_window=64,
+    adapter_rank=8,
+    max_packets=512,
+)
+VQHook = patches["vq_hook"]              # VQCodecAttentionHook
+KVPVQManagerClass = patches["kv_manager_class"]  # KVPacketVQBlockManager subclass
+KVPSchedulerClass = patches["scheduler_class"]   # scheduler with KVPSegmentMixin
+
+# Step 3: Attention write path (before paged block write)
+compressed_payload = VQHook.write_to_cache(kv_tensor, positions, layer_idx)
+
+# Step 4: Attention read path (before FlashAttention kernel)
+kv_fp16 = VQHook.read_from_cache(compressed_payload, layer_idx)
+
+# Step 5: Segment store (non-contiguous reuse)
+kv_manager = KVPVQManagerClass(
+    kv_cache_config=kv_cache_config, max_model_len=max_model_len,
+    hash_block_size=block_size, enable_caching=True,
+    kvp_n_heads=32, kvp_d_head=128, kvp_vq_codec=vq_codec,
+)
+seg_key = kv_manager.kvp_store_segment(token_ids, chunk_idx=0, kv_block=kv_fp16, layer_idx=0)
+
+# Step 6: Per-schedule-step reordering
+scheduler = KVPSchedulerClass(
+    ...,  # standard vLLM Scheduler args
+    kvp_kv_manager=kv_manager,
+    kvp_reorder_window=32,
+)
+scheduler.pre_schedule_kvp()  # annotates requests with kvp_hit_score
+```
+
+### Key Parameters (2026-05-10)
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `recent_window` | 64 | FP16 tokens kept uncompressed per segment |
+| `adapter_rank` | 8 | SoftTokenAdapter rank (2×n_heads×rank×d_head×2B extra) |
+| `max_packets` | 512 | Max segments in LRU packet store |
+| `kvp_reorder_window` | 32 | Max waiting requests inspected per schedule step |
+| `warn_compression_threshold` | 0.30 | Warn if compression ratio < this value |
 
 ---
 
@@ -1071,7 +1178,7 @@ The install script automatically runs smoke tests for all activities.
 
 | Component | Status |
 |-----------|--------|
-| vLLM 0.20.1 (v1 engine) | Target version |
+| vLLM 0.20.2 (v1 engine) | Target version |
 | `KVCacheManager` public API | Preserved (subclass only) |
 | `Scheduler` public API | Preserved (mixin, no monkey-patching) |
 | `AttentionImpl.forward` | Not modified — hook is additive only |
@@ -1110,3 +1217,4 @@ The install script automatically runs smoke tests for all activities.
 | **2026-05-06** | **1/3** | **B+C** | **QueryCentricKVCacheManager (ProphetKV dual-stage), TriAttentionCodecWrapper (pre-RoPE trig), QueryCentricTriAttentionKVCacheManager (B+C dual-path), TriAttentionAttentionHook, VllmQueryCentricAttentionWrapper, QueryCentricSchedulerMixin** |
 | **2026-05-08** | **1/3** | **A+C** | **PreemptiveKVOffloadSchedulerMixin (TokenFlow preemption + async offload), CompressedPreemptionMixin (CUDA dual-stream), VllmEOptShrinkQCodec (BBP auto-rank K2/V3), EOptShrinkQAttentionHook, ManifoldKVOutlierScoreHook, StaticDynamicSegmentKVManager (multi-hop invalidation), ManifoldKVWindowedEvictionManager (outlier-based eviction)** |
 | **2026-05-09** | **1/3** | **A+B+C (Cross-1)** | **HitAwarePPDRouterMixin (A+B Cross-1: PPDAppendPrefillRouter + EMA threshold, Turn 2+ D-node routing), TriangleIndexKVCacheManagerMixin (B: O(log N) non-contiguous lookup via TriangleInequalitySegmentIndex), SegmentIndexAdapter (auto-sync cache↔index, resolves Report① issue #4), _InlinePPDRouter + _InlineTriangleIndex (fallback, no src/ dependency), SpecKVGammaAttentionHook (C: γ annotation, FP16/INT8/NF4), ContextIntensiveGuardAttentionHook (C: density-based min_bits gate), SpecKVContextGuardCombinedHook (C: combined A+B+C pipeline), build_triangle_index factory, make_hit_aware_ppd_scheduler_class factory** |
+| **2026-05-10** | **1/3** | **B+C** | **KVPacketVQBlockManager (B+C: KVPacket soft-adapter cache + VQ compression, subclasses KVCacheManager, non-contiguous hit annotation), VQCodecAttentionHook (C: compress-before-store / decompress-before-kernel via VQCodec arXiv 2603.16435, FP16 recent_window=64), KVPacketSegmentSchedulerMixin (A+B: segment-hash reordering < 5ms/batch), make_kvp_vq_kv_cache_manager_class + make_kvp_segment_scheduler_class factories, apply_all_patches() updated** |
