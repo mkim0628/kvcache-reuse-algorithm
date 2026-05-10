@@ -8,6 +8,7 @@ monotone M/n_residuals sweeps, save/load roundtrip.
 import os
 import math
 import tempfile
+from typing import List, Optional, Tuple
 
 import pytest
 import torch
@@ -150,83 +151,156 @@ def test_encode_decode_mse_bounded_high_precision() -> None:
 def test_perplexity_delta_within_1pct() -> None:
     """Verify accuracy preservation: VQ compression preserves perplexity within ±1%.
 
-    This test uses a stub attention-output proxy to validate the accuracy-preservation
-    guarantee of the VQ pipeline.  Full WikiText-2 perplexity measurement (which
-    requires a real LLM) is handled in the integration tests.
+    Uses a tiny 2-layer, 2-head, d_model=64 transformer with fixed random weights
+    and a short token sequence (~256 tokens) to keep runtime < 60s.
 
-    Design: the ContextFreeCompressedKVPacket uses a recent_window that keeps the
-    most-recent tokens as FP16.  When recent_window >= sequence length, ALL tokens
-    are kept as FP16 and zero compression-induced accuracy loss occurs.  This test
-    verifies:
-    1. The encode→decode pipeline runs end-to-end without error.
-    2. With in-distribution calibration (calibration data from same sequence as test),
-       the VQ reconstruction MSE is finite, non-NaN, and below a loose bound.
-    3. The attention output relative error is < 1.0 (confirming the pipeline produces
-       valid, non-divergent KV tensors even under worst-case random data).
+    Design:
+    - Build a minimal causal LM with a KV cache hook.
+    - Run forward pass with FP16 KV → compute baseline perplexity.
+    - Run forward pass where KV is VQ-encoded then decoded → compute compressed perplexity.
+    - Assert abs(compressed_ppl - baseline_ppl) / baseline_ppl <= 0.01.
+
+    The VQ codec is calibrated on the same sequence KV tensors so the codebook is
+    in-distribution, giving the best-case (but still meaningful) accuracy bound.
     """
     torch.manual_seed(42)
-    n_tokens = 128
-    n_heads = 4
-    d_head = 32
 
-    # Calibrate on data from the same sequence (in-distribution, most favorable case)
-    torch.manual_seed(7)
-    kv_fp16 = _make_kv(n_tokens, n_heads, d_head)
+    # Tiny model parameters
+    vocab_size = 128
+    seq_len = 64       # short sequence for speed
+    d_model = 64
+    n_heads = 2
+    d_head = d_model // n_heads  # 32
+    n_layers = 2
 
-    # Use all tokens from the sequence as calibration (n_tokens × n_heads vectors)
-    calib_k = kv_fp16[:, 0].reshape(-1, d_head).float()  # [n_tokens*n_heads, d_head]
-    calib_v = kv_fp16[:, 1].reshape(-1, d_head).float()
+    # Build random token sequence (simulated WikiText-2 stub)
+    token_ids = torch.randint(0, vocab_size, (seq_len,))
 
+    # Embedding matrix: [vocab_size, d_model]
+    torch.manual_seed(1)
+    embed_weight = torch.randn(vocab_size, d_model) * 0.1
+    # Output projection (tied to embedding): [d_model, vocab_size]
+    out_weight = embed_weight.t()  # [d_model, vocab_size]
+
+    # Transformer weight matrices per layer (fixed random, FP32 for stability)
+    layers_weights = []
+    for _ in range(n_layers):
+        torch.manual_seed(len(layers_weights) * 7 + 3)
+        Wqkv = torch.randn(d_model, 3 * d_model) * 0.02  # [d_model, 3*d_model]
+        Wo = torch.randn(d_model, d_model) * 0.02          # [d_model, d_model]
+        W1 = torch.randn(d_model, 4 * d_model) * 0.02
+        W2 = torch.randn(4 * d_model, d_model) * 0.02
+        layers_weights.append((Wqkv, Wo, W1, W2))
+
+    def causal_self_attn(
+        x: torch.Tensor,   # [T, d_model]
+        Wqkv: torch.Tensor,
+        Wo: torch.Tensor,
+        kv_override: Optional[torch.Tensor] = None,  # [T, 2, n_heads, d_head]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Single-head causal self-attention; returns (output, kv_block)."""
+        T = x.shape[0]
+        qkv = x @ Wqkv  # [T, 3*d_model]
+        q, k, v = qkv.split(d_model, dim=-1)  # each [T, d_model]
+
+        # Reshape to [T, n_heads, d_head]
+        q = q.view(T, n_heads, d_head)
+        k = k.view(T, n_heads, d_head)
+        v = v.view(T, n_heads, d_head)
+
+        # Use overridden KV if provided (VQ reconstruction case)
+        if kv_override is not None:
+            k = kv_override[:, 0, :, :]
+            v = kv_override[:, 1, :, :]
+
+        kv_block = torch.stack([k, v], dim=1)  # [T, 2, n_heads, d_head]
+
+        # Causal attention: [n_heads, T, T]
+        scale = math.sqrt(d_head)
+        scores = torch.einsum("thd,shd->hts", q, k) / scale  # [n_heads, T, T]
+        mask = torch.triu(torch.full((T, T), float("-inf")), diagonal=1)
+        scores = scores + mask.unsqueeze(0)
+        attn = torch.softmax(scores, dim=-1)
+
+        out = torch.einsum("hts,shd->thd", attn, v)  # [T, n_heads, d_head]
+        out = out.reshape(T, d_model)
+        return out @ Wo, kv_block
+
+    def forward_pass(
+        tokens: torch.Tensor,
+        kv_overrides: Optional[List[Optional[torch.Tensor]]] = None,
+    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+        """Full forward pass. Returns (logits [T, vocab], list of kv_blocks per layer)."""
+        x = embed_weight[tokens]  # [T, d_model]
+        all_kvs = []
+        for layer_idx, (Wqkv, Wo, W1, W2) in enumerate(layers_weights):
+            override = kv_overrides[layer_idx] if kv_overrides is not None else None
+            # Pre-norm (simple layer norm approximation via mean subtraction)
+            xn = x - x.mean(dim=-1, keepdim=True)
+            attn_out, kv_block = causal_self_attn(xn, Wqkv, Wo, kv_override=override)
+            all_kvs.append(kv_block)
+            x = x + attn_out
+            # Feed-forward
+            xn2 = x - x.mean(dim=-1, keepdim=True)
+            ff = torch.relu(xn2 @ W1) @ W2
+            x = x + ff
+        logits = x @ out_weight  # [T, vocab_size]
+        return logits, all_kvs
+
+    def compute_perplexity(tokens: torch.Tensor, logits: torch.Tensor) -> float:
+        """Cross-entropy perplexity on next-token prediction."""
+        # Predict token t+1 from position t
+        T = tokens.shape[0]
+        log_probs = torch.log_softmax(logits[:-1], dim=-1)  # [T-1, vocab]
+        targets = tokens[1:].long()                         # [T-1]
+        nll = -log_probs[torch.arange(T - 1), targets].mean()
+        return math.exp(nll.item())
+
+    # ── Step 1: baseline FP16 forward pass ──────────────────────────────
+    with torch.no_grad():
+        logits_fp16, kv_blocks_fp16 = forward_pass(token_ids)
+    baseline_ppl = compute_perplexity(token_ids, logits_fp16)
+
+    # ── Step 2: fit VQ codecs on baseline KV and run compressed forward ──
     cfg = _make_config(
-        codebook_size=64,   # smaller M → faster, but meaningful quantisation
+        codebook_size=64,
         n_residuals=4,
         n_heads=n_heads,
         d_head=d_head,
-        max_iter_kmeans=100,
-        recent_window=64,   # half the tokens kept FP16
-    )
-    codec = VQCodec(cfg)
-    codec.fit(calib_k, calib_v, layer_idx=0)
-
-    queries = torch.randn(n_tokens, n_heads, d_head).float()
-
-    def compute_attn_output(kv: torch.Tensor) -> torch.Tensor:
-        k = kv[:, 0].float()
-        v = kv[:, 1].float()
-        scale = math.sqrt(d_head)
-        scores = torch.einsum("qhd,khd->hqk", queries, k) / scale
-        attn = torch.softmax(scores, dim=-1)
-        return torch.einsum("hqk,khd->qhd", attn, v)
-
-    out_fp16 = compute_attn_output(kv_fp16)
-
-    positions = torch.arange(n_tokens, dtype=torch.long)
-    codes = codec.encode(kv_fp16, layer_idx=0, positions=positions)
-    kv_vq = codec.decode(codes, layer_idx=0)
-    out_vq = compute_attn_output(kv_vq)
-
-    # Verify no NaN/Inf in pipeline output
-    assert not torch.isnan(kv_vq).any(), "Decoded KV tensor contains NaN"
-    assert not torch.isinf(kv_vq).any(), "Decoded KV tensor contains Inf"
-
-    diff = torch.mean((out_fp16 - out_vq) ** 2).item()
-    norm = torch.mean(out_fp16 ** 2).item()
-    relative_diff = diff / (norm + 1e-8)
-
-    # Loose bound: pipeline must produce non-divergent outputs.
-    # Real accuracy preservation (±1% perplexity) is verified in integration tests
-    # using actual LLM weights on WikiText-2.  The bound here simply confirms the
-    # codec does not produce catastrophically wrong values on random data.
-    assert relative_diff < 1.5, (
-        f"Attention output relative diff {relative_diff:.4f} suggests broken pipeline"
+        max_iter_kmeans=50,
+        recent_window=8,   # keep only 8 tokens FP16; compress the rest
     )
 
-    # Tighter check: reconstruction MSE relative to input norm < 1.0
-    kv_mse = torch.mean((kv_fp16.float() - kv_vq.float()) ** 2).item()
-    kv_norm = torch.mean(kv_fp16.float() ** 2).item()
-    kv_relative_mse = kv_mse / (kv_norm + 1e-8)
-    assert kv_relative_mse < 1.0, (
-        f"KV reconstruction relative MSE {kv_relative_mse:.4f} too high"
+    kv_overrides: List[Optional[torch.Tensor]] = []
+    for layer_idx, kv_block_fp16 in enumerate(kv_blocks_fp16):
+        # kv_block_fp16: [T, 2, n_heads, d_head]
+        T = kv_block_fp16.shape[0]
+        k_flat = kv_block_fp16[:, 0].reshape(-1, d_head)
+        v_flat = kv_block_fp16[:, 1].reshape(-1, d_head)
+
+        codec = VQCodec(cfg)
+        codec.fit(k_flat.float(), v_flat.float(), layer_idx=layer_idx)
+
+        positions = torch.arange(T, dtype=torch.long)
+        codes = codec.encode(kv_block_fp16.float().to(torch.float16), layer_idx, positions)
+        kv_reconstructed = codec.decode(codes, layer_idx).float()
+        kv_overrides.append(kv_reconstructed)
+
+    with torch.no_grad():
+        logits_vq, _ = forward_pass(token_ids, kv_overrides=kv_overrides)
+    compressed_ppl = compute_perplexity(token_ids, logits_vq)
+
+    # ── Step 3: assert ±1% perplexity delta ─────────────────────────────
+    assert baseline_ppl > 0 and math.isfinite(baseline_ppl), (
+        f"Baseline perplexity is invalid: {baseline_ppl}"
+    )
+    assert math.isfinite(compressed_ppl), (
+        f"Compressed perplexity is invalid: {compressed_ppl}"
+    )
+    delta_ratio = abs(compressed_ppl - baseline_ppl) / baseline_ppl
+    assert delta_ratio <= 0.01, (
+        f"Perplexity delta {delta_ratio:.4%} exceeds ±1% threshold. "
+        f"baseline={baseline_ppl:.4f}, compressed={compressed_ppl:.4f}"
     )
 
 
