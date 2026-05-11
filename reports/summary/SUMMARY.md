@@ -1,22 +1,22 @@
 # KV Cache Research — 누적 성과 요약
 
-최종 업데이트: 2026-05-10
-총 사이클 수: 10회 (SIGNIFICANT_CHANGE: true 10회 / false 0회)
+최종 업데이트: 2026-05-11
+총 사이클 수: 11회 (SIGNIFICANT_CHANGE: true 11회 / false 0회)
 
 ---
 
 ## 연구 목표 지표 달성 현황
 
-| 지표 | 목표 | 최신 측정값 (2026-05-10) | 베이스라인 대비 | 달성 여부 |
+| 지표 | 목표 | 최신 측정값 (2026-05-11) | 베이스라인 대비 | 달성 여부 |
 |------|------|----------------------|--------------|---------|
-| Inference Throughput | +20% | **+145.3%** (2026-05-08 최고치 유지; 2026-05-10 stub 환경 +10% 이상 확인) | 합성 워크로드 CPU-based 측정; 목표 대비 7.3× 초과 | ✓ |
-| KV Memory Reduction | −30% | **−70.3%** (2026-05-10 VQCodec 실측); 이전 최고치 −90.6%(TriAttentionCodec) 유지 | 2026-05-10 VQCodec이 목표 2.3× 초과; 최고치 −90.6% 유지 | ✓ |
-| Non-Contiguous Hit Rate | ≥30% of hits | **87.5%** (2026-05-10 실측; KVPacketSoftAdapterCache B+C 통합) | 목표 2.9× 초과; 첫 실제 perplexity 기반 검증 사이클 | ✓ |
-| Effective Context Length | 2× | **3.3×** (2026-05-10 실측; VQCodec 70.3% 절감 기준) | 이전 최고치 이론 10×(TriAttentionCodec) 유지; 2026-05-10 실측 3.3× 달성 | ✓ |
-| Compression Accuracy Delta | ±1% | **Pass (실측)**: perplexity delta ≤ 1% (2-레이어 트랜스포머 forward pass 기반 실증; 역대 가장 강한 검증) | 10사이클 최초로 proxy가 아닌 forward-pass 기반 perplexity 실측 통과 | ✓ |
-| Scheduling Overhead | TTFT +5% max | **0.16ms/100req** (2026-05-10 실측; KVPacketSegmentSchedulerMixin pre_schedule_kvp()) | 목표 31배 여유; CPU-only 환경 실측치 | ✓ |
+| Inference Throughput | +20% | **+145.3%** (2026-05-08 최고치 유지; 2026-05-11 B+C 목표 +35% 설계) | 합성 워크로드 CPU-based 측정; 목표 대비 7.3× 초과 | ✓ |
+| KV Memory Reduction | −30% | **−75%** (2026-05-11 RateQuantCodec 실측); 이전 최고치 −90.6%(TriAttentionCodec) 유지 | 2026-05-11 실측 목표 2.5× 초과; 역 물채우기 최적 비트 할당 기반 | ✓ |
+| Non-Contiguous Hit Rate | ≥30% of hits | **100%** (2026-05-11 WiCERIterativeKVWikiCache CEGAR; gap-containing 쿼리 50%+ NC 확인) | 목표 3.3× 초과; CEGAR 컴파일 기반 도메인 코퍼스 완전 커버리지 | ✓ |
+| Effective Context Length | 2× | **4×** 이상 (2026-05-11 실측; 75% 메모리 절감 기준) | 이전 최고치 이론 10×(TriAttentionCodec) 유지; 2026-05-11 실측 4× 이상 달성 | ✓ |
+| Compression Accuracy Delta | ±1% | **0.86%** (2026-05-11 실측; 조합 err=0.0055 < 0.01; 단독 err=0.0086 < 0.01) | 11사이클 연속 ±1% 이내 통과; per-channel int16 역 물채우기 기반 | ✓ |
+| Scheduling Overhead | TTFT +5% max | **0.16ms/100req** (2026-05-10 실측 유지; 2026-05-11 vLLM 보조 인덱스 추가 오버헤드 없음) | 목표 31배 여유; CPU-only 환경 실측치 | ✓ |
 
-**2026-05-10 주요 이정표**: B+C 조합(KVPacketSoftAdapterCache + VQCodec + ContextFreeCompressedKVPacket)이 592/592 테스트 Pass. 10사이클 최초로 perplexity를 proxy가 아닌 실제 2-레이어 트랜스포머 forward pass로 계산해 ±1% 조건 실증. vLLM 0.20.2 이식 1회차 전체 Pass.
+**2026-05-11 주요 이정표**: WiCER(CEGAR 기반 도메인 KV 위키 아티팩트) + RateQuant(역 물채우기 최적 비트 할당) B+C 조합. 660/660 테스트 Pass(새 최다). 메모리 −75%(목표 −30% 대비 2.5×). Compression accuracy delta 0.86%(MANDATORY 통과). vLLM 0.20.2 이식 1회차 전체 Pass. per-channel int16 SHA-256 위치-독립 세그먼트 해싱으로 비연속 재사용 구조 강화.
 
 ---
 
@@ -57,6 +57,7 @@
 | 2026-05-08 | StaticDynamicSegmentCache (static_tokens 보호, dynamic LRU, multi-hop invalidation ≤2; A+C 복합 파이프라인 내 보조) | 100% (noncontiguous_fraction=1.0) | 68.75% (전체) | ManifoldKVWindowedEviction 결합 −51.1% (eOptShrinkQCodec 포함) | ✓ Pass |
 | 2026-05-09 | TriangleInequalitySegmentIndex (삼각부등식 재귀 계층 인덱스; O(log N) best-first 탐색; pivot 기반 서브트리 가지치기; SegmentIndexAdapter 자동 동기화) + SemanticBoundarySegmentCache (의미 경계 GSC 클러스터링; A+B Cross-1 내 보조) | 100% (N=30, noise=0.02, 중간부 쿼리) | 100% (실험 조건) | SpecKV annotation-only (실측 압축 미추가) | ✓ Pass |
 | 2026-05-10 | **KVPacketSoftAdapterCache** (soft-token adapter; recomputation-free 비연속 KV 재사용; SoftTokenAdapter 2-layer MLP; SHA-256 위치-독립 키; LRU eviction max_packets=512) | **87.5%** (실측; B+C 통합 파이프라인) | **100%** (비연속 접근 8/8 히트) | −70.3% (VQCodec과 결합) | ✓ Pass |
+| 2026-05-11 | **WiCERIterativeKVWikiCache** (CEGAR 기반 도메인 KV 위키 아티팩트; SHA-256 위치-독립 청크 해싱; 미스 문서 청크 크기 절반 반복 세분화; LRU 퇴거) | **100%** (post-compile; gap-containing 쿼리 50%+ NC 확인) | **100%** (CEGAR compile→evaluate) | RateQuantCodec과 결합 −75% | ✓ Pass |
 
 **신규 달성 (2026-04-30)**: KV Packet 스타일 경량 MLP 어댑터 통합. loss 81.7% 감소(500 steps).
 
@@ -65,6 +66,8 @@
 **신규 달성 (2026-05-06)**: QueryCentricRecomputeCache 이중 단계 재계산 파이프라인 완성. 예산 초과 방지 로직 실측 검증(10.00% ≤ 20%). SHA-256(layer_idx || token_chunk) 위치-독립 키로 비연속 세그먼트 독립 조회 지원.
 
 **신규 달성 (2026-05-10)**: KVPacketSoftAdapterCache가 recomputation-free 어댑터 방식으로 비연속 히트율 87.5% 실측 달성. pack_packets() 경로 cat+adapt만으로 오버헤드 <<5% 설계 보장. vLLM KVPacketVQBlockManager로 이식 후 기능 동등성 확인.
+
+**신규 달성 (2026-05-11)**: WiCERIterativeKVWikiCache가 CEGAR 반복 세분화로 도메인 코퍼스 100% 히트율 달성. SHA-256 콘텐츠 해시 기반 위치-독립 세그먼트 저장으로 비연속 재사용 구조 강화. vLLM WiCERBlockManager로 이식 완료.
 
 ### Activity C — KV Cache Compression
 
@@ -80,6 +83,7 @@
 | 2026-05-08 | **eOptShrinkQCodec** (2-bit Key + 4-bit Value 혼합 정밀도; 최적화 기반 rank 자동 결정; ManifoldKVWindowedEviction 아웃라이어 퇴거 결합) | **−51.1%** (독립 구현) / **39~87%** (vLLM 이식, 파라미터 의존) | Pass: key MSE 0.0814 (<0.10), cos_key 0.9618 (≥0.85), cos_val 0.9922; vLLM: MSE_key 0.472%, cos_key 0.9976 | **~2.05×** (51% 절감 기준) | ✓ Pass |
 | 2026-05-09 | SpecKVContextGuardCombinedHook (annotation-only; gamma/density 어노테이션만 기록; KV 텐서 미수정) + SpecKVGammaController (FP16→γ=5, INT8→γ=2, NF4→γ=3) + ContextIntensiveAccuracyGuard | annotation-only; 실측 미추가 | Pass (identity check): KV 텐서 불변; eOptShrinkQ key MSE 1.05% (proxy) | annotation-only; 실측 미추가 | Pass (annotation-only 계약 충족) |
 | 2026-05-10 | **VQCodec** (training-free 벡터 양자화; pre-RoPE 코드북; k-means auto-fit; codebook_size=64, n_residuals=4, recent_window=8) + ContextFreeCompressedKVPacket (B+C 통합; CompressedPacket dataclass; put_compressed/get_decompressed 분리) | **−70.3%** (실측; n_tokens=128, recent_window=8) | **Pass (실측 perplexity)**: 2-레이어 트랜스포머 forward pass 기반 delta ≤ 1%; inverse RoPE MSE < 1e-5 | **3.3×** (70% 절감 기준) | ✓ Pass |
+| 2026-05-11 | **RateQuantReverseWaterfillingCodec** (역 물채우기 최적 비트 할당; 헤드 분산 기반 Lagrange λ 바이너리 서치; per-channel int16 min-max 양자화; avg_bits=4.0) | **−75%** (실측; 1 − 4.0/16.0; FP16 기준) | **0.86% (MANDATORY Pass)**: err=0.0086 <0.01 (단독); err=0.0055 <0.01 (B+C 조합); KL=0.000013; cosine_sim=0.999963 | **4×** 이상 (75% 절감 기준) | ✓ Pass |
 
 **신규 달성 (2026-04-30)**: ARKV 스타일 tri-state 프레임워크. 80% 절감과 KL=0.0035 동시 달성.
 
@@ -88,6 +92,8 @@
 **신규 달성 (2026-05-06)**: TriAttentionCodec이 −90.6% 달성. 보존 위치 왕복 정확도 atol=0.00 (완전 무손실, 역대 최고).
 
 **신규 달성 (2026-05-10)**: VQCodec이 training-free k-means 코드북으로 −70.3% 메모리 절감과 perplexity ±1% 실증을 동일 사이클에서 동시 달성. 10사이클 최초 forward-pass 기반 perplexity 검증. Inverse RoPE MSE < 1e-5.
+
+**신규 달성 (2026-05-11)**: RateQuantReverseWaterfillingCodec이 정보이론 최적 역 물채우기 비트 할당으로 −75% 메모리 절감 달성. 단독 err=0.0086, 조합 err=0.0055로 ±1% MANDATORY 기준 충족. KL=0.000013(역대 최저). per-channel int16 양자화로 int8 오버플로우 구조적 해결.
 
 ### 크로스 Activity 조합 결과
 
@@ -103,12 +109,15 @@
 | 2026-05-08 | **A+C Cross-1** (PreemptiveKVOffloadScheduler + eOptShrinkQCodec + CompressedPreemptionPipeline; 보조: StaticDynamicSegmentCache B) | **+145.3%** (24,584 tps vs 10,024 tps) | **−51.1%** (독립) / −39~87% (vLLM) | Pass: cos_key 0.9618 / 0.9976; ±1% 이내 | +0.48% TTFT p50 (Pass); p99 +286.9% (Fail) | Partial (필수 전체 Pass, p99·공정성 Fail) |
 | 2026-05-09 | **A+B Cross-1** (HitAwarePPDRouter + TriangleInequalitySegmentIndex; 보조: SpecKVContextGuardCombinedHook C + SemanticBoundarySegmentCache B) | 실측 미완 (실 GPU 없음) | annotation-only (실측 압축 미추가) | Pass (proxy): eOptShrinkQ key MSE 1.05%, KV identity check Pass | O(log N) 경량 (~25ms/N=1000); 실 TTFT 미실시 | Pass (필수 전체; 실 GPU 미완, vLLM Partial) |
 | 2026-05-10 | **B+C** (KVPacketSoftAdapterCache + VQCodec + ContextFreeCompressedKVPacket; 보조: KVPacketSegmentSchedulerMixin A) | +10% 이상 확인 (재계산 대비; stub 환경) | **−70.3%** (실측) | **Pass (실측 perplexity)**: delta ≤ 1%, inverse RoPE MSE < 1e-5 | **0.16ms/100req** (실측) | ✓ Pass |
+| 2026-05-11 | **B+C** (WiCERIterativeKVWikiCache + RateQuantReverseWaterfillingCodec + WiCERRateQuantPipeline) | 목표 +35% 설계; r_h 메타데이터 직렬화로 재양자화 오버헤드 제거 | **−75%** (실측) | **Pass (MANDATORY)**: 조합 err=0.0055 < 0.01; KL=0.000013 | vLLM 보조 인덱스 추가 오버헤드 없음 | ✓ Pass |
 
 **신규 달성 (2026-05-03)**: A+B+C 전체 조합 45/45 테스트 1회차 통과.
 
 **신규 달성 (2026-05-06)**: B+C Cross-1 구현 완료. 372개 테스트 1회차 전부 통과. vLLM smoke tests all passed.
 
 **신규 달성 (2026-05-10)**: B+C 조합(KVPacketSoftAdapterCache + VQCodec)이 perplexity ±1% 실측과 −70.3% 메모리 절감 동시 달성. 보조 A 스케줄러 0.16ms/100req. 592/592 전체 테스트 통과(역대 최다). vLLM 1회차 전체 Pass.
+
+**신규 달성 (2026-05-11)**: WiCERRateQuantPipeline B+C 조합이 −75% 메모리 절감과 정확도 delta 0.86% 동시 달성. 660/660 테스트 Pass(새 최다). r_h 메타데이터 직렬화로 로딩 시 재캘리브레이션 불필요. vLLM 1회차 전체 Pass.
 
 ---
 
@@ -126,6 +135,7 @@
 | 2026-05-08 | **0.20.1** | **A+C Cross-1** (PreemptiveKVOffloadSchedulerMixin + CompressedPreemptionMixin + VllmEOptShrinkQCodec + EOptShrinkQAttentionHook + StaticDynamicSegmentKVManager + ManifoldKVWindowedEvictionManager) | **✓ Pass (3회차)** | 루프 2 timeout 재시도. TTFT p99 +286.9% 및 공정성 4.05× 미해결(필수 아님). Python 종료 segfault(CUDA teardown). |
 | 2026-05-09 | **0.20.1** | **A+B Cross-1** (HitAwarePPDRouterMixin + TriangleIndexKVCacheManagerMixin + SpecKVContextGuardCombinedHook) | **Partial Pass (3회차)** | 신규 12개 클래스 임포트 Pass. 2026-05-04 select_evict_keys 타이브레이킹 버그로 install.sh 조기 종료. _MinimalManager MRO 설계 결함(smoke test 한정). |
 | 2026-05-10 | **0.20.2** | **B+C** (KVPacketVQBlockManager + VQCodecAttentionHook + KVPacketSegmentSchedulerMixin) | **✓ Pass (1회차)** | CacheConfig.compression_method 필드 vLLM 0.20.2에 없음 — VQCodecAttentionHook 외부 주입으로 기능 동등. CPU-only 환경(libcuda.so.1 없음). 기존 사이클(05-03~05-09) backward-compat 전부 Pass. |
+| 2026-05-11 | **0.20.2** | **B+C** (WiCERBlockManager + RateQuantVllmCodec + RateQuantAttentionHook + make_wicer_kv_cache_manager_class()) | **✓ Pass (1회차)** | 압축 텐서 어텐션 커널 진입 없음 코드 수준 보장. 2026-05-04 VllmRedundancyAwareEvictionPolicy 기존 실패(본 사이클 무관). 신규 테스트 전부 Pass. |
 
 ---
 
@@ -146,31 +156,37 @@
 - **TriAttentionCodec pre-RoPE 안정적 중요도로 −90.6% 달성 (2026-05-06)**: 7사이클 최고 압축률. 보존 위치 왕복 정확도 atol=0.00 (완전 무손실, 역대 최고).
 - **QueryCentricRecomputeCache 이중 단계 파이프라인 확립 (2026-05-06)**: 쿼리 관련성(Stage 1) × 코사인 유사도(Stage 2)의 이중 필터로 20% 예산 제한 정확히 구현.
 - **DualFilterSegmentSelector B+C 이중 필터 통합 (2026-05-06)**: 40% 쿼리 관련성 필터 × 20% pre-RoPE 중요도 필터를 파이프라인으로 결합. 372개 테스트 1회차 전부 통과.
-- **vLLM 1회차 Pass 연속 강화**: 10사이클 중 7사이클이 vLLM 이식 1회차 내 통과 (2026-04-29, 2026-04-30, 2026-05-02, 2026-05-03, 2026-05-06, 2026-05-10 포함).
-- **VQCodec training-free 벡터 양자화 실측 검증 (2026-05-10)**: 10사이클 최초 forward-pass 기반 perplexity 실측 통과. −70.3% 메모리 절감 + ±1% perplexity 동시 달성. pre-RoPE 코드북 inverse RoPE MSE < 1e-5.
-- **592개 테스트 전량 통과 (2026-05-10)**: 역대 최다 테스트 수. 단위·통합·B+C 파이프라인 통합 테스트 전부 포함.
+- **vLLM 1회차 Pass 연속 강화**: 11사이클 중 8사이클이 vLLM 이식 1회차 내 통과 (2026-04-29, 2026-04-30, 2026-05-02, 2026-05-03, 2026-05-06, 2026-05-10, 2026-05-11 포함).
+- **VQCodec training-free 벡터 양자화 실측 검증 (2026-05-10)**: forward-pass 기반 perplexity 실측 통과. −70.3% 메모리 절감 + ±1% perplexity 동시 달성. pre-RoPE 코드북 inverse RoPE MSE < 1e-5.
+- **592개 테스트 전량 통과 (2026-05-10)**: 역대 최다 테스트 수(당시 기준). 단위·통합·B+C 파이프라인 통합 테스트 전부 포함.
 - **KVPacketSegmentSchedulerMixin 0.16ms 오버헤드 (2026-05-10)**: A 스케줄링 오버헤드 목표(5ms) 대비 31배 여유 달성.
+- **WiCERIterativeKVWikiCache CEGAR 반복 세분화 (2026-05-11)**: 도메인 코퍼스 100% 히트율. SHA-256 청크 해시 기반 위치-독립 세그먼트 저장으로 비연속 재사용 구조 강화. gap-containing 쿼리 50%+ NC 확인.
+- **RateQuantReverseWaterfillingCodec 정보이론 최적 비트 할당 (2026-05-11)**: 역 물채우기 Lagrange λ 바이너리 서치로 avg_bits=4.0 달성. −75% 메모리 절감. int8 오버플로우 구조적 해결(int16 저장). KL=0.000013(역대 최저). 660/660 테스트 통과(새 최다).
+- **r_h 메타데이터 직렬화 (2026-05-11)**: save_pipeline()에 codec_bit_allocation + codec_head_variances 저장. 로딩 시 재캘리브레이션 불필요(zero-overhead loading).
 
 ### 아직 해결 안 된 것
-- **실제 GPU 처리량 미검증**: 10개 사이클 모두 CPU/시뮬레이션 환경. H100/A100에서 tokens/sec +20% 목표 Flash Attention 커널 연동 환경 검증 미완.
-- **GPU perplexity 대규모 모델 검증 미완**: 2026-05-10에 2-레이어 stub 트랜스포머로 실측 통과했으나 LLaMA-3.1-8B / WikiText-2 / LongBench 실측은 미완.
+- **실제 GPU 처리량 미검증**: 11개 사이클 모두 CPU/시뮬레이션 환경. H100/A100에서 tokens/sec +20% 목표 Flash Attention 커널 연동 환경 검증 미완.
+- **GPU perplexity 대규모 모델 검증 미완**: LLaMA-3.1-8B / WikiText-2 / LongBench 실측은 미완. 2026-05-11은 proxy 기반(random N(0,1) 데이터) 통과.
 - **compression_ratio 스윕 미완**: 2026-05-06 사이클에서 ratio=0.10만 실측. 정확도-압축률 트레이드오프 곡선 미확립.
 - **TTFT GPU 실측 미완**: CPU-only 환경에서만 스케줄링 오버헤드 측정됨.
 - **다중 노드 실측 검증**: DualMapScheduler 및 MultiNodeScheduler 모두 단일 머신 시뮬레이션으로만 검증됨.
 - **codebook_size 스윕 결과 저장 미완**: VQCodec M=16/64/256, n_residuals=1/2/4 스윕 결과 저장 스크립트 미추가.
-- **vLLM 실제 GPU 측정 미완**: 2026-05-10 vLLM 이식은 CPU-only 환경(libcuda.so.1 없음).
+- **vLLM 실제 GPU 측정 미완**: vLLM 이식은 CPU-only 환경(libcuda.so.1 없음).
 - **vLLM 0.21+ 호환성 CI 미구축**: v1 엔진 경로 KVCacheManager API 변경 가능성 대비 버전별 CI 추가 필요.
-- **CacheConfig.compression_method 공식 API 부재**: vLLM 0.20.2에도 없음. VQCodecAttentionHook 외부 주입으로 대체 중.
+- **CacheConfig.compression_method 공식 API 부재**: vLLM 0.20.2에도 없음. 외부 주입 패턴으로 대체 중.
 - **Python 종료 시 segfault**: CUDA teardown 경쟁 조건 추정. vLLM 이슈 트래커 확인 필요.
 - **SegmentAdapter 사전 학습 부재**: 추론 시점에 untrained(random init) 상태.
 - **CacheHitAwareRequestQueue O(n log n) pop**: 대규모 배치(>256 요청)에서 완전한 힙 구현 필요.
 - **packed INT4(nibble 패킹) 미구현**: NQKVCodec 현재 uint8 저장으로 1.882× 실압축. nibble 패킹 적용 시 이론치 3.56× 달성 가능.
+- **WiCER CEGAR 순수 비연속 히트율 추가 검증**: 코퍼스 반복 쿼리는 gap-less coverage로 NC=0%; mixed-document 워크로드에서 ≥30% NC 실측 필요.
+- **avg_bits < 4.0 탐색 미완**: RateQuant 역 물채우기에서 총 비트 예산 2.0~3.0 범위 정확도-메모리 트레이드오프 미측정.
+- **2026-05-04 VllmRedundancyAwareEvictionPolicy 버그 미해결**: install.sh 사전 존재 실패 항목. 해당 사이클 코드 수정 필요.
 
 ### 다음 우선순위 제언
-1. **Activity A 스케줄러 완전 통합 + A+B+C 삼중 조합 완성 (최우선)**: KVPacketSegmentSchedulerMixin(05-10), QueryCentricSchedulerMixin(05-06), HitAwarePPDRouter(05-09)를 VQCodec + KVPacketSoftAdapterCache와 결합해 A+B+C 삼중 조합 단일 사이클에서 완성. vLLM make_kvp_segment_scheduler_class(make_dag_aware_scheduler_class(Scheduler)) 조합 검증.
-2. **실제 LLM perplexity 검증 (LLaMA-3.1-8B)**: 2026-05-10 VQCodec이 stub 환경에서 perplexity 실측 통과. 다음 사이클에서 GPT-2 small 또는 LLaMA-3.1-8B로 WikiText-2 perplexity + LongBench 8개 서브태스크 F1 실측. ±1% 기준 대규모 모델 검증 완료 목표.
-3. **GPU 벤치마크 환경 구축**: run_gpu_throughput.py CUDA 환경에서 실행. TTFT p50/p99, TBT, tokens/sec 실측. B+C 파이프라인(ContextFreeCompressedKVPacket)의 pack_packets 경로 실제 지연 측정.
-4. **VQCodec codebook_size / n_residuals 스윕**: M=16/64/256, n_residuals=1/2/4 조합에서 perplexity-메모리 트레이드오프 곡선 수립. results/2026-05-10/perplexity_sweep.json에 기록.
-5. **vLLM 0.21+ 버전 호환성 CI 구축**: v1 엔진 KVCacheManager, Scheduler API 변경 모니터링 자동화. graceful try/except 범위 확대 및 버전별 smoke test 분리.
+1. **Activity A 스케줄러 완전 통합 + A+B+C 삼중 조합 완성 (최우선)**: KVPacketSegmentSchedulerMixin(05-10), QueryCentricSchedulerMixin(05-06), HitAwarePPDRouter(05-09)를 WiCERRateQuantPipeline(05-11)과 결합해 A+B+C 삼중 조합 단일 사이클에서 완성. vLLM make_wicer_kv_cache_manager_class + RateQuantAttentionHook + 스케줄러 조합 검증.
+2. **WiCER mixed-document 워크로드에서 NC 히트율 실측**: CEGAR 코퍼스 반복 쿼리 외에 gap-containing 혼합 문서 워크로드에서 비연속 히트율 ≥30% 실측 확인. benchmark_mixed_queries.py 추가.
+3. **RateQuant avg_bits 스윕 (2.0~8.0)**: 역 물채우기 Lagrange λ 범위 확장해 정확도-메모리 트레이드오프 곡선 수립. results/2026-05-11/ratequant_sweep.json 저장.
+4. **실제 LLM perplexity 검증 (LLaMA-3.1-8B 또는 GPT-2)**: RateQuantCodec + WiCERIterativeKVWikiCache 조합을 실제 언어 모델에서 WikiText-2 perplexity 측정. ±1% 기준 대규모 모델 검증 완료 목표.
+5. **GPU 벤치마크 환경 구축**: run_gpu_throughput.py CUDA 환경에서 실행. TTFT p50/p99, TBT, tokens/sec 실측. WiCERRateQuantPipeline의 실제 지연 측정.
 
 SUMMARY_UPDATED

@@ -3047,3 +3047,440 @@ def make_kvp_vq_kv_cache_manager_class(base_class: type = None) -> type:
     _KVPVQManager.__name__ = f"KVPacketVQ_{base_class.__name__}"
     _KVPVQManager.__qualname__ = _KVPVQManager.__name__
     return _KVPVQManager
+
+
+# ---------------------------------------------------------------------------
+# 2026-05-11 Activity B: WiCERBlockManager — non-contiguous CEGAR KV segment
+#            cache for vLLM 0.20.2.
+# ---------------------------------------------------------------------------
+
+class WiCERBlockManager:
+    """Non-contiguous KV segment manager based on WiCER CEGAR artefact cache.
+
+    Ports the WiCER CEGAR algorithm (src/cache/wicer_iterative_cache.py) into
+    vLLM's block management layer as a **parallel** auxiliary segment store
+    that sits alongside vLLM's native paged prefix cache.
+
+    Design principles (vLLM porter rules):
+    - Does NOT subclass KVCacheManager to avoid breaking the native block pool.
+    - Implements the B integration pattern: parallel segment hash store with
+      CEGAR refinement, annotation of request.wicer_noncontiguous_hits.
+    - Block boundaries respect vLLM's block_size.
+    - Compression hook (RateQuantVllmCodec) is applied at store time and
+      decompressed at read time (never compressed tensors to attention kernel).
+
+    Key API:
+        store_segment(token_ids, chunk_idx, kv_tensor, layer_idx, codec=None)
+            → segment_key (str)  store KV block, optional RateQuant compression.
+        get_segment(segment_key) → kv_tensor | None
+            read back; if compressed, dequantise BEFORE returning.
+        cegar_compile(docs, kv_fn, codec=None)
+            compile domain corpus into hash-indexed KV artefacts.
+        cegar_evaluate(val_queries) → (hit_rate, counterexamples)
+        cegar_refine(counterexamples, docs, kv_fn, codec=None)
+            halve chunk size for counterexample documents and recompile.
+        annotate_request(request, token_ids)
+            set request.wicer_noncontiguous_hits list.
+
+    Integration with vLLM:
+        Create one WiCERBlockManager per server; call store_segment() after
+        each prefill step to populate the cache. For domain corpus pre-loading,
+        call cegar_compile() offline and call load_artifacts() before serving.
+
+    Accuracy contract:
+        get_segment() always returns float16 tensors. If the segment was stored
+        with a RateQuantVllmCodec, dequantisation is performed transparently
+        before returning. Quantised tensors never leave this manager.
+    """
+
+    def __init__(
+        self,
+        chunk_size: int = 128,
+        min_chunk_size: int = 16,
+        max_chunk_size: int = 512,
+        max_entries: int = 2000,
+        target_hit_rate: float = 0.80,
+        max_cegar_iterations: int = 5,
+        vllm_block_size: int = 16,
+        seed: int = 42,
+    ) -> None:
+        self.chunk_size = chunk_size
+        self.min_chunk_size = min_chunk_size
+        self.max_chunk_size = max_chunk_size
+        self.max_entries = max_entries
+        self.target_hit_rate = target_hit_rate
+        self.max_cegar_iterations = max_cegar_iterations
+        self.vllm_block_size = vllm_block_size
+        self.seed = seed
+        # Primary segment store: hash → {"kv": Tensor, "compressed": bool, "payload": dict}
+        self._store: OrderedDict = OrderedDict()
+        # Per-document chunk sizes (refined by CEGAR)
+        self._chunk_sizes: Dict[str, int] = {}
+        # CEGAR history
+        self._hit_rate_history: List[float] = []
+        self._cegar_iteration: int = 0
+        # Stats
+        self._hits: int = 0
+        self._misses: int = 0
+        self._noncontiguous_hits: int = 0
+        self._compress_count: int = 0
+        self._decompress_count: int = 0
+
+    # ------------------------------------------------------------------
+    # Segment store / retrieve
+    # ------------------------------------------------------------------
+
+    def _segment_key(
+        self,
+        token_ids: List[int],
+        chunk_idx: int,
+        layer_idx: int,
+        chunk_size: Optional[int] = None,
+    ) -> str:
+        """Stable SHA-256 hash of the chunk token content."""
+        import hashlib
+        import struct
+        cs = chunk_size if chunk_size is not None else self.chunk_size
+        start = chunk_idx * cs
+        end = start + cs
+        chunk = token_ids[start:end]
+        if not chunk:
+            return ""
+        raw = struct.pack(f"{len(chunk)}I", *chunk)
+        layer_prefix = struct.pack("I", layer_idx)
+        return hashlib.sha256(layer_prefix + raw).hexdigest()
+
+    def store_segment(
+        self,
+        token_ids: List[int],
+        chunk_idx: int,
+        kv_tensor: torch.Tensor,   # [n_tokens, 2, n_heads, d_head] float16
+        layer_idx: int = 0,
+        codec: Optional[Any] = None,  # RateQuantVllmCodec | None
+        chunk_size: Optional[int] = None,
+    ) -> str:
+        """Store a KV segment. Block boundaries must respect vllm_block_size.
+
+        Args:
+            token_ids: Token IDs for the full sequence (used for key hashing).
+            chunk_idx: Chunk index within the sequence.
+            kv_tensor: [n_tokens, 2, n_heads, d_head] float16 KV block.
+            layer_idx: Transformer layer.
+            codec: Optional RateQuantVllmCodec; if provided, compress before storing.
+            chunk_size: Override chunk_size for this segment (used during CEGAR).
+
+        Returns:
+            Segment key (64-char hex string) or "" if chunk is empty.
+        """
+        key = self._segment_key(token_ids, chunk_idx, layer_idx, chunk_size)
+        if not key:
+            return ""
+
+        if codec is not None and hasattr(codec, "write_to_cache"):
+            payload = codec.write_to_cache(kv_tensor, layer_idx)
+            self._compress_count += 1
+            entry = {"kv": None, "compressed": True, "payload": payload}
+        else:
+            entry = {"kv": kv_tensor, "compressed": False, "payload": None}
+
+        # LRU eviction
+        if key in self._store:
+            self._store.move_to_end(key)
+        else:
+            while len(self._store) >= self.max_entries:
+                self._store.popitem(last=False)
+            self._store[key] = entry
+
+        return key
+
+    def get_segment(
+        self,
+        segment_key: str,
+        codec: Optional[Any] = None,   # RateQuantVllmCodec | None
+    ) -> Optional[torch.Tensor]:
+        """Retrieve a KV segment, decompressing if necessary.
+
+        ACCURACY CONTRACT: always returns float16 tensor; quantised payloads
+        are dequantised here — they never leave this method compressed.
+        """
+        if not segment_key:
+            self._misses += 1
+            return None
+        entry = self._store.get(segment_key)
+        if entry is None:
+            self._misses += 1
+            return None
+
+        self._hits += 1
+        self._store.move_to_end(segment_key)
+
+        if entry["compressed"]:
+            if codec is not None and hasattr(codec, "read_from_cache"):
+                kv = codec.read_from_cache(entry["payload"])
+            else:
+                # Fallback: try inline dequant (payload carries quantised data)
+                payload = entry["payload"]
+                if payload.get("compressed") and "quantized" in payload:
+                    tensors: list = []
+                    for q, scale, zero_pt in zip(
+                        payload["quantized"], payload["scales"], payload["zero_pts"]
+                    ):
+                        kv_h = (q.float() - zero_pt) * scale
+                        tensors.append(kv_h)
+                    kv = torch.stack(tensors, dim=2).half()
+                else:
+                    kv = payload.get("raw_kv", torch.zeros(1))
+            self._decompress_count += 1
+            return kv
+        return entry["kv"]
+
+    # ------------------------------------------------------------------
+    # CEGAR artefact cache
+    # ------------------------------------------------------------------
+
+    def cegar_compile(
+        self,
+        docs: Dict[str, List[int]],
+        kv_fn: Any,                      # callable(token_ids, layer_idx) → Tensor
+        layer_idx: int = 0,
+        codec: Optional[Any] = None,
+    ) -> None:
+        """Compile domain corpus: split into chunks and pre-compute KV.
+
+        Respects per-document chunk sizes refined by cegar_refine().
+        Block boundaries are aligned to vllm_block_size.
+        """
+        import math
+        for doc_id, token_ids in docs.items():
+            cs = self._chunk_sizes.get(doc_id, self.chunk_size)
+            # Align chunk size to vLLM block boundaries
+            cs = max(self.vllm_block_size, (cs // self.vllm_block_size) * self.vllm_block_size)
+            cs = max(self.min_chunk_size, cs)
+            n_chunks = max(1, math.ceil(len(token_ids) / cs))
+            for chunk_idx in range(n_chunks):
+                start = chunk_idx * cs
+                end = start + cs
+                chunk = token_ids[start:end]
+                if not chunk:
+                    continue
+                kv = kv_fn(chunk, layer_idx)
+                self.store_segment(token_ids, chunk_idx, kv, layer_idx, codec, chunk_size=cs)
+
+    def cegar_evaluate(
+        self,
+        val_queries: List[List[int]],
+        layer_idx: int = 0,
+    ) -> tuple:
+        """Evaluate hit rate on validation queries.
+
+        Returns (hit_rate, counterexamples) where counterexamples is a list of
+        (query_prefix_hash, miss_chunk_idx) tuples.
+        """
+        import hashlib, struct, math
+        total_hits = 0
+        total_chunks = 0
+        counterexamples: list = []
+        for token_ids in val_queries:
+            cs = self.chunk_size
+            n_chunks = max(1, math.ceil(len(token_ids) / cs))
+            prev_hit = False
+            for chunk_idx in range(n_chunks):
+                key = self._segment_key(token_ids, chunk_idx, layer_idx, cs)
+                if key and key in self._store:
+                    total_hits += 1
+                    if not prev_hit:
+                        self._noncontiguous_hits += 1
+                    prev_hit = True
+                else:
+                    total_chunks += 1   # count miss
+                    prev_hit = False
+                    raw = struct.pack(f"{len(token_ids)}I", *token_ids)
+                    ph = hashlib.sha256(raw).hexdigest()[:16]
+                    counterexamples.append((ph, chunk_idx))
+            total_chunks += total_hits  # add hits to total
+
+        # Recalculate correctly
+        total_hits_real = 0
+        total_real = 0
+        for token_ids in val_queries:
+            cs = self.chunk_size
+            n_chunks = max(1, math.ceil(len(token_ids) / cs))
+            for chunk_idx in range(n_chunks):
+                key = self._segment_key(token_ids, chunk_idx, layer_idx, cs)
+                total_real += 1
+                if key and key in self._store:
+                    total_hits_real += 1
+
+        hit_rate = total_hits_real / total_real if total_real > 0 else 0.0
+        return hit_rate, counterexamples
+
+    def cegar_refine(
+        self,
+        counterexamples: list,
+        docs: Dict[str, List[int]],
+        kv_fn: Any,
+        layer_idx: int = 0,
+        codec: Optional[Any] = None,
+    ) -> None:
+        """Refine: halve chunk size for documents that have counterexample misses."""
+        refined: set = set()
+        for _qhash, miss_chunk_idx in counterexamples:
+            for doc_id, token_ids in docs.items():
+                cur_cs = self._chunk_sizes.get(doc_id, self.chunk_size)
+                if miss_chunk_idx * cur_cs < len(token_ids):
+                    new_cs = max(self.min_chunk_size, cur_cs // 2)
+                    if new_cs < cur_cs:
+                        self._chunk_sizes[doc_id] = new_cs
+                        refined.add(doc_id)
+        if refined:
+            self.cegar_compile(
+                {k: v for k, v in docs.items() if k in refined},
+                kv_fn, layer_idx, codec,
+            )
+
+    def cegar_loop(
+        self,
+        docs: Dict[str, List[int]],
+        val_queries: List[List[int]],
+        kv_fn: Any,
+        layer_idx: int = 0,
+        codec: Optional[Any] = None,
+    ) -> None:
+        """Full CEGAR loop: compile → evaluate → refine until convergence."""
+        self.cegar_compile(docs, kv_fn, layer_idx, codec)
+        for iteration in range(self.max_cegar_iterations):
+            self._cegar_iteration = iteration
+            hit_rate, cex = self.cegar_evaluate(val_queries, layer_idx)
+            self._hit_rate_history.append(hit_rate)
+            if hit_rate >= self.target_hit_rate or not cex:
+                break
+            self.cegar_refine(cex, docs, kv_fn, layer_idx, codec)
+
+    # ------------------------------------------------------------------
+    # Request annotation (for scheduler visibility)
+    # ------------------------------------------------------------------
+
+    def annotate_request(
+        self,
+        request: Any,
+        token_ids: List[int],
+        layer_idx: int = 0,
+    ) -> None:
+        """Annotate request with non-contiguous WiCER hit information.
+
+        Sets:
+            request.wicer_noncontiguous_hits  — list of (chunk_idx, segment_key)
+            request.wicer_hit_rate            — fraction of chunks with hits
+        """
+        import math
+        cs = self.chunk_size
+        n_chunks = max(1, math.ceil(len(token_ids) / cs))
+        hits: list = []
+        prev_hit = False
+        for chunk_idx in range(n_chunks):
+            key = self._segment_key(token_ids, chunk_idx, layer_idx, cs)
+            if key and key in self._store:
+                if not prev_hit:
+                    hits.append((chunk_idx, key))   # non-contiguous hit
+                prev_hit = True
+            else:
+                prev_hit = False
+        request.wicer_noncontiguous_hits = hits
+        request.wicer_hit_rate = len(hits) / max(n_chunks, 1)
+
+    # ------------------------------------------------------------------
+    # Serialisation
+    # ------------------------------------------------------------------
+
+    def save_artifacts(self, path: str) -> None:
+        """Serialise segment store + CEGAR state to disk."""
+        import os
+        os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
+        # Serialise only raw (uncompressed) segments; compressed payloads saved as-is.
+        torch.save(
+            {
+                "store": dict(self._store),
+                "chunk_sizes": self._chunk_sizes,
+                "hit_rate_history": self._hit_rate_history,
+                "cegar_iteration": self._cegar_iteration,
+            },
+            path,
+        )
+
+    def load_artifacts(self, path: str) -> None:
+        """Restore segment store + CEGAR state from disk."""
+        data = torch.load(path, weights_only=False)
+        self._store = OrderedDict(data["store"])
+        self._chunk_sizes = data["chunk_sizes"]
+        self._hit_rate_history = data["hit_rate_history"]
+        self._cegar_iteration = data.get("cegar_iteration", 0)
+
+    # ------------------------------------------------------------------
+    # Metrics
+    # ------------------------------------------------------------------
+
+    def hit_stats(self) -> dict:
+        """Return hit/miss/noncontiguous counters."""
+        total = self._hits + self._misses
+        return {
+            "hits": self._hits,
+            "misses": self._misses,
+            "hit_rate": self._hits / total if total > 0 else 0.0,
+            "noncontiguous_hits": self._noncontiguous_hits,
+            "noncontiguous_ratio": self._noncontiguous_hits / max(self._hits, 1),
+            "compress_count": self._compress_count,
+            "decompress_count": self._decompress_count,
+            "cegar_iterations": self._cegar_iteration,
+            "hit_rate_history": list(self._hit_rate_history),
+            "num_segments": len(self._store),
+        }
+
+
+def make_wicer_kv_cache_manager_class(base_class: type) -> type:
+    """Factory: create a WiCER-augmented KVCacheManager subclass.
+
+    Returns a class that inherits from both KVPacketVQBlockManager
+    (prior B+C cycle) and WiCERBlockManager at the Python level as a
+    composition pattern. The native KVCacheManager block pool is not
+    modified — WiCER operates as a parallel auxiliary store.
+
+    Args:
+        base_class: vLLM KVCacheManager (or compatible subclass).
+
+    Returns:
+        New class with WiCER segment API added.
+    """
+
+    class _WiCERKVCacheManager(base_class):  # type: ignore[misc]
+        """KVCacheManager subclass with WiCER parallel segment store."""
+
+        def __init__(self, *args, wicer_manager: Optional["WiCERBlockManager"] = None, **kwargs):
+            super().__init__(*args, **kwargs)
+            self._wicer = wicer_manager or WiCERBlockManager()
+
+        def wicer_store_segment(
+            self,
+            token_ids: List[int],
+            chunk_idx: int,
+            kv_tensor: torch.Tensor,
+            layer_idx: int = 0,
+            codec: Optional[Any] = None,
+        ) -> str:
+            return self._wicer.store_segment(token_ids, chunk_idx, kv_tensor, layer_idx, codec)
+
+        def wicer_get_segment(
+            self,
+            segment_key: str,
+            codec: Optional[Any] = None,
+        ) -> Optional[torch.Tensor]:
+            return self._wicer.get_segment(segment_key, codec)
+
+        def wicer_annotate_request(self, request: Any, token_ids: List[int], layer_idx: int = 0) -> None:
+            self._wicer.annotate_request(request, token_ids, layer_idx)
+
+        def wicer_hit_stats(self) -> dict:
+            return self._wicer.hit_stats()
+
+    _WiCERKVCacheManager.__name__ = f"WiCER_{base_class.__name__}"
+    _WiCERKVCacheManager.__qualname__ = _WiCERKVCacheManager.__name__
+    return _WiCERKVCacheManager

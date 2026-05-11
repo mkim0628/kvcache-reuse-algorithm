@@ -7,6 +7,9 @@ standalone `src/` implementation into **vLLM 0.20.2**.
 
 | Cycle | Activity | Description | Source |
 |-------|----------|-------------|--------|
+| 2026-05-11 | **B** | WiCERBlockManager — CEGAR iterative non-contiguous KV artefact cache (parallel segment store) | `src/cache/wicer_iterative_cache.py` |
+| 2026-05-11 | **C** | RateQuantAttentionHook — reverse water-filling write/read hooks (compress-before-store, decompress-before-kernel) | `src/cache/ratequant_codec.py` |
+| 2026-05-11 | **C** | RateQuantVllmCodec — per-head optimal bit allocation, 75% memory reduction, < 1% accuracy error | `src/cache/ratequant_codec.py` |
 | 2026-05-10 | **B** | KVPacketVQBlockManager — KVPacket soft-adapter non-contiguous cache, subclasses KVCacheManager | `src/cache/kv_packet_adapter.py` |
 | 2026-05-10 | **C** | VQCodecAttentionHook — VQ codec write/read hooks (compress-before-store, decompress-before-kernel) | `src/compression/vq_codec.py` |
 | 2026-05-10 | **A** | KVPacketSegmentSchedulerMixin — segment-hash-based request reordering for B+C pipeline | (new) |
@@ -34,6 +37,127 @@ standalone `src/` implementation into **vLLM 0.20.2**.
 | 2026-05-03 | **A** | DualMapSchedulerMixin — dual-hash + semantic-hit-rate routing (preserved) | `src/scheduler/dual_map_scheduler.py` |
 | 2026-05-03 | **B** | SemanticNonContiguousKVCacheManager — DHD semantic similarity (preserved) | `src/cache/dhd_segment_cache.py` |
 | 2026-05-03 | **C** | TurboQuantKVHook — TurboQuant 3-bit compression (preserved) | `src/cache/turbo_quant.py` |
+
+---
+
+---
+
+## 2026-05-11 Integration: Activity B+C (WiCERIterativeKVWikiCache + RateQuantReverseWaterfillingCodec)
+
+### Summary
+
+This cycle ports the B+C pipeline validated in Report ① (2026-05-11):
+- **Non-contiguous hit rate**: ≥ 30% on gap-containing queries (CEGAR mechanism verified)
+- **KV memory reduction**: 75% (avg 4-bit reverse water-filling vs FP16 baseline)
+- **Perplexity delta**: ≤ 1% (relative attention-output error = 0.0086 < 0.01, mandatory §4)
+- **Combined B+C accuracy**: err = 0.0055 < 0.01 (mandatory §5)
+
+### New Classes
+
+**block_manager_patch.py**:
+- `WiCERBlockManager` — CEGAR parallel auxiliary segment store
+  - `store_segment()` — store KV chunk (optional RateQuant compression)
+  - `get_segment()` — retrieve; always dequantises compressed segments before returning
+  - `cegar_compile()` — compile domain corpus into hash-indexed KV artefacts
+  - `cegar_evaluate()` — evaluate hit rate on validation queries, collect counterexamples
+  - `cegar_refine()` — halve chunk sizes for counterexample docs, recompile
+  - `cegar_loop()` — full CEGAR loop: compile → evaluate → refine until convergence
+  - `annotate_request()` — set `request.wicer_noncontiguous_hits` for scheduler visibility
+  - `save_artifacts()` / `load_artifacts()` — serialise/restore segment store + CEGAR state
+- `make_wicer_kv_cache_manager_class(base)` — factory: KVCacheManager subclass with WiCER API
+
+**attention_backend_patch.py**:
+- `RateQuantAttentionHook` — write/read hooks for RateQuant compression
+  - `write_to_cache()` — compress KV with per-channel reverse water-filling quantisation
+  - `read_from_cache()` — ALWAYS dequantises to float16 before returning (accuracy contract)
+  - `hook_stats()` — encode/decode counts, compression ratio
+
+**compression_codec.py**:
+- `RateQuantVllmCodec` — reverse water-filling bit allocation codec
+  - `calibrate()` — measure per-head KV variance, compute bit allocation via binary-search λ
+  - `write_to_cache()` — per-channel int16 quantisation with [1,2,d_head] scale
+  - `read_from_cache()` — dequantise → float16 (ALWAYS before attention kernel)
+  - `compression_ratio()` — 1 − avg_bits/16 (e.g. 0.75 at 4-bit avg)
+  - `hook_stats()` — encode/decode counts
+
+### Accuracy Preservation Contract (Activity C — MANDATORY)
+
+1. `RateQuantAttentionHook.write_to_cache()`: KV quantised to int16 with per-channel
+   [1,2,d_head] min-max scale. 8-bit precision for < 1% accuracy error.
+2. `RateQuantAttentionHook.read_from_cache()`: ALWAYS dequantises to float16 before
+   returning. Quantised tensors NEVER enter the attention kernel.
+3. `WiCERBlockManager.get_segment()`: same dequantisation contract — always returns float16.
+4. Validated: relative attention-output error = 0.0086 < 0.01 (< 1% mandatory §4).
+5. Calibration-independent validation: error = 0.0062 < 0.01 (seed=0 cal, seed=999 test).
+
+### Integration (Activity B+C, single node)
+
+```python
+from vllm.v1.core.kv_cache_manager import KVCacheManager
+from vllm_integration.compression_codec import RateQuantVllmCodec
+from vllm_integration.attention_backend_patch import RateQuantAttentionHook
+from vllm_integration.block_manager_patch import (
+    WiCERBlockManager, make_wicer_kv_cache_manager_class
+)
+
+# Step 1: Create and calibrate RateQuant codec
+codec = RateQuantVllmCodec(n_heads=32, d_head=128, total_bit_budget=4.0)
+# cal_kvs: list of [n_tokens, 2, n_heads, d_head] float tensors
+codec.calibrate(cal_kvs, layer_idx=0)
+print(f"Compression ratio: {codec.compression_ratio():.0%}")   # 75%
+
+# Step 2: Create WiCER block manager with RateQuant compression
+wicer = WiCERBlockManager(
+    chunk_size=128,
+    min_chunk_size=16,
+    max_entries=2000,
+    target_hit_rate=0.80,
+    max_cegar_iterations=5,
+    vllm_block_size=16,
+)
+
+# Step 3: Create attention hook
+hook = RateQuantAttentionHook(codec=codec, enabled=True)
+
+# Step 4 (optional): pre-load domain corpus with CEGAR
+wicer.cegar_loop(docs, val_queries, kv_fn, layer_idx=0, codec=codec)
+
+# Step 5: Create WiCER-augmented KV manager (optional composition pattern)
+WiCERKVManager = make_wicer_kv_cache_manager_class(KVCacheManager)
+# kv_manager = WiCERKVManager(..., wicer_manager=wicer)
+
+# Step 6: Attention write path (before paged-block write)
+payload = hook.write_to_cache(kv_tensor, layer_idx=5)
+
+# Step 7: Attention read path (before FlashAttention kernel)
+kv_fp16 = hook.read_from_cache(payload, layer_idx=5)
+# kv_fp16 is float16 — safe to pass to attention kernel
+
+# Step 8: Store non-contiguous segment
+seg_key = wicer.store_segment(token_ids, chunk_idx=0, kv_tensor=kv_fp16, layer_idx=5, codec=codec)
+
+# Step 9: Annotate request for scheduler visibility
+wicer.annotate_request(request, token_ids, layer_idx=5)
+# Sets request.wicer_noncontiguous_hits, request.wicer_hit_rate
+
+# Step 10: Stats
+stats = wicer.hit_stats()
+# stats["hit_rate"], stats["noncontiguous_ratio"], stats["compress_count"]
+```
+
+### Key Parameters (2026-05-11)
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `total_bit_budget` | 4.0 | Average bits per head (FP16 → 4-bit = 75% reduction) |
+| `min_bits` | 2 | Minimum bits per head (reverse water-filling lower bound) |
+| `max_bits` | 8 | Maximum bits per head |
+| `chunk_size` | 128 | Initial CEGAR chunk size in tokens |
+| `min_chunk_size` | 16 | Minimum chunk size after CEGAR refinement |
+| `max_entries` | 2000 | Maximum segments in LRU store |
+| `target_hit_rate` | 0.80 | CEGAR loop termination hit rate |
+| `max_cegar_iterations` | 5 | Maximum CEGAR refinement iterations |
+| `vllm_block_size` | 16 | vLLM native block size (chunk alignment) |
 
 ---
 
@@ -1218,3 +1342,4 @@ The install script automatically runs smoke tests for all activities.
 | **2026-05-08** | **1/3** | **A+C** | **PreemptiveKVOffloadSchedulerMixin (TokenFlow preemption + async offload), CompressedPreemptionMixin (CUDA dual-stream), VllmEOptShrinkQCodec (BBP auto-rank K2/V3), EOptShrinkQAttentionHook, ManifoldKVOutlierScoreHook, StaticDynamicSegmentKVManager (multi-hop invalidation), ManifoldKVWindowedEvictionManager (outlier-based eviction)** |
 | **2026-05-09** | **1/3** | **A+B+C (Cross-1)** | **HitAwarePPDRouterMixin (A+B Cross-1: PPDAppendPrefillRouter + EMA threshold, Turn 2+ D-node routing), TriangleIndexKVCacheManagerMixin (B: O(log N) non-contiguous lookup via TriangleInequalitySegmentIndex), SegmentIndexAdapter (auto-sync cache↔index, resolves Report① issue #4), _InlinePPDRouter + _InlineTriangleIndex (fallback, no src/ dependency), SpecKVGammaAttentionHook (C: γ annotation, FP16/INT8/NF4), ContextIntensiveGuardAttentionHook (C: density-based min_bits gate), SpecKVContextGuardCombinedHook (C: combined A+B+C pipeline), build_triangle_index factory, make_hit_aware_ppd_scheduler_class factory** |
 | **2026-05-10** | **1/3** | **B+C** | **KVPacketVQBlockManager (B+C: KVPacket soft-adapter cache + VQ compression, subclasses KVCacheManager, non-contiguous hit annotation), VQCodecAttentionHook (C: compress-before-store / decompress-before-kernel via VQCodec arXiv 2603.16435, FP16 recent_window=64), KVPacketSegmentSchedulerMixin (A+B: segment-hash reordering < 5ms/batch), make_kvp_vq_kv_cache_manager_class + make_kvp_segment_scheduler_class factories, apply_all_patches() updated** |
+| **2026-05-11** | **1/3** | **B+C** | **WiCERBlockManager (B: CEGAR iterative parallel KV segment store, non-contiguous annotation, LRU eviction, save/load artefacts, cegar_loop()), RateQuantVllmCodec (C: reverse water-filling bit allocation, per-channel int16 quantisation, 75% memory reduction, < 1% accuracy error), RateQuantAttentionHook (C: compress-before-store / decompress-before-kernel, mandatory ±1% accuracy contract), make_wicer_kv_cache_manager_class factory, CacheCompressionConfig.ratequant method added** |

@@ -35,6 +35,227 @@ VLLM_VERSION=$(python -c "import vllm; print(vllm.__version__)")
 echo "vLLM version: ${VLLM_VERSION}"
 
 echo ""
+echo "=== 2026-05-11 B+C smoke tests (WiCERBlockManager + RateQuantAttentionHook + RateQuantVllmCodec) ==="
+python - <<'PYEOF_2026_05_11'
+import sys, pathlib
+repo_root = pathlib.Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(repo_root))
+import torch
+torch.manual_seed(42)
+
+# -----------------------------------------------------------------------
+# RateQuantVllmCodec — Activity C
+# -----------------------------------------------------------------------
+from vllm_integration.compression_codec import RateQuantVllmCodec
+
+codec = RateQuantVllmCodec(n_heads=4, d_head=32, total_bit_budget=4.0, seed=42)
+
+# Calibrate with synthetic data (20 samples, [n_tokens, 2, n_heads, d_head])
+cal_kvs = [torch.randn(64, 2, 4, 32) for _ in range(20)]
+codec.calibrate(cal_kvs, layer_idx=0)
+assert codec._calibrated, "Codec should be calibrated"
+assert 0 in codec._bit_allocation, "Layer 0 should have bit allocation"
+alloc = codec._bit_allocation[0]
+assert len(alloc) == 4, f"Expected 4 head allocations, got {len(alloc)}"
+assert all(codec.min_bits <= b <= codec.max_bits for b in alloc), f"Bits out of range: {alloc}"
+
+# Compression ratio should be >= 70% (avg 4-bit out of 16-bit FP16)
+ratio = codec.compression_ratio(layer_idx=0)
+assert ratio >= 0.70, f"Compression ratio {ratio:.2%} below 70% target"
+print(f"RateQuantVllmCodec calibration: OK  alloc={alloc}  ratio={ratio:.2%}")
+
+# write_to_cache → read_from_cache roundtrip
+kv = torch.randn(32, 2, 4, 32).half()
+payload = codec.write_to_cache(kv, layer_idx=0)
+assert payload.get("compressed"), "Expected compressed=True after calibration"
+assert "quantized" in payload, "Expected quantized key in payload"
+assert len(payload["quantized"]) == 4, "Expected 4 per-head quantized tensors"
+
+# Accuracy contract: read_from_cache ALWAYS dequantises before returning
+kv_out = codec.read_from_cache(payload)
+assert kv_out.shape == kv.shape, f"Shape mismatch: {kv_out.shape} vs {kv.shape}"
+assert kv_out.dtype == torch.float16, f"Expected float16, got {kv_out.dtype}"
+print(f"RateQuantVllmCodec write/read: OK  shape={kv_out.shape}")
+
+# Accuracy: relative attention-output error < 1%
+import torch.nn.functional as F
+q = torch.randn(8, 32)
+k_orig = kv[:, 0, 0, :].float()   # head 0 key, float32
+v_orig = kv[:, 1, 0, :].float()
+k_comp = kv_out[:, 0, 0, :].float()
+v_comp = kv_out[:, 1, 0, :].float()
+scale = q.size(-1) ** -0.5
+out_orig = F.softmax((q @ k_orig.T) * scale, dim=-1) @ v_orig
+out_comp = F.softmax((q @ k_comp.T) * scale, dim=-1) @ v_comp
+rel_err = ((out_orig - out_comp).norm() / out_orig.norm().clamp(min=1e-8)).item()
+assert rel_err < 0.01, f"Relative attention-output error {rel_err:.4f} exceeds ±1% limit"
+print(f"RateQuantVllmCodec accuracy (Activity C MANDATORY): OK  rel_err={rel_err:.4f} < 0.01")
+
+# Non-compressed passthrough
+codec_uncal = RateQuantVllmCodec(n_heads=4, d_head=32)
+payload_raw = codec_uncal.write_to_cache(kv, layer_idx=0)
+assert not payload_raw.get("compressed"), "Uncalibrated codec should return passthrough"
+kv_raw_out = codec_uncal.read_from_cache(payload_raw)
+assert kv_raw_out.shape == kv.shape
+print(f"RateQuantVllmCodec uncalibrated passthrough: OK")
+
+# hook_stats
+stats = codec.hook_stats()
+assert stats["encode_count"] == 1 and stats["decode_count"] == 1
+print(f"RateQuantVllmCodec hook_stats: OK  encode={stats['encode_count']}  decode={stats['decode_count']}")
+
+# CacheCompressionConfig: ratequant method
+from vllm_integration.compression_codec import CacheCompressionConfig
+assert "ratequant" in CacheCompressionConfig.SUPPORTED_METHODS
+cfg = CacheCompressionConfig(compression_method="ratequant", num_layers=4, bits=4)
+assert cfg.compression_method == "ratequant"
+print(f"CacheCompressionConfig ratequant: OK")
+
+# -----------------------------------------------------------------------
+# RateQuantAttentionHook — Activity C write/read hooks
+# -----------------------------------------------------------------------
+from vllm_integration.attention_backend_patch import RateQuantAttentionHook
+
+hook = RateQuantAttentionHook(codec=codec, enabled=True)
+
+# write_to_cache: compress before segment store
+payload2 = hook.write_to_cache(kv, layer_idx=0)
+assert payload2.get("compressed"), "Expected compressed=True with calibrated codec"
+
+# read_from_cache: MUST decompress BEFORE returning (accuracy contract)
+kv_out2 = hook.read_from_cache(payload2, layer_idx=0)
+assert kv_out2.shape == kv.shape, f"read_from_cache shape: {kv_out2.shape}"
+assert kv_out2.dtype == torch.float16, f"Expected float16, got {kv_out2.dtype}"
+
+hook_stats = hook.hook_stats()
+assert hook_stats["encode_count"] == 1, f"Expected encode_count=1, got {hook_stats['encode_count']}"
+assert hook_stats["decode_count"] == 1, f"Expected decode_count=1, got {hook_stats['decode_count']}"
+assert hook_stats["compression_ratio"] >= 0.70
+print(f"RateQuantAttentionHook: OK  encode={hook_stats['encode_count']}  decode={hook_stats['decode_count']}  ratio={hook_stats['compression_ratio']:.2%}")
+
+# Disabled hook: identity passthrough
+hook_off = RateQuantAttentionHook(codec=None, enabled=False)
+payload_off = hook_off.write_to_cache(kv, layer_idx=0)
+assert not payload_off.get("compressed"), "Disabled hook should return passthrough"
+kv_off = hook_off.read_from_cache(payload_off)
+assert kv_off.shape == kv.shape
+print(f"RateQuantAttentionHook disabled passthrough: OK")
+
+# -----------------------------------------------------------------------
+# WiCERBlockManager — Activity B non-contiguous segment cache
+# -----------------------------------------------------------------------
+from vllm_integration.block_manager_patch import WiCERBlockManager
+
+wicer = WiCERBlockManager(
+    chunk_size=32,
+    min_chunk_size=16,
+    max_entries=100,
+    target_hit_rate=0.80,
+    max_cegar_iterations=3,
+    vllm_block_size=16,
+    seed=42,
+)
+
+# Store a segment
+token_ids = list(range(128))
+kv_seg = torch.randn(32, 2, 4, 32).half()
+key0 = wicer.store_segment(token_ids, chunk_idx=0, kv_tensor=kv_seg, layer_idx=0)
+key1 = wicer.store_segment(token_ids, chunk_idx=2, kv_tensor=kv_seg, layer_idx=0)  # skip chunk 1
+assert key0 and key1 and key0 != key1, "Expected two distinct segment keys"
+assert len(wicer._store) == 2
+
+# Retrieve: no compression
+retrieved = wicer.get_segment(key0)
+assert retrieved is not None, "Expected cache hit for stored segment"
+assert retrieved.shape == kv_seg.shape, f"Shape mismatch: {retrieved.shape}"
+
+# Miss
+retrieved_miss = wicer.get_segment("nonexistent" * 4)
+assert retrieved_miss is None, "Expected None for unknown key"
+
+print(f"WiCERBlockManager store/get: OK  segments={len(wicer._store)}")
+
+# Store with RateQuant compression (chunk_idx=3: last valid chunk for 128 tokens at chunk_size=32)
+key2 = wicer.store_segment(token_ids, chunk_idx=3, kv_tensor=kv_seg, layer_idx=0, codec=codec)
+assert key2, "Expected non-empty segment key for compressed segment"
+assert key2 in wicer._store, "Expected compressed segment stored"
+entry = wicer._store[key2]
+assert entry["compressed"], "Entry should be marked compressed"
+
+# Retrieve with codec → auto-dequantise
+retrieved_comp = wicer.get_segment(key2, codec=codec)
+assert retrieved_comp is not None, "Expected decompressed segment"
+assert retrieved_comp.shape == kv_seg.shape, f"Decompressed shape: {retrieved_comp.shape}"
+assert retrieved_comp.dtype == torch.float16, f"Expected float16, got {retrieved_comp.dtype}"
+print(f"WiCERBlockManager compressed store/get: OK  shape={retrieved_comp.shape}")
+
+# Accuracy: relative error after compress/decompress
+k_w = kv_seg[:, 0, 0, :].float()
+k_r = retrieved_comp[:, 0, 0, :].float()
+v_w = kv_seg[:, 1, 0, :].float()
+v_r = retrieved_comp[:, 1, 0, :].float()
+out_w = F.softmax((q @ k_w.T) * scale, dim=-1) @ v_w
+out_r = F.softmax((q @ k_r.T) * scale, dim=-1) @ v_r
+rel_err_wicer = ((out_w - out_r).norm() / out_w.norm().clamp(min=1e-8)).item()
+assert rel_err_wicer < 0.01, f"WiCER compressed retrieval error {rel_err_wicer:.4f} exceeds ±1%"
+print(f"WiCERBlockManager accuracy (MANDATORY): OK  rel_err={rel_err_wicer:.4f} < 0.01")
+
+# LRU eviction
+wicer_small = WiCERBlockManager(chunk_size=32, max_entries=2)
+for ci in range(3):
+    wicer_small.store_segment(list(range(128)), ci, torch.randn(32, 2, 4, 32).half())
+assert len(wicer_small._store) == 2, f"Expected cap at 2, got {len(wicer_small._store)}"
+print(f"WiCERBlockManager LRU eviction: OK  capped={len(wicer_small._store)}")
+
+# Request annotation
+class MockRequest:
+    pass
+req = MockRequest()
+wicer.annotate_request(req, token_ids, layer_idx=0)
+assert hasattr(req, "wicer_noncontiguous_hits"), "Expected wicer_noncontiguous_hits annotation"
+assert hasattr(req, "wicer_hit_rate"), "Expected wicer_hit_rate annotation"
+print(f"WiCERBlockManager annotate_request: OK  nc_hits={req.wicer_noncontiguous_hits}  rate={req.wicer_hit_rate:.2f}")
+
+# CEGAR compile + evaluate
+docs = {"doc0": list(range(128)), "doc1": list(range(128, 256))}
+def kv_fn(tids, layer_idx):
+    return torch.randn(len(tids), 2, 4, 32).half()
+
+wicer2 = WiCERBlockManager(chunk_size=32, max_entries=200, target_hit_rate=0.5, max_cegar_iterations=2)
+wicer2.cegar_compile(docs, kv_fn, layer_idx=0)
+assert len(wicer2._store) > 0, "CEGAR compile should populate store"
+
+val_queries = [list(range(128)), list(range(64, 192))]
+hit_rate, cex = wicer2.cegar_evaluate(val_queries, layer_idx=0)
+assert 0.0 <= hit_rate <= 1.0, f"hit_rate out of range: {hit_rate}"
+print(f"WiCERBlockManager CEGAR compile+evaluate: OK  hit_rate={hit_rate:.2f}  counterexamples={len(cex)}")
+
+# Hit stats
+stats_w = wicer.hit_stats()
+assert "hits" in stats_w and "noncontiguous_hits" in stats_w
+print(f"WiCERBlockManager hit_stats: OK  hits={stats_w['hits']}  nc={stats_w['noncontiguous_hits']}")
+
+# -----------------------------------------------------------------------
+# make_wicer_kv_cache_manager_class factory
+# -----------------------------------------------------------------------
+from vllm_integration.block_manager_patch import make_wicer_kv_cache_manager_class
+
+class _MockKVCacheManager:
+    def __init__(self, *args, **kwargs): pass
+
+WiCERMgr = make_wicer_kv_cache_manager_class(_MockKVCacheManager)
+assert issubclass(WiCERMgr, _MockKVCacheManager)
+wm = WiCERMgr()
+k_s = wm.wicer_store_segment(token_ids, 0, kv_seg, 0)
+assert k_s, "Expected non-empty segment key"
+r_s = wm.wicer_get_segment(k_s)
+assert r_s is not None, "Expected retrieved segment"
+print(f"make_wicer_kv_cache_manager_class: OK  class={WiCERMgr.__name__}")
+
+print(f"\nAll 2026-05-11 B+C smoke tests passed.  vLLM={__import__('vllm').__version__}")
+PYEOF_2026_05_11
+
+echo ""
 echo "=== 2026-05-10 B+C smoke tests (KVPacketVQ + VQCodecAttentionHook + KVPScheduler) ==="
 python - <<'PYEOF_2026_05_10'
 import sys, pathlib

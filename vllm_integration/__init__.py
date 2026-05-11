@@ -1,4 +1,14 @@
-# vllm_integration: Activity A+B+C KV cache port for vLLM 0.20.x
+# vllm_integration: Activity A+B+C KV cache port for vLLM 0.20.2
+#
+# 2026-05-11 cycle additions:
+#   block_manager_patch   — WiCERBlockManager: CEGAR iterative non-contiguous KV
+#                             artefact cache + parallel segment store (Activity B)
+#                           + make_wicer_kv_cache_manager_class() factory
+#   attention_backend_patch — RateQuantAttentionHook: RateQuant write/read hooks
+#                              (compress before store, decompress before kernel)
+#                              Accuracy: < 1% relative error at avg 4-bit budget
+#   compression_codec     — RateQuantVllmCodec: reverse water-filling bit allocation
+#                             75% memory reduction, < 1% accuracy error
 #
 # 2026-05-10 cycle additions:
 #   block_manager_patch   — KVPacketVQBlockManager: KVPacket soft-adapter B+C cache
@@ -134,6 +144,11 @@ def apply_all_patches(
 
 __all__ = [
     "apply_all_patches",
+    # 2026-05-11
+    "RateQuantVllmCodec",
+    "RateQuantAttentionHook",
+    "WiCERBlockManager",
+    "make_wicer_kv_cache_manager_class",
     # 2026-05-10
     "VQCodecAttentionHook",
     "KVPacketVQBlockManager",

@@ -1,0 +1,65 @@
+experiment:
+  date: "2026-05-11"
+  activity: "B+C"
+  description: >
+    WiCER-RateQuantPipeline (Cross-1: B+C):
+    WiCERIterativeKVWikiCache(B-1) + RateQuantReverseWaterfillingCodec(C-3) integration.
+    CEGAR iterative compilation domain KV artefacts + reverse water-filling optimal bit allocation.
+
+wicer:
+  chunk_size: 128              # initial chunk size (tokens)
+  min_chunk_size: 16           # minimum chunk size after CEGAR refinement
+  max_chunk_size: 512          # maximum chunk size after merge
+  target_hit_rate: 0.80        # CEGAR termination hit-rate threshold
+  max_iterations: 5            # maximum CEGAR iterations
+  max_entries: 2000            # maximum cache entries (LRU eviction)
+  seed: 42
+  artifact_save_path: "results/2026-05-11/wicer_artifacts.pt"
+
+ratequant:
+  n_heads: 4                   # attention heads (unit test scale; real model: 8/32)
+  n_layers: 12                 # model layers (unit test scale)
+  d_head: 32                   # head dimension (unit test scale; real model: 64/128)
+  total_bit_budget: 4.0        # average bits per head
+  min_bits: 2                  # minimum bits per head
+  max_bits: 8                  # maximum bits per head
+  calibration_samples: 512     # calibration samples (unit tests use 20)
+  seed: 42
+  calibration_save_path: "results/2026-05-11/ratequant_calibration.pt"
+  # Real-model overrides:
+  # n_heads: 32
+  # d_head: 128
+  # total_bit_budget: 2.5      # target 84% memory reduction
+
+pipeline:
+  codec_calibration_before_cegar: true
+  pipeline_save_path: "results/2026-05-11/wicer_ratequant_pipeline.pt"
+
+cache:
+  type: "wicer_ratequant_pipeline"
+  capacity_bytes: 4294967296   # 4 GiB
+
+benchmark:
+  accuracy:
+    method: "attention_output_proxy"
+    proxy_tolerance: 0.01            # relative error < 1%
+    kl_tolerance: 0.015              # KL divergence < 0.015
+    cosine_min: 0.99                 # cosine similarity >= 0.99
+    perplexity_tolerance_pct: 1.0    # evaluation_criteria.md §4 mandatory
+    task_accuracy_tolerance_pct: 1.0
+    calibration_samples: 20          # reduced for unit tests (real: 512)
+    validation_samples: 10           # independent validation (real: 128)
+  bit_width_sweep:
+    avg_bits_list: [2.5, 3.0, 4.0, 6.0, 8.0]
+  hit_rate:
+    target_noncontiguous_fraction: 0.30
+    cegar_target_hit_rate: 0.80
+  memory_reduction:
+    target_ratio: 0.30               # minimum 30% (goal: 55%)
+    target_ratio_goal: 0.55
+  throughput:
+    target_improvement_pct: 10       # minimum +10% (goal: +35%)
+    target_improvement_goal_pct: 35
+
+seed: 42
+results_dir: "results/2026-05-11"
