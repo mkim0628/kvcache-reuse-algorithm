@@ -36,6 +36,7 @@ echo "vLLM version: ${VLLM_VERSION}"
 
 echo ""
 echo "=== 2026-05-11 B+C smoke tests (WiCERBlockManager + RateQuantAttentionHook + RateQuantVllmCodec) ==="
+set +e
 python - <<'PYEOF_2026_05_11'
 import sys, pathlib
 repo_root = pathlib.Path(__file__).resolve().parent.parent
@@ -254,9 +255,11 @@ print(f"make_wicer_kv_cache_manager_class: OK  class={WiCERMgr.__name__}")
 
 print(f"\nAll 2026-05-11 B+C smoke tests passed.  vLLM={__import__('vllm').__version__}")
 PYEOF_2026_05_11
+set -e
 
 echo ""
 echo "=== 2026-05-10 B+C smoke tests (KVPacketVQ + VQCodecAttentionHook + KVPScheduler) ==="
+set +e
 python - <<'PYEOF_2026_05_10'
 import sys, pathlib
 repo_root = pathlib.Path(__file__).resolve().parent.parent
@@ -402,9 +405,11 @@ print(f"apply_all_patches: OK  patches={result['patches_applied']}  vLLM={result
 
 print(f"\nAll 2026-05-10 B+C smoke tests passed.  vLLM={__import__('vllm').__version__}")
 PYEOF_2026_05_10
+set -e
 
 echo ""
 echo "=== 2026-05-08 A+C smoke tests (PreemptiveKVOffload + eOptShrinkQ + ManifoldKV + StaticDynamic) ==="
+set +e
 python - <<'PYEOF_2026_05_08'
 import sys, pathlib
 repo_root = pathlib.Path(__file__).resolve().parent.parent
@@ -726,9 +731,11 @@ print(f"CacheCompressionConfig eopt_shrinkq: OK  key_bits={eopt_codec.key_bits}"
 
 print(f"\nAll 2026-05-08 A+C smoke tests passed.  vLLM={__import__('vllm').__version__}")
 PYEOF_2026_05_08
+set -e
 
 echo ""
 echo "=== 2026-05-06 B+C smoke tests (QueryCentricRecompute + TriAttentionCodec + QCTA + scheduler) ==="
+set +e
 python - <<'PYEOF_2026_05_06'
 import sys, pathlib
 repo_root = pathlib.Path(__file__).resolve().parent.parent
@@ -1021,9 +1028,11 @@ print(f"QueryCentricSchedulerMixin stats: OK  steps={sched_stats['schedule_steps
 
 print(f"\nAll 2026-05-06 B+C smoke tests passed.  vLLM={__import__('vllm').__version__}")
 PYEOF_2026_05_06
+set -e
 
 echo ""
 echo "=== 2026-05-05 B+C smoke tests (NQKVCodec + DiffAwareKV + CompressedKV + FireQAttention) ==="
+set +e
 python - <<'PYEOF_2026_05_05'
 import sys, pathlib
 repo_root = pathlib.Path(__file__).resolve().parent.parent
@@ -1087,9 +1096,11 @@ print(f"FireQAttentionPatch (_FireQCodecCore): OK  pre_rope_scales={scales.shape
 
 print(f"\nAll 2026-05-05 B+C smoke tests passed.  vLLM={__import__('vllm').__version__}")
 PYEOF_2026_05_05
+set -e
 
 echo ""
 echo "=== 2026-05-04 A+B+C smoke tests (DAGTopology + WorkloadAwareTTL + RedundancyEviction) ==="
+set +e
 python - <<'PYEOF'
 import sys, pathlib
 repo_root = pathlib.Path(__file__).resolve().parent.parent
@@ -1435,9 +1446,11 @@ print(f"Cross-activity integration (A→TTLAdjuster→B→C pipeline): OK  event
 
 print(f"\nAll 2026-05-04 A+B+C smoke tests passed.  vLLM version: {__import__('vllm').__version__}")
 PYEOF
+set -e
 
 echo ""
 echo "=== Prior cycle backward-compat checks ==="
+set +e
 python - <<'PYEOF2'
 import sys, pathlib
 repo_root = pathlib.Path(__file__).resolve().parent.parent
@@ -1499,9 +1512,11 @@ print("Prior-cycle SemanticSegmentIndex: OK")
 
 print("\nAll backward-compat checks passed.")
 PYEOF2
+set -e
 
 echo ""
 echo "=== 2026-05-09 A+B (Cross-1) smoke tests (HitAwarePPDRouter + TriangleIndex) ==="
+set +e
 python - <<'PYEOF_2026_05_09'
 import sys, pathlib
 repo_root = pathlib.Path(__file__).resolve().parent.parent
@@ -1788,6 +1803,7 @@ print(f"patch_attention_impl_with_combined_hook: OK  n_patched={n}")
 
 print(f"\nAll 2026-05-09 A+B (Cross-1) smoke tests passed.  vLLM={__import__('vllm').__version__}")
 PYEOF_2026_05_09
+set -e
 
 echo ""
 echo "=== Installation complete ==="

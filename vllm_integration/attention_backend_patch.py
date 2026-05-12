@@ -2124,7 +2124,7 @@ def extend_cache_config_mixed_dim(
     Usage::
 
         from vllm_integration.attention_backend_patch import extend_cache_config_mixed_dim
-        extra = extend_cache_config_mixed_dim(budget_ratio=0.50)
+        extra = extend_cache_config_mixed_dim(mixed_dim_budget_ratio=0.50)
         hook = MixedDimAttentionHook(budget_ratio=extra["mixed_dim_budget_ratio"])
     """
     return {
