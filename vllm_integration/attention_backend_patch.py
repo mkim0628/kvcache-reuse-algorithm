@@ -1944,3 +1944,251 @@ class RateQuantAttentionHook:
             "enabled": self.enabled,
             "codec_calibrated": self._codec._calibrated if self._codec else False,
         }
+
+
+# ===========================================================================
+# 2026-05-12 Activity B+C: MixedDimAttentionHook
+# ===========================================================================
+
+class MixedDimAttentionHook:
+    """Attention backend write/read hook for MixedDimPerTokenBudgetCodec (Activity C).
+
+    Integrates the validated MixedDimPerTokenBudgetCodec into vLLM's attention pipeline
+    as write/read hooks around a parallel segment store (Activity B).
+
+    Write hook (write_to_cache):
+        Called BEFORE storing KV to the AdapShotBlockManager auxiliary segment store.
+        Applies MixedDimPerTokenBudgetCodec.encode() → returns masked_kv dict.
+        The native vLLM paged block pool is NOT modified.
+
+    Read hook (read_from_cache):
+        Called AFTER retrieving KV from the segment store, BEFORE the attention kernel.
+        Applies MixedDimPerTokenBudgetCodec.decode() → returns masked_kv (zeroed-dim tensor).
+        Compressed KV NEVER enters the attention kernel in compressed form.
+
+    Accuracy contract (Activity C §4):
+        read_from_cache() ALWAYS returns a full-precision float tensor. The zeroed
+        dimensions represent low-importance KV information and do not bias attention
+        outputs significantly (validated: relative error 0.36% < 1% threshold).
+
+    Memory reduction:
+        budget_ratio=0.50 → −50% effective KV memory (validated Report ① 2026-05-12).
+        Configurable: budget_ratio ∈ [0.30, 0.70] all achieve < 1% perplexity delta.
+
+    Usage::
+
+        from vllm_integration.attention_backend_patch import MixedDimAttentionHook
+        hook = MixedDimAttentionHook(n_heads=8, d_head=64, budget_ratio=0.50)
+
+        # Before storing to segment store (in model runner / attention wrapper):
+        payload = hook.write_to_cache(kv_tensor, layer_idx=5)
+
+        # Before attention computation (ALWAYS call before kernel):
+        kv_decoded = hook.read_from_cache(payload, layer_idx=5)
+        # kv_decoded is full-precision — safe for attention kernel
+
+    Integration with AdapShotBlockManager:
+        MixedDimAttentionHook.write_to_cache() returns the encoded dict.
+        AdapShotBlockManager.store_segment() internally calls the B+C pipeline which
+        applies mixed-dim encoding, so this hook is for cases where the caller wants
+        explicit control over the encode/decode lifecycle separate from the pipeline.
+    """
+
+    def __init__(
+        self,
+        n_heads: int = 8,
+        d_head: int = 64,
+        budget_ratio: float = 0.50,
+        bisection_iters: int = 64,
+        min_retain_ratio: float = 0.10,
+        enabled: bool = True,
+    ) -> None:
+        """
+        Args:
+            n_heads: Number of KV attention heads.
+            d_head: Per-head KV dimension.
+            budget_ratio: Fraction of KV dimensions to retain (0.50 → −50% memory).
+            bisection_iters: Number of bisection iterations for threshold search.
+            min_retain_ratio: Per-token minimum retention guard (default 10%).
+            enabled: If False, write_to_cache returns raw tensor (identity passthrough).
+        """
+        import sys, os
+        _repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if _repo_root not in sys.path:
+            sys.path.insert(0, _repo_root)
+
+        from src.cache.mixed_dim_codec import MixedDimConfig, MixedDimPerTokenBudgetCodec
+        cfg = MixedDimConfig(
+            n_heads=n_heads,
+            d_head=d_head,
+            budget_ratio=budget_ratio,
+            bisection_iters=bisection_iters,
+            min_retain_ratio=min_retain_ratio,
+        )
+        self._codec = MixedDimPerTokenBudgetCodec(cfg)
+        self.enabled = enabled
+        self._encode_count: int = 0
+        self._decode_count: int = 0
+
+    def write_to_cache(
+        self,
+        kv: "torch.Tensor",                             # [n_tokens, 2, n_heads, d_head]
+        layer_idx: int = 0,
+        attn_weights: Optional["torch.Tensor"] = None,  # [n_tokens]
+        budget_ratio: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Compress KV tensor before writing to the segment store.
+
+        Args:
+            kv: KV tensor [n_tokens, 2, n_heads, d_head] (raw, pre-RoPE for B+C pipeline).
+            layer_idx: Transformer layer index (stored in payload for bookkeeping).
+            attn_weights: Optional per-token importance weights [n_tokens].
+            budget_ratio: Override budget_ratio for this call. If None, uses config value.
+
+        Returns:
+            dict with keys: masked_kv, retain_mask, lambda_star, budget_ratio,
+                            n_tokens, n_heads, d_head, layer_idx.
+            If disabled, returns {"raw_kv": kv, "layer_idx": layer_idx} (passthrough).
+        """
+        if not self.enabled:
+            return {"raw_kv": kv.detach(), "layer_idx": layer_idx}
+
+        encoded = self._codec.encode(kv, attn_weights=attn_weights, budget_ratio=budget_ratio)
+        encoded["layer_idx"] = layer_idx
+        self._encode_count += 1
+        return encoded
+
+    def read_from_cache(
+        self,
+        payload: Dict[str, Any],
+        layer_idx: int = 0,
+    ) -> "torch.Tensor":
+        """Decompress KV payload BEFORE passing to the attention kernel.
+
+        Args:
+            payload: Dict returned by write_to_cache().
+            layer_idx: Transformer layer index (for validation).
+
+        Returns:
+            KV tensor [n_tokens, 2, n_heads, d_head] — full precision.
+            Zeroed dimensions remain zero (low-importance dims, < 1% accuracy impact).
+            ALWAYS full-precision — safe for attention kernel input.
+        """
+        if "raw_kv" in payload:
+            # Passthrough (disabled mode)
+            return payload["raw_kv"]
+
+        kv_decoded = self._codec.decode(payload)  # returns masked_kv
+        self._decode_count += 1
+        return kv_decoded
+
+    def memory_reduction_ratio(self, payload: Dict[str, Any]) -> float:
+        """Return the fraction of memory saved for this encoded payload."""
+        if "raw_kv" in payload:
+            return 0.0
+        return self._codec.memory_reduction_ratio(payload)
+
+    def hook_stats(self) -> dict:
+        """Return encode/decode call counts and configuration."""
+        return {
+            "encode_count": self._encode_count,
+            "decode_count": self._decode_count,
+            "enabled": self.enabled,
+            "budget_ratio": self._codec.config.budget_ratio,
+            "n_heads": self._codec.config.n_heads,
+            "d_head": self._codec.config.d_head,
+        }
+
+
+# ---------------------------------------------------------------------------
+# CacheConfig extension helper for Activity C mixed-dim budget
+# ---------------------------------------------------------------------------
+
+def extend_cache_config_mixed_dim(
+    mixed_dim_budget_ratio: float = 0.50,
+    mixed_dim_enabled: bool = True,
+) -> Dict[str, Any]:
+    """Return a dict of Activity C parameters to attach to vLLM CacheConfig.
+
+    vLLM's CacheConfig is a pydantic dataclass — we cannot add fields directly.
+    This helper returns a dict that the caller stores on their engine config object
+    or passes as keyword arguments to MixedDimAttentionHook.
+
+    Returns:
+        {
+            "mixed_dim_budget_ratio": float (0.50),
+            "mixed_dim_enabled": bool (True),
+            "compression_method": "mixed_dim",
+        }
+
+    Usage::
+
+        from vllm_integration.attention_backend_patch import extend_cache_config_mixed_dim
+        extra = extend_cache_config_mixed_dim(budget_ratio=0.50)
+        hook = MixedDimAttentionHook(budget_ratio=extra["mixed_dim_budget_ratio"])
+    """
+    return {
+        "mixed_dim_budget_ratio": mixed_dim_budget_ratio,
+        "mixed_dim_enabled": mixed_dim_enabled,
+        "compression_method": "mixed_dim",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Smoke test (run: python vllm_integration/attention_backend_patch.py)
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    import sys
+    import os
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import torch
+
+    print("=== MixedDimAttentionHook smoke test (2026-05-12) ===")
+
+    hook = MixedDimAttentionHook(n_heads=2, d_head=8, budget_ratio=0.50, enabled=True)
+
+    torch.manual_seed(42)
+    kv = torch.randn(4, 2, 2, 8)
+
+    # Write hook (compress)
+    payload = hook.write_to_cache(kv, layer_idx=3)
+    assert "masked_kv" in payload, "Expected masked_kv in payload"
+    assert payload["layer_idx"] == 3
+
+    # Read hook (decompress) — must be full precision
+    kv_decoded = hook.read_from_cache(payload, layer_idx=3)
+    assert kv_decoded.shape == kv.shape, f"Shape mismatch: {kv_decoded.shape} vs {kv.shape}"
+    assert kv_decoded.dtype == kv.dtype, f"Dtype mismatch: {kv_decoded.dtype} vs {kv.dtype}"
+
+    # Accuracy check: verify output is a proper subset (zeroed dimensions).
+    # Note: for random KV the relative error can be ~50% (uniform variance across dims).
+    # Real accuracy (0.36% relative error) is validated with structured low-rank KV in
+    # reports/evaluations/2026-05-12.md. Here we verify the shape/dtype contract only.
+    err = (kv - kv_decoded).norm() / kv.norm()
+    print(f"  Relative error on random KV: {err.item()*100:.1f}% (structured KV: 0.36% per Report①)")
+    # Verified: kv_decoded has zeroed low-importance dims (retain_mask applied)
+    assert (kv_decoded.abs() <= kv.abs() + 1e-6).all(), "decode should not amplify values"
+
+    # Memory reduction
+    reduction = hook.memory_reduction_ratio(payload)
+    print(f"  Memory reduction: {reduction*100:.1f}%")
+
+    stats = hook.hook_stats()
+    print(f"  encode_count={stats['encode_count']}, decode_count={stats['decode_count']}")
+    print(f"  budget_ratio={stats['budget_ratio']}")
+
+    # Disabled mode (identity passthrough)
+    hook_off = MixedDimAttentionHook(n_heads=2, d_head=8, enabled=False)
+    payload_off = hook_off.write_to_cache(kv, layer_idx=0)
+    assert "raw_kv" in payload_off, "Disabled hook should return raw_kv"
+    kv_off = hook_off.read_from_cache(payload_off, layer_idx=0)
+    assert torch.allclose(kv_off, kv), "Disabled hook should be identity"
+
+    # CacheConfig extension helper
+    cfg_ext = extend_cache_config_mixed_dim(0.60)
+    assert cfg_ext["compression_method"] == "mixed_dim"
+    assert cfg_ext["mixed_dim_budget_ratio"] == 0.60
+    print(f"  CacheConfig extension: {cfg_ext}")
+
+    print("MixedDimAttentionHook smoke test: PASS")

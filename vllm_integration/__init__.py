@@ -1,5 +1,17 @@
 # vllm_integration: Activity A+B+C KV cache port for vLLM 0.20.2
 #
+# 2026-05-12 cycle additions:
+#   block_manager_patch   — AdapShotBlockManager: B+C AdapShotMixedDimSegmentPipeline
+#                             parallel auxiliary store (RoPE re-encoding + MixedDim codec)
+#                           + make_adapshot_kv_cache_manager_class() factory
+#   attention_backend_patch — MixedDimAttentionHook: write/read hooks for
+#                              MixedDimPerTokenBudgetCodec (compress before store,
+#                              decompress before kernel)
+#                           + extend_cache_config_mixed_dim(): CacheConfig extension helper
+#   scheduler_patch       — AdapShotSegmentSchedulerMixin: non-contiguous hit-rate-based
+#                             request reordering (B+C Cross-2)
+#                           + make_adapshot_scheduler_class() factory
+#
 # 2026-05-11 cycle additions:
 #   block_manager_patch   — WiCERBlockManager: CEGAR iterative non-contiguous KV
 #                             artefact cache + parallel segment store (Activity B)
@@ -144,6 +156,13 @@ def apply_all_patches(
 
 __all__ = [
     "apply_all_patches",
+    # 2026-05-12
+    "AdapShotBlockManager",
+    "make_adapshot_kv_cache_manager_class",
+    "MixedDimAttentionHook",
+    "extend_cache_config_mixed_dim",
+    "AdapShotSegmentSchedulerMixin",
+    "make_adapshot_scheduler_class",
     # 2026-05-11
     "RateQuantVllmCodec",
     "RateQuantAttentionHook",
