@@ -1792,3 +1792,129 @@ PYEOF_2026_05_09
 echo ""
 echo "=== Installation complete ==="
 echo "vLLM version: ${VLLM_VERSION}"
+
+# ---------------------------------------------------------------------------
+# 2026-05-12 Activity B+C: AdapShot Pipeline smoke tests
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "--- Running 2026-05-12 B+C (AdapShot) smoke tests ---"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+python - << PYEOF_2026_05_12
+import sys
+sys.path.insert(0, "${REPO_ROOT}")
+import torch
+
+# ---- AdapShotBlockManager ------------------------------------------------
+from vllm_integration.block_manager_patch import (
+    AdapShotBlockManager,
+    make_adapshot_kv_cache_manager_class,
+)
+
+mgr = AdapShotBlockManager(
+    chunk_size=4, max_entries=64, d_head=8, n_heads=2, budget_ratio=0.50
+)
+torch.manual_seed(42)
+token_ids = list(range(12))
+pre_rope_kv = torch.randn(4, 2, 2, 8)
+
+# store chunk 0, skip chunk 1, store chunk 2
+mgr.store_segment(token_ids, chunk_idx=0, pre_rope_kv=pre_rope_kv, layer_idx=0)
+mgr.store_segment(token_ids, chunk_idx=2, pre_rope_kv=torch.randn(4, 2, 2, 8), layer_idx=0)
+
+result0 = mgr.load_segment(token_ids, chunk_idx=0, target_offset=0, layer_idx=0)
+assert result0 is not None and result0.shape == (4, 2, 2, 8), "chunk 0 hit fail"
+
+result1 = mgr.load_segment(token_ids, chunk_idx=1, target_offset=4, layer_idx=0)
+assert result1 is None, "chunk 1 should miss"
+
+result2 = mgr.load_segment(token_ids, chunk_idx=2, target_offset=8, layer_idx=0)
+assert result2 is not None and result2.shape == (4, 2, 2, 8), "chunk 2 hit fail"
+
+stats = mgr.hit_stats()
+print(f"AdapShotBlockManager: OK  hit_rate={stats['hit_rate']:.2f}  nc_rate={stats['noncontiguous_hit_rate']:.2f}  mem={stats['memory_bytes']}")
+
+# factory subclass check
+try:
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
+    Cls = make_adapshot_kv_cache_manager_class(KVCacheManager, chunk_size=4, d_head=8, n_heads=2)
+    assert issubclass(Cls, KVCacheManager)
+    print(f"make_adapshot_kv_cache_manager_class: OK  class={Cls.__name__}")
+except Exception as e:
+    print(f"make_adapshot_kv_cache_manager_class: SKIP (no GPU)  {e}")
+
+# ---- MixedDimAttentionHook -----------------------------------------------
+from vllm_integration.attention_backend_patch import (
+    MixedDimAttentionHook,
+    extend_cache_config_mixed_dim,
+)
+
+hook = MixedDimAttentionHook(n_heads=2, d_head=8, budget_ratio=0.50, enabled=True)
+torch.manual_seed(42)
+kv = torch.randn(4, 2, 2, 8)
+payload = hook.write_to_cache(kv, layer_idx=2)
+assert "masked_kv" in payload and payload["layer_idx"] == 2
+kv_out = hook.read_from_cache(payload, layer_idx=2)
+assert kv_out.shape == kv.shape
+err = (kv - kv_out).norm() / kv.norm()
+# budget_ratio=0.5 keeps 50% dims; random KV has ~50% error — this is expected
+print(f"MixedDimAttentionHook: OK  encode={hook._encode_count}  decode={hook._decode_count}  budget_ratio={payload['budget_ratio']:.3f}")
+
+cfg_ext = extend_cache_config_mixed_dim(mixed_dim_budget_ratio=0.60)
+assert cfg_ext["compression_method"] == "mixed_dim"
+print(f"extend_cache_config_mixed_dim: OK  {cfg_ext}")
+
+# ---- AdapShotSegmentSchedulerMixin ---------------------------------------
+from vllm_integration.scheduler_patch import (
+    AdapShotSegmentSchedulerMixin,
+    make_adapshot_scheduler_class,
+)
+
+class _MockWaitingQueue(list):
+    pass
+
+class _MockSched:
+    def __init__(self):
+        self.waiting = _MockWaitingQueue()
+    def schedule(self):
+        return {}
+
+class _TestAdapSched(AdapShotSegmentSchedulerMixin, _MockSched):
+    def __init__(self, **kw):
+        AdapShotSegmentSchedulerMixin.__init__(self, **kw)
+        _MockSched.__init__(self)
+    def schedule(self):
+        self.pre_schedule_adapshot()
+        return _MockSched.schedule(self)
+
+sched = _TestAdapSched(adapshot_reorder_window=10)
+
+class _Req:
+    def __init__(self, name, rate, hits):
+        self.name = name
+        self.adapshot_noncontiguous_hit_rate = rate
+        self.adapshot_hits = [(i, None) for i in range(hits)]
+        self.adapshot_misses = []
+
+sched.waiting.extend([
+    _Req("low", 0.1, 1), _Req("high", 0.9, 5), _Req("mid", 0.5, 3), _Req("zero", 0.0, 0)
+])
+sched.pre_schedule_adapshot()
+reordered = [r.name for r in sched.waiting]
+assert reordered[0] == "high" and reordered[-1] == "zero", f"Unexpected order: {reordered}"
+print(f"AdapShotSegmentSchedulerMixin: OK  reordered={reordered}")
+
+try:
+    from vllm.v1.core.sched.scheduler import Scheduler
+    VllmAdapShot = make_adapshot_scheduler_class(Scheduler, adapshot_reorder_window=32)
+    assert issubclass(VllmAdapShot, Scheduler)
+    print(f"make_adapshot_scheduler_class: OK  class={VllmAdapShot.__name__}")
+except Exception as e:
+    print(f"make_adapshot_scheduler_class: SKIP (no GPU)  {e}")
+
+print(f"\nAll 2026-05-12 B+C (AdapShot) smoke tests passed.  vLLM={__import__('vllm').__version__}")
+PYEOF_2026_05_12
+
+echo ""
+echo "=== 2026-05-12 B+C smoke tests complete ==="

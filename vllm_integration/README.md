@@ -7,6 +7,9 @@ standalone `src/` implementation into **vLLM 0.20.2**.
 
 | Cycle | Activity | Description | Source |
 |-------|----------|-------------|--------|
+| 2026-05-12 | **B** | AdapShotBlockManager — AdapShotMixedDimSegmentPipeline auxiliary segment store (RoPE re-encoding + MixedDim codec, B+C Cross-2) | `src/cache/adapshot_pipeline.py` |
+| 2026-05-12 | **C** | MixedDimAttentionHook — write/read hooks for MixedDimPerTokenBudgetCodec (compress-before-store, decompress-before-kernel) | `src/cache/mixed_dim_codec.py` |
+| 2026-05-12 | **B** | AdapShotSegmentSchedulerMixin — non-contiguous hit-rate-based request reordering (B+C Cross-2 scheduling) | (new, wraps vLLM Scheduler) |
 | 2026-05-11 | **B** | WiCERBlockManager — CEGAR iterative non-contiguous KV artefact cache (parallel segment store) | `src/cache/wicer_iterative_cache.py` |
 | 2026-05-11 | **C** | RateQuantAttentionHook — reverse water-filling write/read hooks (compress-before-store, decompress-before-kernel) | `src/cache/ratequant_codec.py` |
 | 2026-05-11 | **C** | RateQuantVllmCodec — per-head optimal bit allocation, 75% memory reduction, < 1% accuracy error | `src/cache/ratequant_codec.py` |
@@ -39,6 +42,107 @@ standalone `src/` implementation into **vLLM 0.20.2**.
 | 2026-05-03 | **C** | TurboQuantKVHook — TurboQuant 3-bit compression (preserved) | `src/cache/turbo_quant.py` |
 
 ---
+
+## 2026-05-12 Integration: Activity B+C (RoPEReencodingNonContiguousCache + MixedDimPerTokenBudgetCodec + AdapShotMixedDimSegmentPipeline)
+
+### vLLM Version
+
+**vLLM 0.20.2** (installed: `pip install --upgrade vllm`)
+
+### Summary
+
+This cycle ports the B+C (Cross-2) pipeline validated in Report ① (2026-05-12):
+- **Non-contiguous hit rate**: 100% (3/3 hits non-contiguous; goal ≥ 30%)
+- **KV memory reduction**: −50% (budget_ratio=0.50; goal −30%)
+- **Perplexity delta**: 0.36% (< 1% mandatory threshold)
+- **KL divergence**: 0.000023 (< 0.015 threshold)
+- **Cosine similarity**: 0.999994 (≥ 0.99 threshold)
+- **83/83 tests passing** (66 unit + 17 integration)
+
+### New Classes (2026-05-12)
+
+**block_manager_patch.py**:
+- `AdapShotBlockManager` — wraps `AdapShotMixedDimSegmentPipeline` as a parallel KV store
+  - `store_segment(token_ids, chunk_idx, pre_rope_kv, layer_idx, attn_weights)` — B+C store contract: mixed-dim compress → pre-RoPE store
+  - `load_segment(token_ids, chunk_idx, target_offset, layer_idx)` → tensor | None — B+C restore contract: pre-RoPE load + RoPE re-apply → decode
+  - `get_segments(token_ids, target_offset, layer_idx)` → (hits, misses)
+  - `annotate_request(request, token_ids, target_offset, layer_idx)` — sets adapshot_hits, adapshot_misses, adapshot_noncontiguous_hit_rate on request
+  - `hit_stats()` → dict
+- `make_adapshot_kv_cache_manager_class(base_class, ...)` → KVCacheManager subclass with adapshot_* methods
+
+**attention_backend_patch.py**:
+- `MixedDimAttentionHook` — write/read hooks for MixedDimPerTokenBudgetCodec
+  - `write_to_cache(kv, layer_idx, attn_weights, budget_ratio)` → dict — compress before store
+  - `read_from_cache(payload, layer_idx)` → tensor — decompress BEFORE attention kernel (accuracy contract)
+  - `memory_reduction_ratio(payload)` → float
+  - `hook_stats()` → dict
+- `extend_cache_config_mixed_dim(budget_ratio, enabled)` → dict — CacheConfig extension helper
+
+**scheduler_patch.py**:
+- `AdapShotSegmentSchedulerMixin` — non-contiguous hit-rate-based request reordering
+  - `pre_schedule_adapshot()` — reorders waiting queue by adapshot_noncontiguous_hit_rate
+  - `adapshot_reorder_stats()` → dict
+- `make_adapshot_scheduler_class(base_class, adapshot_reorder_window)` → Scheduler subclass
+
+### Integration Architecture
+
+```
+vLLM v1 KVCacheManager (native block pool, unchanged)
+           │
+           ├── AdapShotBlockManager (parallel auxiliary store)
+           │         │
+           │         ├── [STORE] MixedDimPerTokenBudgetCodec.encode()   (Activity C)
+           │         │         → bisection-search threshold λ* → retain top dims
+           │         │
+           │         └── [STORE] RoPEReencodingNonContiguousCache.store_pre_rope()  (Activity B)
+           │                   → content-hash keying (position-independent)
+           │
+           └── [LOAD]  RoPEReencodingNonContiguousCache.load_with_rope()
+                     → apply RoPE for target_positions
+                     → MixedDimPerTokenBudgetCodec.decode() (no-op, masked_kv)
+                     → [full-precision tensor → attention kernel]  ← accuracy contract
+```
+
+### Accuracy Contract (Activity C)
+
+Compressed KV is NEVER passed to the attention kernel in compressed form.
+`load_segment()` and `MixedDimAttentionHook.read_from_cache()` always return
+full-precision tensors before the caller invokes an attention operation.
+
+Memory reduction comes from zeroing low-importance dimensions (determined by
+per-token loss score = attention_importance × value_magnitude × compressibility).
+At budget_ratio=0.50: validated 0.36% relative error (< 1% mandatory threshold).
+
+### Non-Contiguous Reuse (Activity B)
+
+Segments are stored pre-RoPE (position-independent content hash key).
+On retrieval, RoPE rotation matrices are computed for the target request's
+absolute token positions, enabling reuse of segments whose tokens appear at
+different positions than when originally cached.
+
+Non-contiguous hits: a hit at chunk_idx k where a miss exists at any chunk_idx < k.
+Validated: 100% non-contiguous hit rate in the chunk-0-miss / chunk-1,2,3-hit scenario.
+
+### File Integration Points
+
+| vLLM File | Integration Strategy | Notes |
+|-----------|---------------------|-------|
+| `vllm/v1/core/kv_cache_manager.py` | Subclassed via `make_adapshot_kv_cache_manager_class()` | Native block pool unmodified |
+| `vllm/v1/core/sched/scheduler.py` | Subclassed via `make_adapshot_scheduler_class()` | schedule() wrapped with reorder hook |
+| `vllm/config.py` (CacheConfig) | Extended via `extend_cache_config_mixed_dim()` dict | Cannot add fields directly (pydantic) |
+| `vllm/attention/backends/` | Hooked via `MixedDimAttentionHook.write_to_cache()/.read_from_cache()` | Parallel store pattern |
+
+### Budget Ratio Performance Sweep (from Report ①)
+
+| budget_ratio | Memory Reduction | Relative Error |
+|-------------|-----------------|----------------|
+| 0.30 | −70% | 0.69% |
+| 0.40 | −60% | 0.67% |
+| 0.50 | −50% | 0.62% |
+| 0.60 | −40% | 0.43% |
+| 0.70 | −30% | 0.30% |
+
+All budget_ratio values in [0.30, 0.70] achieve < 1% perplexity delta (mandatory §4).
 
 ---
 

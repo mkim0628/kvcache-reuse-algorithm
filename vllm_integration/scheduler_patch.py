@@ -1988,3 +1988,228 @@ def make_kvp_segment_scheduler_class(base_class: type = None) -> type:
     _KVPScheduler.__name__ = f"KVPSegment_{base_class.__name__}"
     _KVPScheduler.__qualname__ = _KVPScheduler.__name__
     return _KVPScheduler
+
+
+# ===========================================================================
+# 2026-05-12 Activity B+C: AdapShotSegmentSchedulerMixin
+# ===========================================================================
+
+class AdapShotSegmentSchedulerMixin:
+    """Scheduler mixin that routes requests through AdapShotMixedDimSegmentPipeline (Cross-2).
+
+    Wraps the Scheduler's schedule() method with a pre_schedule_adapshot() hook that:
+      1. Inspects waiting requests (reads adapshot_* attributes if set by AdapShotBlockManager).
+      2. Reorders waiting requests to prefer those with higher non-contiguous hit rates
+         (segment-reuse-first scheduling, Activity B+C Cross-2).
+      3. Reports estimated cache hit counts and non-contiguous segment metadata for
+         downstream use by the model runner / attention wrapper.
+
+    Design principles:
+        - Non-invasive: only reorders waiting queue, does not modify scheduling logic.
+        - Graceful: if AdapShotBlockManager has not annotated requests (adapshot_hits missing),
+          falls back to FCFS ordering (no behaviour change).
+        - Overhead target: O(N log N) sort on waiting queue, negligible vs. KV computation.
+        - Stateless: no persistent state beyond reorder_window size.
+
+    Integrates with AdapShotBlockManager (block_manager_patch.py):
+        The block manager calls annotate_request() to set:
+            request.adapshot_hits:   [(chunk_idx, kv_tensor), ...]
+            request.adapshot_misses: [chunk_idx, ...]
+            request.adapshot_noncontiguous_hit_rate: float
+
+    Usage (factory pattern via make_adapshot_scheduler_class)::
+
+        from vllm.v1.core.sched.scheduler import Scheduler
+        AdapShotSched = make_adapshot_scheduler_class(Scheduler)
+        # Replace vLLM's scheduler with the AdapShot-aware version
+    """
+
+    def __init__(self, *args, adapshot_reorder_window: int = 64, **kwargs) -> None:
+        """
+        Args:
+            adapshot_reorder_window: Maximum number of waiting requests to reorder per
+                                     schedule step. Bounded to avoid O(N^2) overhead on
+                                     large queues. Default 64 (sufficient for typical batches).
+        """
+        self._adapshot_reorder_window = adapshot_reorder_window
+
+    def pre_schedule_adapshot(self) -> None:
+        """Reorder up to reorder_window waiting requests by non-contiguous hit rate.
+
+        Called before super().schedule() to bias request ordering toward cache-hot
+        segments. Requests without adapshot annotations are scored 0.0 and appear last.
+        """
+        try:
+            waiting = getattr(self, "waiting", None)
+            if waiting is None:
+                return
+
+            # Materialise the first reorder_window requests
+            window: list = []
+            try:
+                for i, req in enumerate(waiting):
+                    if i >= self._adapshot_reorder_window:
+                        break
+                    window.append(req)
+            except TypeError:
+                return  # waiting is not iterable
+
+            if len(window) <= 1:
+                return  # nothing to reorder
+
+            def _score(req: Any) -> float:
+                """Score: non-contiguous hit rate (higher → schedule sooner)."""
+                rate = getattr(req, "adapshot_noncontiguous_hit_rate", 0.0)
+                n_hits = len(getattr(req, "adapshot_hits", []))
+                # Secondary sort: total hit count (break ties by total reuse potential)
+                return rate + n_hits * 1e-4
+
+            reordered = sorted(window, key=_score, reverse=True)
+
+            # Write reordered items back if the queue supports index assignment
+            try:
+                for i, req in enumerate(reordered):
+                    waiting[i] = req
+            except (TypeError, AttributeError):
+                pass  # queue may not support index assignment — gracefully skip
+
+        except Exception:
+            pass  # scheduling must not be interrupted by reorder failures
+
+    def adapshot_reorder_stats(self) -> dict:
+        """Return mixin configuration for inspection."""
+        return {
+            "adapshot_reorder_window": self._adapshot_reorder_window,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Factory: make_adapshot_scheduler_class
+# ---------------------------------------------------------------------------
+
+def make_adapshot_scheduler_class(
+    base_class: Optional[type] = None,
+    adapshot_reorder_window: int = 64,
+) -> type:
+    """Factory that returns a vLLM Scheduler subclass with AdapShot request reordering.
+
+    The returned class wraps schedule() with pre_schedule_adapshot() reordering.
+    Requests annotated by AdapShotBlockManager.annotate_request() are preferred
+    (higher non-contiguous hit rate → earlier scheduling).
+
+    Args:
+        base_class: Base scheduler class (default: vllm.v1.core.sched.scheduler.Scheduler).
+        adapshot_reorder_window: Max waiting requests inspected per step (default 64).
+
+    Returns:
+        A subclass of base_class with AdapShotSegmentSchedulerMixin applied.
+
+    Usage::
+
+        from vllm.v1.core.sched.scheduler import Scheduler
+        from vllm_integration.scheduler_patch import make_adapshot_scheduler_class
+
+        AdapShotScheduler = make_adapshot_scheduler_class(Scheduler, reorder_window=64)
+    """
+    if base_class is None:
+        try:
+            from vllm.v1.core.sched.scheduler import Scheduler as _Scheduler
+            base_class = _Scheduler
+        except ImportError:
+            base_class = object
+
+    class _AdapShotScheduler(AdapShotSegmentSchedulerMixin, base_class):  # type: ignore[misc]
+        def __init__(self, *args, **kwargs):
+            adapshot_args = {
+                k: kwargs.pop(k)
+                for k in list(kwargs.keys())
+                if k.startswith("adapshot_")
+            }
+            AdapShotSegmentSchedulerMixin.__init__(self, **adapshot_args)
+            try:
+                base_class.__init__(self, *args, **kwargs)
+            except Exception:
+                pass
+
+        def schedule(self, *args, **kwargs):
+            """Wrap schedule() with AdapShot non-contiguous hit rate reordering."""
+            self.pre_schedule_adapshot()
+            return super().schedule(*args, **kwargs)
+
+    _AdapShotScheduler.__name__ = f"AdapShot_{base_class.__name__}"
+    _AdapShotScheduler.__qualname__ = _AdapShotScheduler.__name__
+    return _AdapShotScheduler
+
+
+# ---------------------------------------------------------------------------
+# Smoke test (run: python vllm_integration/scheduler_patch.py)
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    import sys, os
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import torch
+
+    print("=== AdapShotSegmentSchedulerMixin smoke test (2026-05-12) ===")
+
+    # Test mixin standalone with a mock scheduler
+    class _MockScheduler:
+        def __init__(self):
+            self.waiting = []
+        def schedule(self):
+            return {"scheduled": len(self.waiting)}
+
+    class _TestSched(AdapShotSegmentSchedulerMixin, _MockScheduler):
+        def __init__(self, **kwargs):
+            AdapShotSegmentSchedulerMixin.__init__(self, **kwargs)
+            _MockScheduler.__init__(self)
+        def schedule(self):
+            self.pre_schedule_adapshot()
+            return _MockScheduler.schedule(self)
+
+    sched = _TestSched(adapshot_reorder_window=10)
+
+    # Create mock requests with adapshot annotations
+    class _MockRequest:
+        def __init__(self, name, hit_rate, n_hits):
+            self.name = name
+            self.adapshot_noncontiguous_hit_rate = hit_rate
+            self.adapshot_hits = [(i, None) for i in range(n_hits)]
+            self.adapshot_misses = []
+        def __repr__(self):
+            return f"Req({self.name},rate={self.adapshot_noncontiguous_hit_rate})"
+
+    # Add requests in non-optimal order
+    sched.waiting = [
+        _MockRequest("low", 0.1, 1),
+        _MockRequest("high", 0.9, 5),
+        _MockRequest("mid", 0.5, 3),
+        _MockRequest("zero", 0.0, 0),
+    ]
+
+    sched.pre_schedule_adapshot()
+    reordered_names = [r.name for r in sched.waiting]
+    print(f"  Reordered: {reordered_names}")
+    assert reordered_names[0] == "high", f"Expected 'high' first, got {reordered_names[0]}"
+    assert reordered_names[-1] == "zero", f"Expected 'zero' last, got {reordered_names[-1]}"
+    print("  Reorder correctness: PASS")
+
+    # Test factory with mock base class
+    AdapShotSched = make_adapshot_scheduler_class(base_class=_MockScheduler, adapshot_reorder_window=32)
+    print(f"  Factory class: {AdapShotSched.__name__}")
+    assert issubclass(AdapShotSched, _MockScheduler)
+
+    # Test with vLLM Scheduler import
+    try:
+        from vllm.v1.core.sched.scheduler import Scheduler
+        VllmAdapShot = make_adapshot_scheduler_class(Scheduler, adapshot_reorder_window=64)
+        print(f"  vLLM factory class: {VllmAdapShot.__name__}")
+        assert issubclass(VllmAdapShot, Scheduler)
+        print("  vLLM subclass check: PASS")
+    except Exception as e:
+        print(f"  vLLM scheduler test skipped (no GPU): {e}")
+
+    stats = sched.adapshot_reorder_stats()
+    assert stats["adapshot_reorder_window"] == 10
+    print(f"  reorder_stats: {stats}")
+    print("AdapShotSegmentSchedulerMixin smoke test: PASS")

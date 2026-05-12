@@ -1,0 +1,57 @@
+experiment:
+  date: "2026-05-12"
+  activity: "B+C"
+  description: >
+    AdapShotMixedDimSegmentPipeline (Cross-2: B+C):
+    RoPEReencodingNonContiguousCache(B-1) + MixedDimPerTokenBudgetCodec(C-1) integration.
+    Position-decoupled KV storage + RoPE re-encoding for improved non-contiguous hit rate,
+    per-token mixed-dim budget allocation for memory -50% target.
+
+rope_reencoding:
+  chunk_size: 128
+  max_entries: 2000
+  d_head: 64
+  n_heads: 8
+  rope_base: 10000.0
+  rope_dim: -1
+  seed: 42
+
+mixed_dim:
+  n_heads: 8
+  d_head: 64
+  budget_ratio: 0.50
+  bisection_iters: 64
+  min_retain_ratio: 0.10
+  attn_importance_weight: 1.0
+  value_magnitude_weight: 1.0
+  compressibility_weight: 1.0
+  seed: 42
+
+cache:
+  type: "adapshot_mixed_dim_pipeline"
+  capacity_bytes: 4294967296   # 4 GiB
+
+benchmark:
+  accuracy:
+    method: "attention_output_proxy"
+    proxy_tolerance: 0.01
+    kl_tolerance: 0.015
+    cosine_min: 0.99
+    perplexity_dataset: "wikitext-103"
+    perplexity_tolerance_pct: 1.0
+    task_accuracy_tolerance_pct: 1.0
+  budget_ratio_sweep:
+    ratios: [0.30, 0.40, 0.50, 0.60, 0.70]
+  hit_rate:
+    target_noncontiguous_fraction: 0.30
+  memory_reduction:
+    target_ratio: 0.30
+    target_ratio_goal: 0.50
+  throughput:
+    target_improvement_pct: 10
+    target_improvement_goal_pct: 20
+  scheduling_overhead:
+    ttft_p50_max_increase_pct: 5
+
+seed: 42
+results_dir: "results/2026-05-12"

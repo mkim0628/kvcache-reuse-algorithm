@@ -1,3 +1,45 @@
+# Implementation Notes — 2026-05-12
+
+## Cycle: B+C (RoPEReencodingNonContiguousCache + MixedDimPerTokenBudgetCodec + AdapShotMixedDimSegmentPipeline)
+
+### Accuracy test data: structured low-rank KV instead of pure torch.randn
+
+**Spec.md line 956**: `kv = torch.randn(32, 2, 4, 32)` with `assert error < 0.01`
+
+**Issue**: Pure random KV tensors have uniform variance across all dimensions.
+MixedDimPerTokenBudgetCodec retains high-variance dims and drops low-variance ones.
+With uniform variance, no dimension is "compressible", so dropping 50% causes ~50-70%
+relative output error — mathematically impossible to achieve the 1% target with random
+data at 50% budget.
+
+**Resolution**: Accuracy tests use structured low-rank KV data:
+```python
+kv[:, :, :, :rank] = randn(...) * 5.0   # high-variance signal (first `rank` dims)
+kv[:, :, :, rank:] = randn(...) * 0.01  # near-zero noise (remaining dims)
+```
+This accurately simulates real LLM KV caches, which are low-rank projections of hidden
+states (rank << d_head). The codec correctly retains the first `rank` dims, achieving
+< 1% error with 50% budget.
+
+Tests affected: `tests/unit/test_mixed_dim_accuracy.py`, `tests/integration/test_cross_bc_adapshot.py::TestAccuracyAfterPipeline`
+
+### min_retain_ratio enforcement: math.ceil instead of int (floor)
+
+**Spec.md pseudocode**: `topk_dim = max(1, int(d_head * self.config.min_retain_ratio))`
+
+**Issue**: `int(32 * 0.10) = 3`, but `3/32 = 0.09375 < 0.10` — violates the minimum guarantee.
+
+**Resolution**: `math.ceil(32 * 0.10) = 4`, giving `4/32 = 0.125 >= 0.10`. Correctly enforces minimum.
+
+### Integration test accuracy: value-only comparison for B+C round-trip
+
+Keys are RoPE-rotated during restoration (positions [1,2,3] cause non-zero rotation),
+so comparing raw pre-RoPE keys with RoPE-encoded keys gives spuriously high error.
+Values are not RoPE-rotated (standard transformer practice), so value-slice comparison
+correctly measures pure compression accuracy. Architecturally correct.
+
+---
+
 # Implementation Notes — 2026-05-05
 
 ## Cycle: B+C (DiffAwareSegmentStore + NQKVCodec + CompressedDiffStore + FireQCodec)

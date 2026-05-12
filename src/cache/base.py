@@ -3,6 +3,7 @@ from typing import List, Optional, Tuple
 import torch
 
 
+
 class CacheStore(ABC):
     """Abstract base for all KV cache implementations."""
 
@@ -41,3 +42,32 @@ class CacheStore(ABC):
         Subclasses with Activity C compression may override to compress value.
         """
         return value
+
+    def store_pre_rope(
+        self,
+        key: str,
+        value: torch.Tensor,
+        layer_idx: int = 0,
+    ) -> None:
+        """Store RoPE-free (position-decoupled) KV under a content hash key.
+
+        Default raises NotImplementedError; only RoPE-capable subclasses override.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support pre-RoPE storage."
+        )
+
+    def load_with_rope(
+        self,
+        key: str,
+        target_positions: torch.Tensor,
+        layer_idx: int = 0,
+        rope_dim: int = -1,
+    ) -> Optional[torch.Tensor]:
+        """Load pre-RoPE KV and apply rotation matrix for target_positions.
+
+        Returns None on cache miss. Default raises NotImplementedError.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support pre-RoPE loading."
+        )
