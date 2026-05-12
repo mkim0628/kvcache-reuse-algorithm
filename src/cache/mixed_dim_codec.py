@@ -122,7 +122,9 @@ class MixedDimPerTokenBudgetCodec:
         retain_mask = loss_scores >= lam  # [n_tokens, n_heads, d_head] bool
 
         # Enforce min_retain_ratio per (token, head) pair
-        topk_dim = max(1, int(d_head * self.config.min_retain_ratio))
+        # Use ceil so that e.g. 0.10 * 32 = 3.2 → 4 dims (not 3), ensuring >= ratio
+        import math
+        topk_dim = max(1, math.ceil(d_head * self.config.min_retain_ratio))
         per_token_ratio = retain_mask.float().mean(dim=-1)   # [n_tokens, n_heads]
         under_min = per_token_ratio < self.config.min_retain_ratio  # [n_tokens, n_heads]
         if under_min.any():
