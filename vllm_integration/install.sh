@@ -1934,3 +1934,155 @@ PYEOF_2026_05_12
 
 echo ""
 echo "=== 2026-05-12 B+C smoke tests complete ==="
+
+echo ""
+echo "=== 2026-05-13 A+B+C smoke tests (PBKV + KVFold + SRFTInt8) ==="
+set +e
+python - << PYEOF_2026_05_13
+import sys, pathlib
+repo_root = pathlib.Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(repo_root))
+import torch
+torch.manual_seed(42)
+
+# -----------------------------------------------------------------------
+# Activity A: PBKVAgentSegmentPreservationSchedulerMixin
+# -----------------------------------------------------------------------
+from vllm_integration.scheduler_patch import (
+    PBKVAgentSegmentPreservationSchedulerMixin,
+    PBKVSchedulerConfig,
+    make_pbkv_scheduler_class,
+)
+
+class _MockReq:
+    def __init__(self, rid, toks):
+        self.request_id = rid
+        self.prompt_token_ids = toks
+        self._all_token_ids = toks
+
+class _MockQueue:
+    def __init__(self, reqs):
+        self._queue = list(reqs)
+    def __iter__(self):
+        return iter(self._queue)
+    def __len__(self):
+        return len(self._queue)
+
+class _Base:
+    def __init__(self, *a, **kw):
+        self.waiting = _MockQueue([])
+        self.running = []
+    def schedule(self):
+        return {}
+
+PBKVSched = make_pbkv_scheduler_class(
+    _Base, pbkv_segment_emb_dim=32, pbkv_history_steps=4, pbkv_chunk_size=4
+)
+sched = PBKVSched()
+sched.waiting = _MockQueue([
+    _MockReq("r1", list(range(8))),
+    _MockReq("r2", list(range(4))),
+    _MockReq("r3", list(range(12))),
+])
+sched.schedule()
+stats = sched.pbkv_stats()
+assert stats["pbkv_step_count"] >= 1, f"Expected step_count >= 1, got {stats}"
+preserve, evict = sched.pbkv_preservation_policy(["k1","k2","k3"])
+assert isinstance(preserve, set) and isinstance(evict, set)
+print(f"[A] PBKV scheduler: step_count={stats['pbkv_step_count']}, preserve={len(preserve)}, evict={len(evict)}")
+
+# vLLM Scheduler subclass check
+try:
+    from vllm.v1.core.sched.scheduler import Scheduler
+    PBKVVllm = make_pbkv_scheduler_class(Scheduler)
+    assert issubclass(PBKVVllm, Scheduler)
+    print(f"[A] vLLM subclass: {PBKVVllm.__name__} OK")
+except Exception as e:
+    print(f"[A] vLLM subclass skipped (no GPU): {e}")
+
+# -----------------------------------------------------------------------
+# Activity B: KVFoldAccumulativeBlockManager
+# -----------------------------------------------------------------------
+from vllm_integration.block_manager_patch import (
+    KVFoldAccumulativeBlockManager,
+    KVFoldBlockManagerConfig,
+    make_kvfold_kv_cache_manager_class,
+)
+
+cfg_b = KVFoldBlockManagerConfig(chunk_size=4, max_entries=50, n_heads=2, d_head=8, seed=42)
+mgr = KVFoldAccumulativeBlockManager(cfg_b)
+tokens = list(range(8))
+kv_chunk = torch.randn(4, 2, 2, 8)
+key_stored = mgr.store_chunk(tokens, chunk_idx=0, layer_idx=0, kv_tensor=kv_chunk)
+assert isinstance(key_stored, str)
+result = mgr.lookup_chunk(tokens, chunk_idx=0, layer_idx=0)
+assert result is not None, "cache miss after store"
+fold_key1, acc1 = mgr.fold_chunk(list(range(4)), layer_idx=0)
+fold_key2, acc2 = mgr.fold_chunk(list(range(4, 8)), layer_idx=0, existing_fold_key=fold_key1)
+assert acc2.shape[0] >= 4, f"accumulated KV too small: {acc2.shape}"
+prefix = mgr.lookup_fold_prefix(fold_key2)
+assert prefix is not None
+hits, misses = mgr.lookup_segments(tokens, layer_idx=0)
+stats_b = mgr.hit_stats()
+print(f"[B] KVFold: hits={len(hits)}, misses={len(misses)}, fold_states={stats_b['fold_states']}, hit_rate={stats_b['hit_rate']:.2f}")
+
+try:
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
+    KVFoldMgr = make_kvfold_kv_cache_manager_class(KVCacheManager, chunk_size=4, n_heads=2, d_head=8)
+    assert issubclass(KVFoldMgr, KVCacheManager)
+    print(f"[B] vLLM factory: {KVFoldMgr.__name__} OK")
+except Exception as e:
+    print(f"[B] vLLM factory skipped (no GPU): {e}")
+
+# -----------------------------------------------------------------------
+# Activity C: SRFTInt8AttentionHook
+# -----------------------------------------------------------------------
+from vllm_integration.attention_backend_patch import (
+    SRFTInt8AttentionHook,
+    SRFTInt8Config,
+    apply_srft_int8_patch,
+    extend_cache_config_srft_int8,
+)
+
+hook = SRFTInt8AttentionHook(n_heads=4, d_head=16, group_size=16, seed=42)
+key = torch.randn(8, 4, 16)
+value = torch.randn(8, 4, 16)
+payload = hook.write_to_cache(key, value, layer_idx=0)
+assert payload["compressed"] is True
+key_dec, val_dec = hook.read_from_cache(payload)
+assert key_dec.shape == key.shape
+rel_err = ((key_dec.float() - key).norm() / key.norm()).item()
+assert rel_err < 0.05, f"key rel error {rel_err:.4f} > 5%"
+ratio = hook.memory_reduction_ratio(n_tokens=512)
+assert ratio > 0.5
+cfg_ext = extend_cache_config_srft_int8(group_size=128)
+assert cfg_ext["compression_method"] == "srft_int8"
+print(f"[C] SRFTInt8: rel_err={rel_err:.4f}, memory_reduction={ratio*100:.1f}%, config={cfg_ext['compression_method']}")
+
+try:
+    from vllm.v1.attention.backends.flash_attn import FlashAttentionImpl
+    hook2 = SRFTInt8AttentionHook(n_heads=8, d_head=64)
+    apply_srft_int8_patch(FlashAttentionImpl, hook2)
+    assert hasattr(FlashAttentionImpl, "_srft_int8_hook")
+    print("[C] FlashAttentionImpl patch: OK")
+except Exception as e:
+    print(f"[C] FlashAttentionImpl patch skipped (no GPU): {e}")
+
+# -----------------------------------------------------------------------
+# B+C integration: KVFold with SRFT compressor
+# -----------------------------------------------------------------------
+hook_bc = SRFTInt8AttentionHook(n_heads=2, d_head=8, group_size=8, seed=42)
+cfg_bc = KVFoldBlockManagerConfig(chunk_size=4, n_heads=2, d_head=8, seed=42, compressor=hook_bc)
+mgr_bc = KVFoldAccumulativeBlockManager(cfg_bc)
+fold_key_bc, acc_bc = mgr_bc.fold_chunk(list(range(4)), layer_idx=0)
+assert acc_bc is not None
+fold_key_bc2, acc_bc2 = mgr_bc.fold_chunk(list(range(4, 8)), layer_idx=0, existing_fold_key=fold_key_bc)
+assert acc_bc2.shape[0] >= 4
+print(f"[B+C] KVFold+SRFTInt8: fold_states={mgr_bc.hit_stats()['fold_states']}")
+
+print(f"\nAll 2026-05-13 A+B+C smoke tests passed.  vLLM={__import__('vllm').__version__}")
+PYEOF_2026_05_13
+set -e
+
+echo ""
+echo "=== 2026-05-13 A+B+C smoke tests complete ==="

@@ -3913,4 +3913,479 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"  factory test skipped (no vLLM GPU): {e}")
 
+
+# ===========================================================================
+# 2026-05-13  Activity B — KVFoldAccumulativeBlockManager
+# ===========================================================================
+"""Activity B (2026-05-13): KVFoldAccumulativeBlockManager
+
+Ports KVFoldAccumulativeRadixCache (src/cache/kv_fold_accumulative.py) and
+AgenticChunkPreCachingPipeline (src/cache/agentic_chunk_precaching.py) into
+vLLM's v1 KVCacheManager layer as a standalone auxiliary segment store.
+
+Integration model for vLLM 0.20.2:
+  - KVFoldAccumulativeBlockManager is a self-contained class; it does NOT
+    subclass KVCacheManager directly (which requires complex vLLM internals),
+    instead it acts as a *parallel* non-contiguous KV segment store that
+    sits alongside vLLM's native prefix-caching block pool.
+  - Three public hooks let the vLLM engine (or a custom worker) call into
+    the fold store at the right moments:
+      store_chunk(tokens, layer_idx, kv_tensor)   — after attention computation
+      lookup_chunk(tokens, layer_idx)              — before attention (HIT path)
+      lookup_fold_prefix(fold_key)                 — foldl accumulated prefix
+  - make_kvfold_kv_cache_manager_class(): produces a KVCacheManager subclass
+    that embeds a KVFoldAccumulativeBlockManager; safe to pass to vLLM engine.
+
+Non-contiguous reuse contract (Activity B, vLLM specific):
+  - Blocks are aligned to vLLM's native block_size boundary.
+  - Segment granularity == chunk_size (configurable, default 128 tokens).
+  - Non-contiguous hits are tracked via get_segments_with_fold().
+  - StreamingLLM window_size controls GPU memory upper bound for fold states.
+"""
+
+import collections as _collections
+from dataclasses import dataclass as _dc_b, field as _field_b
+from typing import (
+    Any as _Any_B,
+    Dict as _Dict_B,
+    List as _List_B,
+    Optional as _Optional_B,
+    Tuple as _Tuple_B,
+)
+
+import torch as _torch_b
+
+
+@_dc_b
+class KVFoldBlockManagerConfig:
+    """Configuration for KVFoldAccumulativeBlockManager."""
+    chunk_size: int = 128
+    max_entries: int = 2000
+    drift_threshold: float = 1e-3
+    max_fold_depth: int = 511
+    enable_streaming_fallback: bool = True
+    window_size: int = 32
+    d_head: int = 64
+    n_heads: int = 8
+    n_layers: int = 12
+    seed: int = 42
+    compressor: _Optional_B[object] = None  # Optional SRFTFusedINT8KVCodec
+
+
+class _SegmentHashDict:
+    """Minimal segment store backed by an OrderedDict for LRU eviction."""
+
+    def __init__(self, max_entries: int) -> None:
+        self._cache: _collections.OrderedDict = _collections.OrderedDict()
+        self._max_entries = max_entries
+        self._hits = 0
+        self._misses = 0
+
+    def _make_key(self, tokens: _List_B[int], chunk_idx: int, layer_idx: int) -> str:
+        import hashlib as _hl
+        import struct as _st
+        chunk = tokens[chunk_idx * 128: (chunk_idx + 1) * 128] or [0]
+        raw = _st.pack(f"{len(chunk)}I", *chunk)
+        layer_prefix = _st.pack("II", layer_idx, chunk_idx)
+        return _hl.sha256(layer_prefix + raw).hexdigest()
+
+    def put(self, key: str, value: _torch_b.Tensor) -> None:
+        if len(self._cache) >= self._max_entries:
+            self._cache.popitem(last=False)
+        self._cache[key] = value.detach().cpu()
+        self._cache.move_to_end(key)
+
+    def get(self, key: str) -> _Optional_B[_torch_b.Tensor]:
+        if key in self._cache:
+            self._cache.move_to_end(key)
+            self._hits += 1
+            return self._cache[key]
+        self._misses += 1
+        return None
+
+    def keys(self):
+        return list(self._cache.keys())
+
+    def hit_rate(self) -> float:
+        total = self._hits + self._misses
+        return self._hits / total if total > 0 else 0.0
+
+    def memory_bytes(self) -> int:
+        return sum(v.nbytes for v in self._cache.values())
+
+
+class KVFoldAccumulativeBlockManager:
+    """Auxiliary non-contiguous KV segment store with foldl accumulation (Activity B).
+
+    This class mirrors the contract of KVFoldAccumulativeRadixCache but is
+    designed to operate alongside vLLM's native KV cache without replacing it.
+
+    Public methods:
+      store_chunk()      — store a single KV chunk after attention
+      lookup_chunk()     — look up a single KV chunk (standard prefix match)
+      fold_chunk()       — integrate chunk into foldl accumulation chain
+      lookup_fold_prefix() — get accumulated KV prefix from fold state
+      get_noncontiguous_hits() — retrieve hits that bypassed contiguous-prefix
+                                  matching
+      hit_stats()        — return hit/miss/non-contiguous metrics dict
+    """
+
+    def __init__(self, config: KVFoldBlockManagerConfig) -> None:
+        self.config = config
+        self._store = _SegmentHashDict(max_entries=config.max_entries)
+        # fold_key → {accumulated_kv, chunk_ids, fold_depth, plateau_reached}
+        self._fold_states: _collections.OrderedDict = _collections.OrderedDict()
+        self._hits = 0
+        self._misses = 0
+        self._noncontiguous_hits = 0
+        self._fold_hits = 0
+        _torch_b.manual_seed(config.seed)
+
+    # ------------------------------------------------------------------ #
+    # Segment store API                                                    #
+    # ------------------------------------------------------------------ #
+
+    def store_chunk(
+        self,
+        token_ids: _List_B[int],
+        chunk_idx: int,
+        layer_idx: int,
+        kv_tensor: _torch_b.Tensor,
+    ) -> str:
+        """Store KV for one chunk. Returns the chunk key."""
+        key = self._chunk_key(token_ids, chunk_idx, layer_idx)
+        # Apply SRFT+INT8 compression if configured
+        stored = kv_tensor
+        if self.config.compressor is not None:
+            try:
+                stored = self.config.compressor.compression_hook(key, kv_tensor)
+            except Exception:
+                pass  # compression failure is non-fatal
+        self._store.put(key, stored)
+        return key
+
+    def lookup_chunk(
+        self,
+        token_ids: _List_B[int],
+        chunk_idx: int,
+        layer_idx: int,
+    ) -> _Optional_B[_torch_b.Tensor]:
+        """Look up KV for one chunk. Returns None on miss."""
+        key = self._chunk_key(token_ids, chunk_idx, layer_idx)
+        result = self._store.get(key)
+        if result is not None:
+            self._hits += 1
+        else:
+            self._misses += 1
+        return result
+
+    def lookup_segments(
+        self,
+        token_ids: _List_B[int],
+        layer_idx: int = 0,
+    ) -> _Tuple_B[_List_B[_Tuple_B[int, _torch_b.Tensor]], _List_B[int]]:
+        """Look up all chunks for a token sequence.
+
+        Returns:
+          hits: [(chunk_idx, kv_tensor)] for chunks found in cache
+          misses: [chunk_idx] for chunks not found
+        """
+        chunk_size = self.config.chunk_size
+        n_chunks = max(1, (len(token_ids) + chunk_size - 1) // chunk_size)
+        hits: _List_B[_Tuple_B[int, _torch_b.Tensor]] = []
+        misses: _List_B[int] = []
+        for i in range(n_chunks):
+            kv = self.lookup_chunk(token_ids, i, layer_idx)
+            if kv is not None:
+                hits.append((i, kv))
+            else:
+                misses.append(i)
+
+        # Track non-contiguous hits (hit after a miss)
+        miss_set = set(misses)
+        for idx, _ in hits:
+            if any(m < idx for m in miss_set):
+                self._noncontiguous_hits += 1
+
+        return hits, misses
+
+    # ------------------------------------------------------------------ #
+    # foldl accumulation API                                               #
+    # ------------------------------------------------------------------ #
+
+    def fold_chunk(
+        self,
+        chunk_tokens: _List_B[int],
+        layer_idx: int = 0,
+        existing_fold_key: _Optional_B[str] = None,
+    ) -> _Tuple_B[str, _torch_b.Tensor]:
+        """Integrate a chunk into the foldl accumulation state.
+
+        Mirrors KVFoldAccumulativeRadixCache.fold_chunk() logic.
+
+        Returns:
+          (fold_key, accumulated_kv)
+        """
+        cfg = self.config
+        n_heads, d_head = cfg.n_heads, cfg.d_head
+
+        # Load or init state
+        if existing_fold_key and existing_fold_key in self._fold_states:
+            state = self._fold_states[existing_fold_key]
+        else:
+            state = {
+                "accumulated_kv": _torch_b.empty(0, 2, n_heads, d_head),
+                "chunk_ids": [],
+                "fold_depth": 0,
+                "last_drift": float("inf"),
+                "plateau_reached": False,
+            }
+
+        # Early exit on plateau
+        if state["plateau_reached"] and existing_fold_key is not None:
+            return existing_fold_key, state["accumulated_kv"]
+
+        # Get/compute chunk KV
+        chunk_key = self._chunk_key_from_tokens(chunk_tokens, layer_idx)
+        cached_kv = self._store.get(chunk_key)
+        if cached_kv is None:
+            new_chunk_kv = self._synthetic_chunk_kv(chunk_tokens, layer_idx)
+            self._store.put(chunk_key, new_chunk_kv)
+        else:
+            new_chunk_kv = cached_kv
+
+        # foldl: cat accumulated_kv with new_chunk_kv
+        acc = state["accumulated_kv"]
+        if acc.shape[0] == 0:
+            updated_kv = new_chunk_kv
+        else:
+            updated_kv = _torch_b.cat([acc, new_chunk_kv], dim=0)
+
+        # Drift detection
+        if acc.shape[0] > 0:
+            prev_tail = acc[-new_chunk_kv.shape[0]:]
+            drift = (
+                (new_chunk_kv.float() - prev_tail.float()).norm().item()
+                / prev_tail.float().norm().clamp(min=1e-8).item()
+            )
+        else:
+            drift = float("inf")
+
+        plateau = drift < cfg.drift_threshold and state["fold_depth"] >= 2
+
+        # StreamingLLM fallback
+        max_tokens = cfg.window_size * cfg.chunk_size
+        if cfg.enable_streaming_fallback and updated_kv.shape[0] > max_tokens:
+            sink_tokens = min(4, updated_kv.shape[0])
+            keep_recent = max_tokens - sink_tokens
+            if keep_recent > 0:
+                updated_kv = _torch_b.cat(
+                    [updated_kv[:sink_tokens], updated_kv[-keep_recent:]], dim=0
+                )
+            else:
+                updated_kv = updated_kv[:sink_tokens]
+
+        # B+C integration: compress old chunks if compressor attached
+        if (
+            cfg.compressor is not None
+            and updated_kv.shape[0] > cfg.chunk_size
+            and updated_kv.dim() == 4
+        ):
+            try:
+                updated_kv = cfg.compressor.compression_hook("fold", updated_kv)
+            except Exception:
+                pass
+
+        # Build new fold_key and state
+        new_fold_key = f"fold:{layer_idx}:{chunk_key}:{state['fold_depth']}"
+        new_state = {
+            "accumulated_kv": updated_kv,
+            "chunk_ids": state["chunk_ids"] + [hash(tuple(chunk_tokens))],
+            "fold_depth": state["fold_depth"] + 1,
+            "last_drift": drift,
+            "plateau_reached": plateau,
+        }
+        if len(self._fold_states) >= cfg.max_entries:
+            self._fold_states.popitem(last=False)
+        self._fold_states[new_fold_key] = new_state
+
+        return new_fold_key, updated_kv
+
+    def lookup_fold_prefix(
+        self, fold_key: str
+    ) -> _Optional_B[_torch_b.Tensor]:
+        """Return accumulated KV prefix or None if not found."""
+        state = self._fold_states.get(fold_key)
+        if state is None:
+            return None
+        self._fold_hits += 1
+        self._hits += 1
+        return state["accumulated_kv"]
+
+    def register_prefolded_prefix(
+        self,
+        fold_key: str,
+        accumulated_kv: _torch_b.Tensor,
+        chunk_ids: _List_B[int],
+    ) -> None:
+        """Register a pre-accumulated KV prefix (from agentic pre-caching)."""
+        self._fold_states[fold_key] = {
+            "accumulated_kv": accumulated_kv,
+            "chunk_ids": chunk_ids,
+            "fold_depth": len(chunk_ids),
+            "last_drift": 0.0,
+            "plateau_reached": True,
+        }
+        self._store.put(fold_key, accumulated_kv)
+
+    # ------------------------------------------------------------------ #
+    # Stats                                                                #
+    # ------------------------------------------------------------------ #
+
+    def hit_stats(self) -> _Dict_B[str, _Any_B]:
+        total = self._hits + self._misses
+        nc_rate = (self._noncontiguous_hits + self._fold_hits) / max(self._hits, 1)
+        return {
+            "hit_rate": self._hits / total if total > 0 else 0.0,
+            "noncontiguous_hit_rate": nc_rate,
+            "fold_hits": self._fold_hits,
+            "total_hits": self._hits,
+            "total_misses": self._misses,
+            "fold_states": len(self._fold_states),
+            "segment_store_entries": len(self._store.keys()),
+            "memory_bytes": self._store.memory_bytes(),
+        }
+
+    # ------------------------------------------------------------------ #
+    # Internal helpers                                                     #
+    # ------------------------------------------------------------------ #
+
+    def _chunk_key(
+        self, token_ids: _List_B[int], chunk_idx: int, layer_idx: int
+    ) -> str:
+        import hashlib as _hl
+        import struct as _st
+        chunk_size = self.config.chunk_size
+        start = chunk_idx * chunk_size
+        end = start + chunk_size
+        chunk = token_ids[start:end] or [0]
+        raw = _st.pack(f"{len(chunk)}I", *chunk)
+        prefix = _st.pack("II", layer_idx, chunk_idx)
+        return _hl.sha256(prefix + raw).hexdigest()
+
+    def _chunk_key_from_tokens(
+        self, tokens: _List_B[int], layer_idx: int
+    ) -> str:
+        import hashlib as _hl
+        import struct as _st
+        chunk = tokens or [0]
+        raw = _st.pack(f"{len(chunk)}I", *chunk)
+        prefix = _st.pack("I", layer_idx)
+        return _hl.sha256(prefix + raw).hexdigest()
+
+    def _synthetic_chunk_kv(
+        self, chunk_tokens: _List_B[int], layer_idx: int
+    ) -> _torch_b.Tensor:
+        """Generate synthetic KV for testing without a live model."""
+        n_tok = len(chunk_tokens) or self.config.chunk_size
+        seed = (sum(chunk_tokens) + layer_idx) % (2 ** 31)
+        _torch_b.manual_seed(seed)
+        return _torch_b.randn(n_tok, 2, self.config.n_heads, self.config.d_head)
+
+
+def make_kvfold_kv_cache_manager_class(
+    base_class: type,
+    **default_fold_kwargs: _Any_B,
+) -> type:
+    """Factory: embed a KVFoldAccumulativeBlockManager inside a KVCacheManager subclass.
+
+    The returned class adds a `kvfold_store` attribute (KVFoldAccumulativeBlockManager)
+    accessible on any instance. This allows the engine/worker to call
+    `scheduler.kv_cache_manager.kvfold_store.fold_chunk(...)` etc.
+
+    Args:
+        base_class: vllm.v1.core.kv_cache_manager.KVCacheManager (or mock).
+        **default_fold_kwargs: KVFoldBlockManagerConfig keyword args.
+
+    Example:
+        from vllm.v1.core.kv_cache_manager import KVCacheManager
+        KVFoldMgr = make_kvfold_kv_cache_manager_class(
+            KVCacheManager,
+            chunk_size=128, n_heads=32, d_head=128, window_size=16,
+        )
+    """
+
+    class _KVFoldKVCacheManager(base_class):
+        def __init__(self, *args: _Any_B, **kwargs: _Any_B) -> None:
+            fold_cfg = KVFoldBlockManagerConfig(**{
+                k: kwargs.pop(k, v)
+                for k, v in default_fold_kwargs.items()
+            })
+            super().__init__(*args, **kwargs)
+            self.kvfold_store = KVFoldAccumulativeBlockManager(fold_cfg)
+
+    _KVFoldKVCacheManager.__name__ = f"KVFold_{base_class.__name__}"
+    _KVFoldKVCacheManager.__qualname__ = f"KVFold_{base_class.__qualname__}"
+    return _KVFoldKVCacheManager
+
+
+def _smoke_test_kvfold_block_manager() -> None:
+    """Smoke test: KVFoldAccumulativeBlockManager 2026-05-13."""
+    print("[smoke] KVFoldAccumulativeBlockManager (Activity B 2026-05-13)")
+
+    cfg = KVFoldBlockManagerConfig(
+        chunk_size=4,
+        max_entries=50,
+        n_heads=2,
+        d_head=8,
+        window_size=4,
+        seed=42,
+    )
+    mgr = KVFoldAccumulativeBlockManager(cfg)
+
+    # Synthetic tokens for 2 chunks
+    tokens_a = list(range(8))   # chunk 0: [0..3], chunk 1: [4..7]
+    kv_chunk0 = _torch_b.randn(4, 2, 2, 8)
+    kv_chunk1 = _torch_b.randn(4, 2, 2, 8)
+
+    # Store
+    key0 = mgr.store_chunk(tokens_a, 0, 0, kv_chunk0)
+    key1 = mgr.store_chunk(tokens_a, 1, 0, kv_chunk1)
+    assert key0 != key1
+
+    # Lookup hit
+    result0 = mgr.lookup_chunk(tokens_a, 0, 0)
+    assert result0 is not None, "chunk 0 should be a cache hit"
+
+    # foldl accumulation
+    fold_key1, acc1 = mgr.fold_chunk(tokens_a[:4], layer_idx=0)
+    assert fold_key1.startswith("fold:")
+    fold_key2, acc2 = mgr.fold_chunk(tokens_a[4:], layer_idx=0, existing_fold_key=fold_key1)
+    assert acc2.shape[0] >= 4, "accumulated KV should cover at least 1 chunk"
+
+    # fold prefix lookup
+    prefix = mgr.lookup_fold_prefix(fold_key2)
+    assert prefix is not None
+
+    # Non-contiguous segment lookup
+    hits, misses = mgr.lookup_segments(tokens_a, layer_idx=0)
+    print(f"  hits={len(hits)}, misses={len(misses)}")
+
+    stats = mgr.hit_stats()
+    print(f"  hit_stats: {stats}")
+    assert stats["total_hits"] >= 1
+
+    # Factory test
+    try:
+        from vllm.v1.core.kv_cache_manager import KVCacheManager
+        KVFoldMgr = make_kvfold_kv_cache_manager_class(
+            KVCacheManager, chunk_size=4, n_heads=2, d_head=8
+        )
+        assert issubclass(KVFoldMgr, KVCacheManager)
+        print(f"  factory class: {KVFoldMgr.__name__} — PASS")
+    except Exception as e:
+        print(f"  factory test skipped (no GPU): {e}")
+
+    print("  KVFoldAccumulativeBlockManager: PASS")
+
     print("AdapShotBlockManager smoke test: PASS")

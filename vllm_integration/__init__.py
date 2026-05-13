@@ -1,5 +1,20 @@
 # vllm_integration: Activity A+B+C KV cache port for vLLM 0.20.2
 #
+# 2026-05-13 cycle additions:
+#   scheduler_patch       — PBKVAgentSegmentPreservationSchedulerMixin (Activity A):
+#                             PBKV prediction-based segment preservation, fairness-weighted
+#                             request reordering, GPU preserve/host evict policy.
+#                           + make_pbkv_scheduler_class() factory
+#   block_manager_patch   — KVFoldAccumulativeBlockManager (Activity B):
+#                             foldl accumulator-based non-contiguous KV reuse,
+#                             StreamingLLM fallback, SRFT+INT8 B+C integration hook.
+#                           + make_kvfold_kv_cache_manager_class() factory
+#   attention_backend_patch — SRFTInt8AttentionHook (Activity C):
+#                              SRFT Gaussianization + INT8 per-group compression,
+#                              write_to_cache() / read_from_cache() hooks,
+#                              apply_srft_int8_patch() for FlashAttentionImpl.
+#                            + extend_cache_config_srft_int8() helper
+#
 # 2026-05-12 cycle additions:
 #   block_manager_patch   — AdapShotBlockManager: B+C AdapShotMixedDimSegmentPipeline
 #                             parallel auxiliary store (RoPE re-encoding + MixedDim codec)
