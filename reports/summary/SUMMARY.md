@@ -154,6 +154,7 @@
 | 2026-05-10 | **0.20.2** | **B+C** (KVPacketVQBlockManager + VQCodecAttentionHook + KVPacketSegmentSchedulerMixin) | **✓ Pass (1회차)** | CacheConfig.compression_method 필드 vLLM 0.20.2에 없음 — VQCodecAttentionHook 외부 주입으로 기능 동등. CPU-only 환경(libcuda.so.1 없음). 기존 사이클(05-03~05-09) backward-compat 전부 Pass. |
 | 2026-05-11 | **0.20.2** | **B+C** (WiCERBlockManager + RateQuantVllmCodec + RateQuantAttentionHook + make_wicer_kv_cache_manager_class()) | **✓ Pass (1회차)** | 압축 텐서 어텐션 커널 진입 없음 코드 수준 보장. 2026-05-04 VllmRedundancyAwareEvictionPolicy 기존 실패(본 사이클 무관). 신규 테스트 전부 Pass. |
 | 2026-05-12 | **0.20.2** | **B+C Cross-2** (AdapShotBlockManager + MixedDimAttentionHook + AdapShotMixedDimSegmentPipeline + make_adapshot_kv_cache_manager_class()) | **✓ Pass (2회차)** | 루프 1: install.sh 2026-05-09 블록 `set +e`/`set -e` 래핑 누락으로 2026-05-12 섹션 미도달, attention_backend_patch.py line 2127 docstring 파라미터 값 오류. 루프 2: 양 이슈 해소. 743/743 테스트 전량 통과. |
+| 2026-05-13 | **0.20.2** | **A+B+C** (PBKVAgentSegmentPreservationSchedulerMixin + KVFoldAccumulativeBlockManager + SRFTInt8AttentionHook; AgenticChunkPreCachingPipeline) | **✓ Pass (1회차)** | 47/51 smoke 테스트 통과 (4 skip = GPU libcuda.so.1 없는 환경 조건부). deprecation 경고 0건. A: W≥100 대형 큐 오버헤드 ~9ms (실용 범위 외). C: KL=8×10⁻⁸(역대 최저). 파일 헤더 버전 불일치(0.20.1 참조 일부 — cosmetic). |
 
 ---
 
@@ -181,9 +182,15 @@
 - **WiCERIterativeKVWikiCache CEGAR 반복 세분화 (2026-05-11)**: 도메인 코퍼스 100% 히트율. SHA-256 청크 해시 기반 위치-독립 세그먼트 저장으로 비연속 재사용 구조 강화. gap-containing 쿼리 50%+ NC 확인.
 - **RateQuantReverseWaterfillingCodec 정보이론 최적 비트 할당 (2026-05-11)**: 역 물채우기 Lagrange λ 바이너리 서치로 avg_bits=4.0 달성. −75% 메모리 절감. int8 오버플로우 구조적 해결(int16 저장). KL=0.000013(역대 최저). 660/660 테스트 통과(새 최다).
 - **r_h 메타데이터 직렬화 (2026-05-11)**: save_pipeline()에 codec_bit_allocation + codec_head_variances 저장. 로딩 시 재캘리브레이션 불필요(zero-overhead loading).
+- **MixedDimPerTokenBudgetCodec 역대 최저 accuracy delta 0.36% (2026-05-12)**: bisection 64회 training-free 탐색. budget_ratio 0.30~0.70 전 범위에서 ±1% 이내. 743/743 누적 테스트 전량 통과.
+- **RoPEReencodingNonContiguousCache position-decoupled 구조 확립 (2026-05-12)**: content hash 위치-독립 키 + RoPE 재인코딩 in-place로 위치 불일치 비연속 세그먼트 히트율 100% 달성.
+- **A+B+C 삼중 조합 단일 사이클 완성 (2026-05-13)**: PBKVAgentSegmentPreservationSchedulerMixin + KVFoldAccumulativeRadixCache + SRFTFusedINT4KVKernel이 AgenticChunkPreCachingPipeline으로 통합. CacheStore 인터페이스 완전 준수(6개 추상 메서드). 855/855 테스트 역대 최다 전량 통과.
+- **SRFTInt8AttentionHook KL=8×10⁻⁸ 역대 최저 수준 달성 (2026-05-13)**: SRFT 직교 변환 + SMD RL 편향 제거 조합. 다중 크기 스캔(3종 seed) 전 조합 key/value 오차 0.53~0.59%. vLLM 환경에서 독립 구현 대비 정확도 추가 개선(0.66% → 0.59%).
+- **KVFoldAccumulativeRadixCache foldl 비연속 추적 확립 (2026-05-13)**: get_segments_with_fold()가 miss 구간 이후 hit를 비연속으로 정확 추적. agentic 워크로드 40/40 히트. StreamingLLM window_size×chunk_size 상한으로 메모리 폭발 구조적 방지.
+- **vLLM 1회차 Pass 연속 강화 (2026-05-13)**: 13사이클 중 9사이클이 vLLM 이식 1회차 내 통과. deprecation 경고 0건.
 
 ### 아직 해결 안 된 것
-- **실제 GPU 처리량 미검증**: 11개 사이클 모두 CPU/시뮬레이션 환경. H100/A100에서 tokens/sec +20% 목표 Flash Attention 커널 연동 환경 검증 미완.
+- **실제 GPU 처리량 미검증**: 13개 사이클 모두 CPU/시뮬레이션 환경. H100/A100에서 tokens/sec +20% 목표 Flash Attention 커널 연동 환경 검증 미완.
 - **GPU perplexity 대규모 모델 검증 미완**: LLaMA-3.1-8B / WikiText-2 / LongBench 실측은 미완. 2026-05-11은 proxy 기반(random N(0,1) 데이터) 통과.
 - **compression_ratio 스윕 미완**: 2026-05-06 사이클에서 ratio=0.10만 실측. 정확도-압축률 트레이드오프 곡선 미확립.
 - **TTFT GPU 실측 미완**: CPU-only 환경에서만 스케줄링 오버헤드 측정됨.
@@ -199,12 +206,15 @@
 - **WiCER CEGAR 순수 비연속 히트율 추가 검증**: 코퍼스 반복 쿼리는 gap-less coverage로 NC=0%; mixed-document 워크로드에서 ≥30% NC 실측 필요.
 - **avg_bits < 4.0 탐색 미완**: RateQuant 역 물채우기에서 총 비트 예산 2.0~3.0 범위 정확도-메모리 트레이드오프 미측정.
 - **2026-05-04 VllmRedundancyAwareEvictionPolicy 버그 미해결**: install.sh 사전 존재 실패 항목. 해당 사이클 코드 수정 필요.
+- **Activity A 대형 큐 오버헤드 미해결 (2026-05-13 신규)**: PBKVAgentSegmentPreservationSchedulerMixin W≥100에서 pbkv_pre_schedule ~9ms로 5ms 임계값 초과. 조기 종료 또는 배치 임베딩 캐시 추가 필요.
+- **SRFTFusedINT4KVKernel 이론-실측 불일치 지속 (2026-05-13)**: 이론치 73.4%(4-bit), 실측 48.4%(INT8). nibble-pack INT4 실구현 전까지 이중 보고 지속.
+- **파일 헤더 버전 불일치 (2026-05-13 cosmetic)**: block_manager_patch.py, attention_backend_patch.py 일부 docstring이 vLLM 0.20.1 참조. 기능 영향 없으나 다음 사이클 정리 권고.
 
 ### 다음 우선순위 제언
-1. **Activity A 스케줄러 완전 통합 + A+B+C 삼중 조합 완성 (최우선)**: KVPacketSegmentSchedulerMixin(05-10), QueryCentricSchedulerMixin(05-06), HitAwarePPDRouter(05-09)를 WiCERRateQuantPipeline(05-11)과 결합해 A+B+C 삼중 조합 단일 사이클에서 완성. vLLM make_wicer_kv_cache_manager_class + RateQuantAttentionHook + 스케줄러 조합 검증.
-2. **WiCER mixed-document 워크로드에서 NC 히트율 실측**: CEGAR 코퍼스 반복 쿼리 외에 gap-containing 혼합 문서 워크로드에서 비연속 히트율 ≥30% 실측 확인. benchmark_mixed_queries.py 추가.
-3. **RateQuant avg_bits 스윕 (2.0~8.0)**: 역 물채우기 Lagrange λ 범위 확장해 정확도-메모리 트레이드오프 곡선 수립. results/2026-05-11/ratequant_sweep.json 저장.
-4. **실제 LLM perplexity 검증 (LLaMA-3.1-8B 또는 GPT-2)**: RateQuantCodec + WiCERIterativeKVWikiCache 조합을 실제 언어 모델에서 WikiText-2 perplexity 측정. ±1% 기준 대규모 모델 검증 완료 목표.
-5. **GPU 벤치마크 환경 구축**: run_gpu_throughput.py CUDA 환경에서 실행. TTFT p50/p99, TBT, tokens/sec 실측. WiCERRateQuantPipeline의 실제 지연 측정.
+1. **실 GPU 처리량 측정 (최우선, 13사이클 누적 미완)**: A+B+C 삼중 조합(AgenticChunkPreCachingPipeline)이 완성된 지금, GPT-2 또는 LLaMA-3.2 1B 실 모델을 vLLM에 연동해 throughput(tokens/sec) 및 TTFT p50을 results/2026-05-13/metrics.json에 기록. +20% 목표 실증의 마지막 단계.
+2. **Activity A 대형 큐 오버헤드 최적화**: PBKVAgentSegmentPreservationSchedulerMixin W≥100 오버헤드 ~9ms 해소. 상위 N개만 처리하는 조기 종료 또는 배치 임베딩 캐시 도입으로 W=100 시나리오 5ms 이내 달성.
+3. **INT4 nibble-pack 실구현**: SRFTFusedINT4KVKernel의 torch.int8 저장을 nibble-pack으로 교체해 −73.4% 이론치와 실측치 일치. 파일 헤더 버전 동기화(0.20.1 → 0.20.2) 병행.
+4. **실제 LLM perplexity 검증 (LLaMA-3.1-8B 또는 GPT-2)**: SRFTInt8AttentionHook + KVFoldAccumulativeBlockManager 조합을 실 언어 모델에서 WikiText-2 perplexity 측정. ±1% MANDATORY 기준 대규모 모델 환경 확인.
+5. **RateQuant avg_bits 스윕 및 compression_ratio 트레이드오프 곡선 수립**: avg_bits 2.0~8.0 범위 역 물채우기 스윕 + TriAttentionCodec ratio 스윕(0.05~0.30)으로 정확도-메모리 트레이드오프 곡선 데이터 확립.
 
 SUMMARY_UPDATED
