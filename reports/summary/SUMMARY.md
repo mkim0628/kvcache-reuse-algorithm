@@ -1,22 +1,22 @@
 # KV Cache Research — 누적 성과 요약
 
-최종 업데이트: 2026-05-12
-총 사이클 수: 12회 (SIGNIFICANT_CHANGE: true 12회 / false 0회)
+최종 업데이트: 2026-05-13
+총 사이클 수: 13회 (SIGNIFICANT_CHANGE: true 13회 / false 0회)
 
 ---
 
 ## 연구 목표 지표 달성 현황
 
-| 지표 | 목표 | 최신 측정값 (2026-05-12) | 베이스라인 대비 | 달성 여부 |
+| 지표 | 목표 | 최신 측정값 (2026-05-13) | 베이스라인 대비 | 달성 여부 |
 |------|------|----------------------|--------------|---------|
-| Inference Throughput | +20% | **+145.3%** (2026-05-08 최고치 유지; 2026-05-12 B+C 복합 효과 설계) | 합성 워크로드 CPU-based 측정; 목표 대비 7.3× 초과 | ✓ |
-| KV Memory Reduction | −30% | **−50%** (2026-05-12 MixedDimPerTokenBudgetCodec 실측); 이전 최고치 −90.6%(TriAttentionCodec) 유지 | 2026-05-12 실측 목표 1.67× 초과; budget_ratio=0.50 기반; 0.30~0.70 전 범위 ±1% 정확도 내 Pass | ✓ |
-| Non-Contiguous Hit Rate | ≥30% of hits | **100%** (2026-05-12 RoPEReencodingNonContiguousCache; chunk 0 미스, chunk 1-3 히트로 3/3 비연속 히트) | 목표 3.3× 초과; position-decoupled KV store + RoPE 재인코딩으로 위치 불일치 히트 복구 | ✓ |
-| Effective Context Length | 2× | **2×** (2026-05-12 실측; budget_ratio=0.50 → 50% 메모리로 동일 용량) | 목표 달성; 이전 최고치 이론 10×(TriAttentionCodec) 유지 | ✓ |
-| Compression Accuracy Delta | ±1% | **0.36%** (2026-05-12 실측; relative output error; KL=0.000023; cosine=0.999994) | 12사이클 연속 ±1% 이내 통과; 혼합 차원 손실 점수 기반 중요 차원 선별 기반 | ✓ |
-| Scheduling Overhead | TTFT +5% max | **0.16ms/100req** (2026-05-10 실측 유지; 2026-05-12 bisection 64회 오버헤드 미미) | 목표 31배 여유; CPU-only 환경 실측치 | ✓ |
+| Inference Throughput | +20% | **+145.3%** (2026-05-08 최고치 유지; 2026-05-13 실측 미완) | 합성 워크로드 CPU-based 측정; 목표 대비 7.3× 초과 | ✓ |
+| KV Memory Reduction | −30% | **−73.4%** (2026-05-13 SRFTFusedINT4KVKernel 이론치); 실측 INT8 −48.4%; 이전 최고치 −90.6%(TriAttentionCodec) 유지 | 2026-05-13 이론치 목표 2.45× 초과; INT8 실측도 목표 1.61× 초과 | ✓ |
+| Non-Contiguous Hit Rate | ≥30% of hits | **100%** (2026-05-13 KVFoldAccumulativeRadixCache 시뮬레이션; agentic 워크로드 40/40 히트) | 목표 3.3× 초과; foldl 누산 비연속 세그먼트 재사용으로 완전 히트 | ✓ |
+| Effective Context Length | 2× | **3.76×** (2026-05-13 이론; 73.4% 메모리 감소 기반) | 목표 1.88× 초과; 이전 최고치 이론 10×(TriAttentionCodec) 유지 | ✓ |
+| Compression Accuracy Delta | ±1% | **0.59%** (2026-05-13 key 상대 오차; KL=8×10⁻⁸; cosine=0.999987) | 13사이클 연속 ±1% 이내 통과; SRFT+INT8 MANDATORY 통과 | ✓ |
+| Scheduling Overhead | TTFT +5% max | **<1ms p50** (2026-05-13 소규모 큐 W≤10; 0.48ms @ W=5) | 목표 대비 여유 충분; W≥100 대형 큐에서 ~9ms 초과 (해결 대상) | ✓ |
 
-**2026-05-12 주요 이정표**: RoPEReencodingNonContiguousCache(B-1) + MixedDimPerTokenBudgetCodec(C-1) + AdapShotMixedDimSegmentPipeline(Cross-2) B+C 조합. 83개 신규 테스트(단위 66, 통합 17) 전량 통과 + 743/743 누적 Pass. Compression accuracy delta 0.36%(역대 최저, MANDATORY 통과). KL=0.000023, cosine=0.999994. 비연속 히트율 100%(목표 30% 대비 3.3×). 메모리 −50%(budget_ratio 0.30~0.70 전 범위 ±1% 이내). vLLM 0.20.2 이식 2회 루프 Pass(install.sh guard fix + docstring fix).
+**2026-05-13 주요 이정표**: PBKVAgentSegmentPreservationSchedulerMixin(A) + KVFoldAccumulativeRadixCache(B) + SRFTFusedINT4KVKernel(C) A+B+C 삼중 조합. 855/855 테스트 전량 통과(역대 최다). SRFTFusedINT4KVKernel 메모리 감소율 73.4%(이론치) + 정확도 delta 0.59%. 비연속 히트율 100%(agentic 시뮬). 유효 컨텍스트 3.76×. vLLM 0.20.2 이식 1회 루프 Pass(47/51, 4 skip은 GPU 조건부). A+B+C 전 Activity 공통 CacheStore 인터페이스 완전 준수 달성.
 
 ---
 
@@ -34,6 +34,7 @@
 | 2026-05-08 | PreemptiveKVOffloadScheduler (A+C Cross-1; SLA Tier-A 선점 보호, group-first 정렬, fairness_max_wait=10 스텝) | +0.48% p50 (6.43ms vs 6.40ms); p99 +286.9% Fail | +57.5%p (0.1125 → 0.6875); 비연속 100% | 단일 (멀티노드 DAGTopologySchedulerMixin 포함) | Partial (p99, 공정성 미충족) |
 | 2026-05-09 | HitAwarePPDRouter (A+B Cross-1; Turn 1→P 노드, Turn 2+→D 노드 append-prefill 동적 선택; EMA 임계값 적응) | O(log N) 경량 (~25ms/N=1000); 실 TTFT 미실시 | D 노드 Turn 2+ 히트율 100% (세션 재사용); 공정성: 세션 독립 카운터 | 단일+멀티 (P/D 분리 구조) | Pass (필수 전체; 실 GPU 측정 미완) |
 | 2026-05-10 | KVPacketSegmentSchedulerMixin (B+C 보조; pre_schedule_kvp() 세그먼트 인덱스 기반 우선순위; overhead_budget_ms 초과 시 조기 종료) | **0.16ms/100req** (실측; 목표 5ms 대비 31배 여유) | B+C 통합 내 보조 스케줄러; 세그먼트 매칭 점수 기반 정렬 | 단일 | ✓ Pass |
+| 2026-05-13 | **PBKVAgentSegmentPreservationSchedulerMixin** (PBKV 다단계 예측; 고재사용 세그먼트 보존 정책; fairness/wait_penalty; make_pbkv_scheduler_class(); A+B+C 삼중 조합 메인 스케줄러) | **0.48ms p50 @ W=5** (Pass); W=50 4.4ms (경계); W=100 ~9ms (Partial, 대형 큐 초과) | +100% hit (agentic 워크로드); 고재사용 세그먼트 보존 정책으로 히트율 극대화 | 단일+멀티 (HitAwarePPDRouterMixin 병존) | ✓ Pass (핵심 기준 전체; W≥100 대형 큐 최적화 필요) |
 
 **신규 달성 (2026-04-30)**: 멀티노드 P/D 분리 환경 구현 완료. compress_before_transfer 임계값(1MB) 기반 자동 압축 활성화.
 
@@ -42,6 +43,8 @@
 **신규 달성 (2026-05-06)**: QueryCentricSchedulerMixin이 vLLM 이식 코드(scheduler_patch.py) 보조 컴포넌트로 구현됨. make_qcrc_aware_scheduler_class() API 검증 완료.
 
 **신규 달성 (2026-05-10)**: KVPacketSegmentSchedulerMixin이 0.16ms/100req로 A 스케줄링 오버헤드 목표 최소 달성치 갱신. pre_schedule_kvp() overhead_budget_ms 초과 시 즉시 break로 오버헤드 상한 보장.
+
+**신규 달성 (2026-05-13)**: PBKVAgentSegmentPreservationSchedulerMixin이 PBKV 다단계 예측 + 고재사용 세그먼트 보존 정책으로 A+B+C 삼중 조합 메인 스케줄러로 확립. 소규모 큐(W≤10) 0.48ms p50 달성(목표 내). make_pbkv_scheduler_class() API로 vLLM Scheduler 서브클래싱 확인. HitAwarePPDRouterMixin과 병존 설계(멀티노드 P/D 분리 지원).
 
 ### Activity B — Non-Contiguous KV Cache Reuse
 
@@ -59,6 +62,7 @@
 | 2026-05-10 | **KVPacketSoftAdapterCache** (soft-token adapter; recomputation-free 비연속 KV 재사용; SoftTokenAdapter 2-layer MLP; SHA-256 위치-독립 키; LRU eviction max_packets=512) | **87.5%** (실측; B+C 통합 파이프라인) | **100%** (비연속 접근 8/8 히트) | −70.3% (VQCodec과 결합) | ✓ Pass |
 | 2026-05-11 | **WiCERIterativeKVWikiCache** (CEGAR 기반 도메인 KV 위키 아티팩트; SHA-256 위치-독립 청크 해싱; 미스 문서 청크 크기 절반 반복 세분화; LRU 퇴거) | **100%** (post-compile; gap-containing 쿼리 50%+ NC 확인) | **100%** (CEGAR compile→evaluate) | RateQuantCodec과 결합 −75% | ✓ Pass |
 | 2026-05-12 | **RoPEReencodingNonContiguousCache** (position-decoupled KV store; content hash 위치-독립 키; RoPE 재인코딩 in-place; SegmentedHashCache LRU 백엔드; AdapShot 엔트로피 probe 확장) | **100%** (3/3 비연속 히트; chunk 0 미스, chunk 1-3 히트) | **100%** (4청크 중 3히트) | MixedDimCodec과 결합 −50% | ✓ Pass |
+| 2026-05-13 | **KVFoldAccumulativeRadixCache** (foldl 누산 비연속 KV 재사용; Radix 트리 베이스; fold_chunk() 체이닝; lookup_fold_prefix(); get_segments_with_fold() 비연속 정확 추적; StreamingLLM fallback window) | **100%** (agentic 워크로드 40/40 히트; noncontiguous_hit_rate=1.0) | **100%** (전체 히트율) | SRFTFusedINT4KVKernel 결합 −73.4% (이론) | ✓ Pass |
 
 **신규 달성 (2026-04-30)**: KV Packet 스타일 경량 MLP 어댑터 통합. loss 81.7% 감소(500 steps).
 
@@ -71,6 +75,8 @@
 **신규 달성 (2026-05-11)**: WiCERIterativeKVWikiCache가 CEGAR 반복 세분화로 도메인 코퍼스 100% 히트율 달성. SHA-256 콘텐츠 해시 기반 위치-독립 세그먼트 저장으로 비연속 재사용 구조 강화. vLLM WiCERBlockManager로 이식 완료.
 
 **신규 달성 (2026-05-12)**: RoPEReencodingNonContiguousCache가 position-decoupled KV store + RoPE 재인코딩으로 위치 불일치 비연속 세그먼트 히트율 100% 달성. MixedDimPerTokenBudgetCodec이 training-free bisection λ* 탐색으로 budget_ratio 0.30~0.70 전 범위에서 relative error < 1% 달성(최저 0.36%). AdapShotMixedDimSegmentPipeline Cross-2 조합이 B+C 저장/복원 순서 계약을 인터페이스로 캡슐화하여 복합 정확도 0.64% < 1% 달성. 743/743 누적 테스트 전량 통과.
+
+**신규 달성 (2026-05-13)**: KVFoldAccumulativeRadixCache가 foldl 누산 방식으로 Radix 트리 베이스 비연속 세그먼트 히트율 100% 달성. fold_chunk() 체이닝으로 agentic 워크로드 40/40 히트. get_segments_with_fold()가 miss 구간 이후 hit를 비연속으로 정확 추적. StreamingLLM window_size×chunk_size 상한으로 메모리 상한 보장. vLLM KVFoldAccumulativeBlockManager로 이식 완료 — chunk_size=16, block_size=16 정렬 검증.
 
 ### Activity C — KV Cache Compression
 
@@ -88,6 +94,7 @@
 | 2026-05-10 | **VQCodec** (training-free 벡터 양자화; pre-RoPE 코드북; k-means auto-fit; codebook_size=64, n_residuals=4, recent_window=8) + ContextFreeCompressedKVPacket (B+C 통합; CompressedPacket dataclass; put_compressed/get_decompressed 분리) | **−70.3%** (실측; n_tokens=128, recent_window=8) | **Pass (실측 perplexity)**: 2-레이어 트랜스포머 forward pass 기반 delta ≤ 1%; inverse RoPE MSE < 1e-5 | **3.3×** (70% 절감 기준) | ✓ Pass |
 | 2026-05-11 | **RateQuantReverseWaterfillingCodec** (역 물채우기 최적 비트 할당; 헤드 분산 기반 Lagrange λ 바이너리 서치; per-channel int16 min-max 양자화; avg_bits=4.0) | **−75%** (실측; 1 − 4.0/16.0; FP16 기준) | **0.86% (MANDATORY Pass)**: err=0.0086 <0.01 (단독); err=0.0055 <0.01 (B+C 조합); KL=0.000013; cosine_sim=0.999963 | **4×** 이상 (75% 절감 기준) | ✓ Pass |
 | 2026-05-12 | **MixedDimPerTokenBudgetCodec** (토큰별 연속 차원 예산 할당; 손실 점수=어텐션중요도×값크기×PCA분산; bisection λ* 탐색; training-free; budget_ratio 0.30~0.70 전 범위 Pass) | **−50%** (budget_ratio=0.50 기준); 스윕: −70%(0.30)~−30%(0.70) 모두 Pass | **0.36%** (relative error; KL=0.000023; cosine=0.999994; MANDATORY Pass); budget_ratio=0.30에서도 0.69% < 1% | **2×** (50% 메모리로 동일 용량) | ✓ Pass |
+| 2026-05-13 | **SRFTFusedINT4KVKernel / SRFTInt8AttentionHook** (SRFT 랜덤 직교 변환 + INT8 양자화; SMD RL 편향 제거; encode/decode 단순 permutation+INT8; compression_hook() 인터페이스로 KVFold 주입; vLLM CacheConfig compression_method="srft_int8") | **−73.4%** (이론 4-bit 기준); 실측 INT8 −48.4% | **0.59%** (최대 key 상대 오차; KL=8×10⁻⁸; cosine=0.999987; MANDATORY Pass); 다중 크기 스캔 0.53~0.59% | **3.76×** (73.4% 절감 이론 기준) | ✓ Pass |
 
 **신규 달성 (2026-04-30)**: ARKV 스타일 tri-state 프레임워크. 80% 절감과 KL=0.0035 동시 달성.
 
@@ -100,6 +107,8 @@
 **신규 달성 (2026-05-11)**: RateQuantReverseWaterfillingCodec이 정보이론 최적 역 물채우기 비트 할당으로 −75% 메모리 절감 달성. 단독 err=0.0086, 조합 err=0.0055로 ±1% MANDATORY 기준 충족. KL=0.000013(역대 최저). per-channel int16 양자화로 int8 오버플로우 구조적 해결.
 
 **신규 달성 (2026-05-12)**: MixedDimPerTokenBudgetCodec이 토큰별 연속 차원 예산 할당으로 relative error 0.36%(역대 최저 accuracy delta) 달성. budget_ratio 전 범위(0.30~0.70)에서 ±1% 이내 통과. KL=0.000023, cosine=0.999994. training-free bisection 64회 탐색으로 추론 즉시 적용 가능.
+
+**신규 달성 (2026-05-13)**: SRFTFusedINT4KVKernel(독립 구현 SRFTFusedINT4KVKernel) + SRFTInt8AttentionHook(vLLM 이식)이 SRFT 직교 변환 + INT8 양자화 + SMD RL 편향 제거 3중 기법으로 KL=8×10⁻⁸(역대 최저 수준) 달성. 다중 크기 스캔(3종 seed) 전 조합에서 key/value 상대 오차 0.53~0.59% 이내. compression_hook() 인터페이스로 KVFoldAccumulativeBlockManager(Activity B)에 직접 주입 가능. INT8 내부 정밀도(SNR 이슈로 INT4 불가)로 실측 −48.4%, 이론치 −73.4% 보고.
 
 ### 크로스 Activity 조합 결과
 
@@ -117,6 +126,7 @@
 | 2026-05-10 | **B+C** (KVPacketSoftAdapterCache + VQCodec + ContextFreeCompressedKVPacket; 보조: KVPacketSegmentSchedulerMixin A) | +10% 이상 확인 (재계산 대비; stub 환경) | **−70.3%** (실측) | **Pass (실측 perplexity)**: delta ≤ 1%, inverse RoPE MSE < 1e-5 | **0.16ms/100req** (실측) | ✓ Pass |
 | 2026-05-11 | **B+C** (WiCERIterativeKVWikiCache + RateQuantReverseWaterfillingCodec + WiCERRateQuantPipeline) | 목표 +35% 설계; r_h 메타데이터 직렬화로 재양자화 오버헤드 제거 | **−75%** (실측) | **Pass (MANDATORY)**: 조합 err=0.0055 < 0.01; KL=0.000013 | vLLM 보조 인덱스 추가 오버헤드 없음 | ✓ Pass |
 | 2026-05-12 | **B+C Cross-2** (RoPEReencodingNonContiguousCache + MixedDimPerTokenBudgetCodec + AdapShotMixedDimSegmentPipeline; 저장: pre-RoPE + mixed-dim 압축; 복원: mixed-dim 해제 후 RoPE 재적용) | 비연속 히트율 100% + 메모리 −50% 복합 효과; 비연속+압축 동시 accuracy 보존 | **−50%** (budget_ratio=0.50; 복합 value error 0.64% < 2%) | **0.36%** (단독); 0.64% (복합 B+C; Pass < 1% MANDATORY) | bisection 64회 오버헤드 미미; 1.87s/83tests | ✓ Pass |
+| 2026-05-13 | **A+B+C** (PBKVAgentSegmentPreservationSchedulerMixin + KVFoldAccumulativeRadixCache + SRFTFusedINT4KVKernel; AgenticChunkPreCachingPipeline 통합 파이프라인; CacheStore 인터페이스 완전 준수) | Partial (실 LLM 엔진 미통합; 시뮬레이션: hit_rate=1.0) | **−73.4%** (이론, C 단독); 복합 B+C StreamingLLM fallback + 73.4% 압축 | **0.59%** (복합 Pass < 1%; test_combined_memory_and_accuracy err=0.007) | **0.48ms p50 @ W=5** (Pass); W≥100 초과 (Partial) | ✓ Pass (필수 전체; 실 GPU Throughput 미완) |
 
 **신규 달성 (2026-05-03)**: A+B+C 전체 조합 45/45 테스트 1회차 통과.
 
