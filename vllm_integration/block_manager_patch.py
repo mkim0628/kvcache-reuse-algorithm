@@ -4667,10 +4667,25 @@ class FibQuantVQSegmentKVManager(KVCacheManager):
     # Internal helpers
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _chunk_key(token_ids: List[int], chunk_idx: int, layer_idx: int) -> str:
-        """Content-hash key for a chunk (position-independent)."""
-        chunk_size = 64  # default; matches fibquant_chunk_size
+    def _chunk_key(
+        self,
+        token_ids: List[int],
+        chunk_idx: int,
+        layer_idx: int,
+        chunk_size: Optional[int] = None,
+    ) -> str:
+        """Content-hash key for a chunk (position-independent).
+
+        Args:
+            token_ids: Full token ID list for the request.
+            chunk_idx: 0-based chunk index.
+            layer_idx: Transformer layer index.
+            chunk_size: Override chunk size; defaults to self.fibquant_chunk_size.
+
+        Returns:
+            Hex-digest segment key string.
+        """
+        chunk_size = chunk_size if chunk_size is not None else self.fibquant_chunk_size
         start = chunk_idx * chunk_size
         end = start + chunk_size
         chunk_tokens = token_ids[start:end]

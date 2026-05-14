@@ -3046,3 +3046,67 @@ def extend_cache_config_fibquant(
         "use_pre_rope": use_pre_rope,
         "vllm_version": vllm.__version__,
     }
+
+
+# ---------------------------------------------------------------------------
+# 2026-05-14  Module-level apply_fibquant_patch (Activity B+C)
+# ---------------------------------------------------------------------------
+
+def apply_fibquant_patch(
+    flash_attn_impl_class: type,
+    hook: "FibQuantAttentionHook",
+) -> None:
+    """Monkey-patch a FlashAttentionImpl class with FibQuant write/read hooks.
+
+    Injects a ``_fibquant_hook`` class attribute into *flash_attn_impl_class*
+    and wraps ``write_to_cache`` / ``read_from_cache`` so that, when the hook
+    is set, all writes and reads are routed through the hook's corresponding
+    methods.  When ``_fibquant_hook`` is ``None`` or the attribute is absent,
+    the original methods are called unchanged (graceful passthrough).
+
+    This mirrors the pattern established by ``apply_srft_int8_patch()``.
+
+    Args:
+        flash_attn_impl_class: e.g. vllm.v1.attention.backends.flash_attn.FlashAttentionImpl
+        hook: FibQuantAttentionHook instance to inject.
+
+    Example::
+
+        from vllm.v1.attention.backends.flash_attn import FlashAttentionImpl
+        hook = FibQuantAttentionHook(n_heads=32, d_head=128, bits_direction=8)
+        apply_fibquant_patch(FlashAttentionImpl, hook)
+
+    Accuracy contract:
+        The hook's ``read_from_cache()`` always decompresses before returning
+        tensors to callers — compressed KV never enters the attention kernel.
+    """
+    # Preserve original methods before patching (closure captures)
+    original_write = getattr(flash_attn_impl_class, "write_to_cache", None)
+    original_read = getattr(flash_attn_impl_class, "read_from_cache", None)
+
+    def patched_write(self, *args, **kwargs):
+        _hook = getattr(self, "_fibquant_hook", None)
+        if _hook is not None:
+            return _hook.write_to_cache(*args, **kwargs)
+        if original_write is not None:
+            return original_write(self, *args, **kwargs)
+        raise AttributeError(
+            "FlashAttentionImpl has no write_to_cache method and no fibquant hook"
+        )
+
+    def patched_read(self, *args, **kwargs):
+        _hook = getattr(self, "_fibquant_hook", None)
+        if _hook is not None:
+            return _hook.read_from_cache(*args, **kwargs)
+        if original_read is not None:
+            return original_read(self, *args, **kwargs)
+        raise AttributeError(
+            "FlashAttentionImpl has no read_from_cache method and no fibquant hook"
+        )
+
+    # Install class-level hook and patched methods
+    flash_attn_impl_class._fibquant_hook = hook
+    if original_write is not None or True:  # always install patched_write
+        flash_attn_impl_class.write_to_cache = patched_write
+    if original_read is not None or True:   # always install patched_read
+        flash_attn_impl_class.read_from_cache = patched_read
