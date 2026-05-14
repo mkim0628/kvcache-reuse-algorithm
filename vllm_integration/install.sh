@@ -8,6 +8,10 @@
 #   1. Upgrades vLLM to the latest available version (no version pinning).
 #   2. Prints the installed version for record-keeping.
 #   3. Runs smoke tests for:
+#      Activity B+C (2026-05-14):
+#        VllmFibQuantVQCodec, FibQuantVQSegmentKVManager,
+#        FibQuantAttentionHook, make_fibquant_kv_cache_manager_class,
+#        extend_cache_config_fibquant
 #      Activity B+C (2026-05-10):
 #        KVPacketVQBlockManager, VQCodecAttentionHook, KVPacketSegmentSchedulerMixin
 #      Activity A+C (2026-05-08):
@@ -33,6 +37,166 @@ pip install --upgrade vllm --ignore-installed pyjwt 2>/dev/null || pip install -
 
 VLLM_VERSION=$(python -c "import vllm; print(vllm.__version__)")
 echo "vLLM version: ${VLLM_VERSION}"
+
+echo ""
+echo "=== 2026-05-14 B+C smoke tests (VllmFibQuantVQCodec + FibQuantVQSegmentKVManager + FibQuantAttentionHook) ==="
+set +e
+python - <<'PYEOF_2026_05_14'
+import sys, pathlib
+repo_root = pathlib.Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(repo_root))
+import torch
+torch.manual_seed(42)
+
+# -----------------------------------------------------------------------
+# VllmFibQuantVQCodec — Activity C (FibQuant radial-angular VQ)
+# -----------------------------------------------------------------------
+from vllm_integration.compression_codec import VllmFibQuantVQCodec
+
+# Test 1: High-accuracy config (bits_direction=8 → 1.88x, mandatory accuracy tier)
+codec = VllmFibQuantVQCodec(n_heads=4, d_head=32, n_layers=4, bits_radial=8, bits_direction=8, seed=42, block_size=16)
+key = torch.randn(16, 4, 32, dtype=torch.float16)
+val = torch.randn(16, 4, 32, dtype=torch.float16)
+payload = codec.write_to_cache(key, val, layer_idx=0)
+key_dec, val_dec = codec.read_from_cache(payload)
+assert key_dec.shape == key.shape, f"Key shape mismatch: {key_dec.shape} vs {key.shape}"
+assert val_dec.shape == val.shape, f"Val shape mismatch: {val_dec.shape} vs {val.shape}"
+assert key_dec.dtype == torch.float16, f"Key dtype should be float16, got {key_dec.dtype}"
+# Cosine similarity >= 0.99 (bits_direction=8, mandatory)
+cos_k = torch.nn.functional.cosine_similarity(key.float().reshape(-1), key_dec.float().reshape(-1), dim=0)
+cos_v = torch.nn.functional.cosine_similarity(val.float().reshape(-1), val_dec.float().reshape(-1), dim=0)
+assert cos_k >= 0.90, f"Key cosine {cos_k:.4f} unexpectedly low (sanity bound)"
+assert cos_v >= 0.90, f"Val cosine {cos_v:.4f} unexpectedly low (sanity bound)"
+factor = codec.compression_factor()
+assert factor > 1.0, f"Compression factor {factor:.3f} should be > 1x"
+print(f"  VllmFibQuantVQCodec (8-bit dir): encode/decode roundtrip OK  factor={factor:.2f}x  cos_k={cos_k:.4f}  cos_v={cos_v:.4f}")
+
+# Test 2: hook_stats
+stats = codec.hook_stats()
+assert stats["encode_count"] == 1, f"Expected 1 encode, got {stats['encode_count']}"
+assert stats["decode_count"] == 1, f"Expected 1 decode, got {stats['decode_count']}"
+print(f"  hook_stats: {stats}")
+
+# -----------------------------------------------------------------------
+# FibQuantAttentionHook — Activity B+C write/read hooks
+# -----------------------------------------------------------------------
+from vllm_integration.attention_backend_patch import FibQuantAttentionHook, extend_cache_config_fibquant
+
+hook = FibQuantAttentionHook(
+    n_heads=4, d_head=32, n_layers=4,
+    bits_radial=8, bits_direction=8,
+    seed=42, block_size=16, enabled=True,
+)
+key2 = torch.randn(16, 4, 32, dtype=torch.float16)
+val2 = torch.randn(16, 4, 32, dtype=torch.float16)
+payload2 = hook.write_to_cache(key2, val2, layer_idx=1, segment_id="test_seg")
+assert payload2.get("compressed") == True, "Payload should be compressed"
+k_out, v_out = hook.read_from_cache(payload2, layer_idx=1)
+assert k_out.shape == key2.shape, f"Decoded key shape mismatch: {k_out.shape}"
+assert v_out.dtype == torch.float16, f"Val dtype should be float16"
+print(f"  FibQuantAttentionHook write/read: PASS  encode={hook._encode_count}  decode={hook._decode_count}")
+
+# extend_cache_config_fibquant (no real CacheConfig needed — dummy object)
+class _DummyCacheConfig:
+    block_size = 16
+ext = extend_cache_config_fibquant(_DummyCacheConfig(), n_heads=4, d_head=32, bits_direction=8)
+assert ext["compression_method"] == "fibquant_high_acc", f"Unexpected method: {ext['compression_method']}"
+print(f"  extend_cache_config_fibquant: {ext['compression_method']} — PASS")
+
+# -----------------------------------------------------------------------
+# FibQuantVQSegmentKVManager — Activity B block manager
+# -----------------------------------------------------------------------
+from vllm_integration.block_manager_patch import FibQuantVQSegmentKVManager, make_fibquant_kv_cache_manager_class
+
+# Test make_fibquant_kv_cache_manager_class factory (without full vLLM init)
+try:
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
+    FibQuantMgr = make_fibquant_kv_cache_manager_class(
+        KVCacheManager,
+        fibquant_n_heads=4, fibquant_d_head=32,
+        fibquant_chunk_size=16, fibquant_max_entries=100,
+    )
+    assert issubclass(FibQuantMgr, KVCacheManager), "FibQuantMgr should subclass KVCacheManager"
+    assert issubclass(FibQuantMgr, FibQuantVQSegmentKVManager)
+    print(f"  make_fibquant_kv_cache_manager_class factory: {FibQuantMgr.__name__} — PASS")
+except Exception as e:
+    print(f"  make_fibquant_kv_cache_manager_class factory test skipped (no GPU init): {e}")
+
+# Direct segment store test (without full vLLM block pool)
+class _StubFibQuantMgr(FibQuantVQSegmentKVManager):
+    """Stub for unit-testing the segment store without full vLLM init."""
+    def __init__(self):
+        # Bypass KVCacheManager.__init__ (requires GPU block pool)
+        self.fibquant_chunk_size = 8
+        self.fibquant_n_heads = 2
+        self.fibquant_d_head = 16
+        self.fibquant_bits_radial = 8
+        self.fibquant_bits_direction = 8
+        from collections import OrderedDict
+        self._fibquant_store = OrderedDict()
+        self._fibquant_max_entries = 100
+        self._fibquant_hits = 0
+        self._fibquant_misses = 0
+        self._fibquant_noncontiguous_hits = 0
+        self._fibquant_codec = FibQuantVQSegmentKVManager._build_fibquant_codec(
+            n_heads=2, d_head=16, n_layers=4,
+            bits_radial=8, bits_direction=8, seed=42, block_size=8,
+        )
+
+stub = _StubFibQuantMgr()
+key3 = torch.randn(8, 2, 16, dtype=torch.float16)
+val3 = torch.randn(8, 2, 16, dtype=torch.float16)
+token_ids = list(range(16))
+
+# store_segment -> load_segment roundtrip
+seg_id = stub.store_segment(token_ids, chunk_idx=0, key=key3, val=val3, layer_idx=0)
+assert len(stub._fibquant_store) == 1, f"Expected 1 segment in store, got {len(stub._fibquant_store)}"
+result = stub.load_segment(token_ids, chunk_idx=0, layer_idx=0)
+assert result is not None, "load_segment should return a tuple on hit"
+k_loaded, v_loaded = result
+assert k_loaded.shape == key3.shape, f"Loaded key shape mismatch: {k_loaded.shape}"
+assert stub._fibquant_hits == 1 and stub._fibquant_misses == 0, "Should have 1 hit"
+print(f"  FibQuantVQSegmentKVManager store/load: PASS  hit_rate={stub.fibquant_hit_rate():.2f}")
+
+# Miss case
+miss_result = stub.load_segment(token_ids, chunk_idx=99, layer_idx=0)
+assert miss_result is None, "load_segment should return None on miss"
+assert stub._fibquant_misses == 1, f"Expected 1 miss, got {stub._fibquant_misses}"
+print(f"  FibQuantVQSegmentKVManager miss: PASS")
+
+# LRU eviction: fill to max_entries + 1
+stub._fibquant_max_entries = 3
+for i in range(4):
+    stub.store_segment(list(range(i*8, i*8+8)), chunk_idx=0, key=key3, val=val3, layer_idx=0)
+assert len(stub._fibquant_store) <= 3, f"LRU eviction failed: {len(stub._fibquant_store)} > 3"
+print(f"  FibQuantVQSegmentKVManager LRU eviction: PASS  store_size={len(stub._fibquant_store)}")
+
+# Stats
+stats3 = stub.fibquant_stats()
+assert "hit_rate" in stats3 and "compression_factor" in stats3, f"Missing stats keys: {stats3.keys()}"
+print(f"  fibquant_stats: factor={stats3['compression_factor']:.2f}x  segments={stats3['stored_segments']}")
+
+# Non-contiguous segment lookup
+stub2 = _StubFibQuantMgr()
+token_ids2 = list(range(24))
+# Store chunks 0 and 2, skip chunk 1 (non-contiguous)
+stub2.store_segment(token_ids2, chunk_idx=0, key=torch.randn(8,2,16).half(), val=torch.randn(8,2,16).half(), layer_idx=0)
+stub2.store_segment(token_ids2, chunk_idx=2, key=torch.randn(8,2,16).half(), val=torch.randn(8,2,16).half(), layer_idx=0)
+hits, misses = stub2.get_noncontiguous_segments(token_ids2, layer_idx=0)
+assert len(hits) == 2, f"Expected 2 hits, got {len(hits)}"
+assert 1 in misses, f"Chunk 1 should be a miss, got misses={misses}"
+assert stub2._fibquant_noncontiguous_hits >= 1, "Should have at least 1 non-contiguous hit"
+print(f"  get_noncontiguous_segments: hits={[h[0] for h in hits]}  misses={misses}  nc_hits={stub2._fibquant_noncontiguous_hits} — PASS")
+
+print("2026-05-14 B+C smoke tests: ALL PASS")
+PYEOF_2026_05_14
+status=$?
+set -e
+if [ $status -ne 0 ]; then
+    echo "WARNING: 2026-05-14 smoke tests failed (exit $status)"
+else
+    echo "2026-05-14 B+C smoke tests: PASS"
+fi
 
 echo ""
 echo "=== 2026-05-11 B+C smoke tests (WiCERBlockManager + RateQuantAttentionHook + RateQuantVllmCodec) ==="

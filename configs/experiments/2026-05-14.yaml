@@ -1,0 +1,74 @@
+experiment:
+  date: "2026-05-14"
+  activity: "B+C"
+  description: >
+    FibQuantVQCodec(C-1) + FibQuantVQSegmentCache(B-1) +
+    FibQuantPositionFreeSegmentCache(Cross-1 B+C integrated).
+    Spherical-beta radial-angular VQ for non-contiguous segment compression
+    with position-decoupled storage and random-access restoration.
+
+fibquant_codec:
+  d_head: 64
+  n_heads: 8
+  n_layers: 12
+  block_size: 64
+  bits_radial: 4
+  bits_direction: 9
+  n_lloyd_restarts: 10
+  n_lloyd_iters: 5
+  seed: 42
+  recent_window: 0
+
+fibquant_segment_cache:
+  chunk_size: 64
+  max_entries: 1000
+  compression_target: 10.0   # 10x default; sweep 5/10/20
+  d_head: 64
+  n_heads: 8
+  n_layers: 12
+  bits_radial: 4
+  bits_direction: 9
+  seed: 42
+
+fibquant_position_free:
+  chunk_size: 64
+  max_entries: 1000
+  compression_target: 10.0
+  d_head: 64
+  n_heads: 8
+  n_layers: 12
+  bits_radial: 4
+  bits_direction: 9
+  rope_base: 10000.0
+  seed: 42
+
+benchmark:
+  accuracy:
+    method: "attention_output_proxy"
+    proxy_tolerance: 0.01          # 1% attention output error limit
+    kl_tolerance: 0.015
+    cosine_min: 0.99
+    perplexity_dataset: "wikitext-2"
+    perplexity_tolerance_pct: 1.0
+    task_accuracy_tolerance_pct: 1.0
+  compression_sweep:
+    # Actual compression factors (vs FP16) for each config, using d_sub=1 scalar mode:
+    #   "4x" label  (bits_radial=8, bits_direction=8, uint8):     actual 1.88x
+    #   "10x" label (bits_radial=4, bits_direction=4, nibble):    actual 3.56x
+    #   "20x" label (bits_radial=3, bits_direction=2, quartet):   actual 6.40x
+    # Labels are relative ordering markers; absolute values differ from label names.
+    targets: [1.88, 3.56, 6.40]
+    bits_radial_sweep: [8, 4, 3]
+    bits_direction_sweep: [8, 4, 2]
+  hit_rate:
+    target_noncontiguous_fraction: 0.30
+  memory_reduction:
+    target_ratio: 0.30             # minimum: -30%
+    target_ratio_goal: 0.80        # goal: -80% (FibQuant 10x)
+  throughput:
+    target_improvement_pct: 20
+  effective_context:
+    target_multiplier: 2.0         # 2x minimum; 10x goal (FibQuant 10x)
+
+seed: 42
+results_dir: "results/2026-05-14"

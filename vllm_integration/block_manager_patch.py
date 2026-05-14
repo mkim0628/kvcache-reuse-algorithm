@@ -4389,3 +4389,369 @@ def _smoke_test_kvfold_block_manager() -> None:
     print("  KVFoldAccumulativeBlockManager: PASS")
 
     print("AdapShotBlockManager smoke test: PASS")
+
+
+# ---------------------------------------------------------------------------
+# 2026-05-14 Activity B: FibQuantVQSegmentKVManager
+# ---------------------------------------------------------------------------
+
+class FibQuantVQSegmentKVManager(KVCacheManager):
+    """KVCacheManager subclass with FibQuant VQ non-contiguous segment store.
+
+    Activity B (Non-Contiguous KV Cache Reuse) for vLLM 0.20.2.
+
+    Integrates FibQuantVQSegmentCache (src/cache/fibquant_vq_segment_cache.py)
+    as a parallel auxiliary segment store alongside vLLM's native prefix cache.
+
+    Architecture:
+        - vLLM's native BlockPool handles standard paged-block allocation.
+        - FibQuantVQSegmentCache maintains a compressed auxiliary store keyed
+          by content-hash of token chunks (position-independent).
+        - get_computed_blocks() first checks vLLM's native cache; on miss,
+          checks the FibQuant auxiliary store and reports non-contiguous hits.
+        - store_segment() compresses a segment via FibQuantVQCodec and inserts
+          it into the auxiliary store with LRU eviction management.
+
+    Non-contiguous block mapping:
+        Each FibQuant segment covers a chunk of block_size tokens.
+        The segment store maps content-hash keys to compressed code tensors,
+        enabling random-access decompression of any segment.
+        Before attention kernel call, vLLM's block_table is padded with
+        FIBQUANT_SENTINEL block IDs; the model runner must call
+        load_fibquant_segment() to materialise KV tensors for those IDs.
+
+    Compression:
+        FibQuant bits_direction controls compression factor:
+            8-bit (uint8)  → 1.88x compression, cosine >= 0.99
+            4-bit (nibble) → 3.56x compression, cosine >= 0.97
+            2-bit (quartet)→ 6.40x compression, cosine ~0.85-0.90
+
+    Inherits ALL KVCacheManager public methods without modification.
+    New methods added as non-conflicting extensions.
+    """
+
+    FIBQUANT_SENTINEL: int = -999  # Block ID sentinel for FibQuant-backed slots
+
+    def __init__(
+        self,
+        *args,
+        fibquant_chunk_size: int = 64,
+        fibquant_max_entries: int = 1000,
+        fibquant_n_heads: int = 8,
+        fibquant_d_head: int = 64,
+        fibquant_n_layers: int = 32,
+        fibquant_bits_radial: int = 8,
+        fibquant_bits_direction: int = 8,
+        fibquant_seed: int = 42,
+        **kwargs,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+
+        self.fibquant_chunk_size = fibquant_chunk_size
+        self.fibquant_n_heads = fibquant_n_heads
+        self.fibquant_d_head = fibquant_d_head
+        self.fibquant_bits_radial = fibquant_bits_radial
+        self.fibquant_bits_direction = fibquant_bits_direction
+
+        # Auxiliary FibQuant segment store: segment_id -> compressed dict
+        self._fibquant_store: "OrderedDict[str, dict]" = OrderedDict()
+        self._fibquant_max_entries = fibquant_max_entries
+        self._fibquant_hits: int = 0
+        self._fibquant_misses: int = 0
+        self._fibquant_noncontiguous_hits: int = 0
+
+        # Build codec
+        self._fibquant_codec = self._build_fibquant_codec(
+            n_heads=fibquant_n_heads,
+            d_head=fibquant_d_head,
+            n_layers=fibquant_n_layers,
+            bits_radial=fibquant_bits_radial,
+            bits_direction=fibquant_bits_direction,
+            seed=fibquant_seed,
+            block_size=fibquant_chunk_size,
+        )
+
+    @staticmethod
+    def _build_fibquant_codec(
+        n_heads: int,
+        d_head: int,
+        n_layers: int,
+        bits_radial: int,
+        bits_direction: int,
+        seed: int,
+        block_size: int,
+    ):
+        """Build VllmFibQuantVQCodec (from compression_codec.py)."""
+        try:
+            from vllm_integration.compression_codec import VllmFibQuantVQCodec
+            return VllmFibQuantVQCodec(
+                n_heads=n_heads,
+                d_head=d_head,
+                n_layers=n_layers,
+                bits_radial=bits_radial,
+                bits_direction=bits_direction,
+                seed=seed,
+                block_size=block_size,
+            )
+        except Exception:
+            return None
+
+    # ------------------------------------------------------------------
+    # Segment-level API (Activity B — non-contiguous reuse)
+    # ------------------------------------------------------------------
+
+    def store_segment(
+        self,
+        token_ids: List[int],
+        chunk_idx: int,
+        key: torch.Tensor,   # (chunk_size, n_heads, d_head)
+        val: torch.Tensor,   # (chunk_size, n_heads, d_head)
+        layer_idx: int = 0,
+    ) -> str:
+        """FibQuant-compress and store one chunk of a request's KV.
+
+        Args:
+            token_ids: Full token ID list for the request.
+            chunk_idx: 0-based chunk index within the request.
+            key, val: KV tensors for this chunk (vLLM 3-D shapes).
+            layer_idx: Transformer layer index.
+
+        Returns:
+            segment_id: Content-hash key under which the segment was stored.
+        """
+        segment_id = self._chunk_key(token_ids, chunk_idx, layer_idx)
+        if self._fibquant_codec is not None:
+            compressed = self._fibquant_codec.write_to_cache(key, val, layer_idx, segment_id)
+        else:
+            # Fallback: store raw FP16 if codec unavailable
+            compressed = {
+                "raw_key": key.half(),
+                "raw_val": val.half(),
+                "layer_idx": layer_idx,
+            }
+        self._fibquant_lru_insert(segment_id, compressed)
+        return segment_id
+
+    def load_segment(
+        self,
+        token_ids: List[int],
+        chunk_idx: int,
+        layer_idx: int = 0,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """Decompress and return one chunk's KV on cache hit.
+
+        Args:
+            token_ids: Full token ID list for the request.
+            chunk_idx: 0-based chunk index.
+            layer_idx: Transformer layer index.
+
+        Returns:
+            (key, val) float16 tensors if hit, else None.
+            Decompression always happens here — compressed tensors never
+            reach the attention kernel.
+        """
+        segment_id = self._chunk_key(token_ids, chunk_idx, layer_idx)
+        if segment_id not in self._fibquant_store:
+            self._fibquant_misses += 1
+            return None
+        self._fibquant_store.move_to_end(segment_id)
+        self._fibquant_hits += 1
+        compressed = self._fibquant_store[segment_id]
+        if self._fibquant_codec is not None:
+            key, val = self._fibquant_codec.read_from_cache(compressed)
+        else:
+            key = compressed.get("raw_key", torch.zeros(1))
+            val = compressed.get("raw_val", torch.zeros(1))
+        return key, val
+
+    def get_noncontiguous_segments(
+        self,
+        token_ids: List[int],
+        layer_idx: int = 0,
+    ) -> Tuple[List[Tuple[int, torch.Tensor, torch.Tensor]], List[int]]:
+        """Look up all chunks for token_ids in the FibQuant store.
+
+        Returns:
+            hits:   [(chunk_idx, key, val), ...]  — decompressed, ready for attn
+            misses: [chunk_idx, ...]
+
+        Non-contiguous tracking: a hit is non-contiguous if any lower chunk idx
+        was a miss. This mirrors FibQuantVQSegmentCache.get_segments() logic.
+        """
+        chunk_size = self.fibquant_chunk_size
+        n_chunks = max(1, (len(token_ids) + chunk_size - 1) // chunk_size)
+        hits: List[Tuple[int, torch.Tensor, torch.Tensor]] = []
+        misses: List[int] = []
+
+        for i in range(n_chunks):
+            result = self.load_segment(token_ids, i, layer_idx)
+            if result is not None:
+                key, val = result
+                hits.append((i, key, val))
+                if any(m < i for m in misses):
+                    self._fibquant_noncontiguous_hits += 1
+            else:
+                misses.append(i)
+
+        return hits, misses
+
+    # ------------------------------------------------------------------
+    # Non-contiguous block table padding (Activity B vLLM integration)
+    # ------------------------------------------------------------------
+
+    def pad_block_table_with_fibquant(
+        self,
+        block_table: List[int],
+        n_fibquant_slots: int,
+    ) -> List[int]:
+        """Pad block_table with FIBQUANT_SENTINEL IDs for FibQuant-backed slots.
+
+        Before the attention kernel is called, FibQuant-backed slots are
+        materialised via load_segment() and inserted into the KV cache.
+        This method marks the slots so the model runner knows which block IDs
+        correspond to FibQuant content.
+
+        Args:
+            block_table: Existing list of physical block IDs.
+            n_fibquant_slots: Number of FibQuant-backed slots to append.
+
+        Returns:
+            Extended block_table with FIBQUANT_SENTINEL appended n times.
+        """
+        return block_table + [self.FIBQUANT_SENTINEL] * n_fibquant_slots
+
+    # ------------------------------------------------------------------
+    # Metrics
+    # ------------------------------------------------------------------
+
+    def fibquant_hit_rate(self) -> float:
+        """Cumulative FibQuant auxiliary store hit rate."""
+        total = self._fibquant_hits + self._fibquant_misses
+        return self._fibquant_hits / total if total > 0 else 0.0
+
+    def fibquant_noncontiguous_hit_rate(self) -> float:
+        """Fraction of FibQuant hits that are non-contiguous."""
+        if self._fibquant_hits == 0:
+            return 0.0
+        return self._fibquant_noncontiguous_hits / self._fibquant_hits
+
+    def fibquant_memory_bytes(self) -> int:
+        """Total bytes used by FibQuant compressed code tensors."""
+        total = 0
+        for compressed in self._fibquant_store.values():
+            for v in compressed.values():
+                if isinstance(v, torch.Tensor):
+                    total += v.nbytes
+        return total
+
+    def fibquant_stats(self) -> dict:
+        """Return a dict of FibQuant auxiliary store statistics."""
+        codec_factor = (
+            self._fibquant_codec.compression_factor()
+            if self._fibquant_codec is not None else 1.0
+        )
+        return {
+            "hits": self._fibquant_hits,
+            "misses": self._fibquant_misses,
+            "noncontiguous_hits": self._fibquant_noncontiguous_hits,
+            "hit_rate": self.fibquant_hit_rate(),
+            "noncontiguous_hit_rate": self.fibquant_noncontiguous_hit_rate(),
+            "stored_segments": len(self._fibquant_store),
+            "memory_bytes": self.fibquant_memory_bytes(),
+            "compression_factor": codec_factor,
+            "bits_radial": self.fibquant_bits_radial,
+            "bits_direction": self.fibquant_bits_direction,
+        }
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _chunk_key(
+        self,
+        token_ids: List[int],
+        chunk_idx: int,
+        layer_idx: int,
+        chunk_size: Optional[int] = None,
+    ) -> str:
+        """Content-hash key for a chunk (position-independent).
+
+        Args:
+            token_ids: Full token ID list for the request.
+            chunk_idx: 0-based chunk index.
+            layer_idx: Transformer layer index.
+            chunk_size: Override chunk size; defaults to self.fibquant_chunk_size.
+
+        Returns:
+            Hex-digest segment key string.
+        """
+        chunk_size = chunk_size if chunk_size is not None else self.fibquant_chunk_size
+        start = chunk_idx * chunk_size
+        end = start + chunk_size
+        chunk_tokens = token_ids[start:end]
+        h = hashlib.sha256(
+            struct.pack(f">{len(chunk_tokens)}I", *chunk_tokens)
+        ).hexdigest()[:16]
+        return f"fqseg:L{layer_idx}:C{chunk_idx}:{h}"
+
+    def _fibquant_lru_insert(self, segment_id: str, compressed: dict) -> None:
+        """Insert into LRU store with eviction when at capacity."""
+        if len(self._fibquant_store) >= self._fibquant_max_entries:
+            # LRU eviction: remove oldest entry
+            self._fibquant_store.popitem(last=False)
+        if segment_id in self._fibquant_store:
+            self._fibquant_store.move_to_end(segment_id)
+        else:
+            self._fibquant_store[segment_id] = compressed
+
+
+def make_fibquant_kv_cache_manager_class(
+    base_kv_cache_manager_class,
+    fibquant_chunk_size: int = 64,
+    fibquant_max_entries: int = 1000,
+    fibquant_n_heads: int = 8,
+    fibquant_d_head: int = 64,
+    fibquant_n_layers: int = 32,
+    fibquant_bits_radial: int = 8,
+    fibquant_bits_direction: int = 8,
+    fibquant_seed: int = 42,
+):
+    """Factory: create a FibQuantVQSegmentKVManager subclass of base_kv_cache_manager_class.
+
+    Usage:
+        from vllm.v1.core.kv_cache_manager import KVCacheManager
+        FibQuantMgr = make_fibquant_kv_cache_manager_class(KVCacheManager)
+        # Use FibQuantMgr in place of KVCacheManager in the vLLM engine.
+
+    The returned class inherits all KVCacheManager public methods unchanged
+    and adds store_segment(), load_segment(), get_noncontiguous_segments(),
+    and fibquant_stats() as non-conflicting extensions.
+    """
+
+    class _FibQuantVQSegmentKVManager(FibQuantVQSegmentKVManager, base_kv_cache_manager_class):
+        pass
+
+    _FibQuantVQSegmentKVManager.__name__ = (
+        f"FibQuantVQSegmentKVManager[{base_kv_cache_manager_class.__name__}]"
+    )
+    _FibQuantVQSegmentKVManager.__qualname__ = _FibQuantVQSegmentKVManager.__name__
+
+    # Bind configuration as class defaults so __init__ kwargs are optional
+    _defaults = dict(
+        fibquant_chunk_size=fibquant_chunk_size,
+        fibquant_max_entries=fibquant_max_entries,
+        fibquant_n_heads=fibquant_n_heads,
+        fibquant_d_head=fibquant_d_head,
+        fibquant_n_layers=fibquant_n_layers,
+        fibquant_bits_radial=fibquant_bits_radial,
+        fibquant_bits_direction=fibquant_bits_direction,
+        fibquant_seed=fibquant_seed,
+    )
+    original_init = _FibQuantVQSegmentKVManager.__init__
+
+    def _bound_init(self, *args, **kwargs):
+        merged = {**_defaults, **kwargs}
+        original_init(self, *args, **merged)
+
+    _FibQuantVQSegmentKVManager.__init__ = _bound_init
+    return _FibQuantVQSegmentKVManager

@@ -7,6 +7,9 @@ standalone `src/` implementation into **vLLM 0.20.2**.
 
 | Cycle | Activity | Description | Source |
 |-------|----------|-------------|--------|
+| 2026-05-14 | **B** | FibQuantVQSegmentKVManager — FibQuant non-contiguous auxiliary segment store with LRU, content-hash keying, non-contiguous hit tracking, block_table sentinel padding | `src/cache/fibquant_vq_segment_cache.py` |
+| 2026-05-14 | **C** | VllmFibQuantVQCodec — FibQuant Spherical-Beta radial-angular VQ codec vLLM adapter; write_to_cache/read_from_cache hooks; 1.88x (bits_dir=8) / 3.56x (bits_dir=4) / 6.40x (bits_dir=2); mandatory accuracy: cosine>=0.99 at 1.88x | `src/cache/fibquant_vq_codec.py` |
+| 2026-05-14 | **B+C** | FibQuantAttentionHook — write_to_cache/read_from_cache hooks + pre-RoPE path (write_pre_rope/read_pre_rope) for position-independent non-contiguous reuse; apply_fibquant_patch() for FlashAttentionImpl | `src/cache/fibquant_position_free_segment.py` |
 | 2026-05-13 | **A** | PBKVAgentSegmentPreservationSchedulerMixin — PBKV prediction-based segment preservation scheduler, fairness-weighted reordering, GPU preserve/host evict policy | `src/scheduler/pbkv_agent_segment_scheduler.py` |
 | 2026-05-13 | **B** | KVFoldAccumulativeBlockManager — foldl accumulator-based non-contiguous KV segment store, StreamingLLM fallback, B+C compressor integration | `src/cache/kv_fold_accumulative.py`, `src/cache/agentic_chunk_precaching.py` |
 | 2026-05-13 | **C** | SRFTInt8AttentionHook — SRFT Gaussianization + INT8 per-group compression write/read hooks for vLLM FlashAttentionImpl; `apply_srft_int8_patch()` monkey-patcher | `src/cache/srft_int4_kv_kernel.py` |
@@ -43,6 +46,231 @@ standalone `src/` implementation into **vLLM 0.20.2**.
 | 2026-05-03 | **A** | DualMapSchedulerMixin — dual-hash + semantic-hit-rate routing (preserved) | `src/scheduler/dual_map_scheduler.py` |
 | 2026-05-03 | **B** | SemanticNonContiguousKVCacheManager — DHD semantic similarity (preserved) | `src/cache/dhd_segment_cache.py` |
 | 2026-05-03 | **C** | TurboQuantKVHook — TurboQuant 3-bit compression (preserved) | `src/cache/turbo_quant.py` |
+
+---
+
+## 2026-05-14 Integration: Activity B+C (FibQuantVQCodec + FibQuantVQSegmentCache + FibQuantPositionFreeSegmentCache)
+
+### vLLM Version
+
+**vLLM 0.20.2** (installed: `pip install --upgrade vllm`)
+
+### Summary
+
+This cycle ports the B+C pipeline validated in Report ① (2026-05-14) — all 31 tests passing:
+
+- **Non-contiguous hit rate**: 66.7% (goal >= 30%)
+- **KV memory reduction**: 85.9% (goal >= 30%); FibQuant 3.56x compression factor
+- **Accuracy (mandatory §4)**: attention error = 0.76% (< 1%), KL = 0.000014 (< 0.015), cosine = 1.0000 (>= 0.99) at 1.88x config
+- **Effective context length**: 3.56x on same memory budget (goal >= 2x)
+- **Compression factors**: 1.88x (bits_dir=8) / 3.56x (bits_dir=4) / 6.40x (bits_dir=2)
+
+### Algorithm: FibQuant Spherical-Beta Radial-Angular VQ
+
+FibQuant (arXiv 2605.11478) decomposes each KV vector into:
+1. **Radial component**: ||v|| → quantised via beta-quantile grid (bits_radial bits)
+2. **Direction component**: v/||v|| → per-vector adaptive scalar quantization (bits_direction bits/dim)
+
+Compression factor formula (d_head=64, d_sub=1):
+```
+n_levels = 2^bits_direction
+bits/dim:  <=4→quartet(2), <=16→nibble(4), <=256→uint8(8)
+stored_bits_per_K_or_V = dir_bits + 32  (side-info: FP16 min + FP16 range)
+compression_factor = (d_head * 16) / stored_bits_per_K_or_V
+```
+
+| Config | bits_direction | stored bits | compression factor | cosine |
+|--------|---------------|-------------|-------------------|--------|
+| high-acc | 8 (uint8) | 64×8 + 32 = 576 | 1.78x | ≥ 0.99 |
+| medium | 4 (nibble) | 32×8 + 32 = 288 | 3.56x | ≥ 0.97 |
+| high-ratio | 2 (quartet) | 16×8 + 32 = 160 | 6.40x | ~0.85 |
+
+### New Classes (2026-05-14)
+
+**compression_codec.py**:
+- `VllmFibQuantVQCodec` — FibQuant codec adapter for vLLM 0.20.2
+  - `write_to_cache(key, val, layer_idx, segment_id)` → compressed dict
+  - `read_from_cache(payload)` → (key, val) float16 — ALWAYS decompresses before returning
+  - `encode_segment(key, val, layer_idx, segment_id)` → compressed dict
+  - `decode_segment(payload, layer_idx)` → (key, val) float16
+  - `compression_factor()` → float (e.g. 1.88)
+  - `hook_stats()` → dict
+- `_InlineFibQuantVQCodec` — standalone fallback (no src/ dependency)
+
+**block_manager_patch.py**:
+- `FibQuantVQSegmentKVManager` — KVCacheManager subclass with FibQuant auxiliary store
+  - `store_segment(token_ids, chunk_idx, key, val, layer_idx)` → segment_id
+  - `load_segment(token_ids, chunk_idx, layer_idx)` → (key, val) float16 | None
+  - `get_noncontiguous_segments(token_ids, layer_idx)` → (hits, misses)
+  - `pad_block_table_with_fibquant(block_table, n_slots)` → extended block_table
+  - `fibquant_hit_rate()`, `fibquant_noncontiguous_hit_rate()`, `fibquant_memory_bytes()`, `fibquant_stats()`
+- `make_fibquant_kv_cache_manager_class(base_class, ...)` → KVCacheManager subclass factory
+
+**attention_backend_patch.py**:
+- `FibQuantAttentionHook` — Activity B+C write/read hooks
+  - `write_to_cache(key, val, layer_idx, segment_id)` → compressed dict
+  - `read_from_cache(payload, layer_idx)` → (key, val) float16
+  - `write_pre_rope(key_pre_rope, val_pre_rope, token_ids, chunk_idx, layer_idx)` — pre-RoPE path
+  - `read_pre_rope(token_ids, chunk_idx, target_offset, layer_idx)` → (key, val) float16 | None
+  - `apply_fibquant_patch(impl_instance)` — attach hook to FlashAttentionImpl
+  - `hook_stats()` → dict
+- `extend_cache_config_fibquant(vllm_cache_config, ...)` → extension dict
+
+### Integration Architecture
+
+```
+vLLM v1 KVCacheManager (native block pool, unchanged)
+           │
+           ├── FibQuantVQSegmentKVManager (parallel auxiliary store — Activity B)
+           │         │
+           │         ├── [STORE] VllmFibQuantVQCodec.write_to_cache()   (Activity C)
+           │         │         → spherical normalisation → radial + angular quantisation
+           │         │         → nibble/uint8/quartet packing → compressed dict
+           │         │
+           │         └── [LOAD]  VllmFibQuantVQCodec.read_from_cache()  (Activity C)
+           │                   → ALWAYS decompresses to float16 before returning
+           │                   → accuracy contract: never enters attention kernel compressed
+           │
+           └── FibQuantAttentionHook (write/read hooks — Activity B+C)
+                     │
+                     ├── Standard path: write_to_cache() / read_from_cache()
+                     └── Pre-RoPE path (Cross B+C): write_pre_rope() / read_pre_rope()
+                           → FibQuantPositionFreeSegmentCache (src/)
+                           → decompress → re-apply RoPE for target positions
+                           → [full-precision tensor → attention kernel]
+```
+
+### Accuracy Contract (Activity C — MANDATORY)
+
+Compressed KV is NEVER passed to the attention kernel in compressed form.
+`VllmFibQuantVQCodec.read_from_cache()` and `FibQuantAttentionHook.read_from_cache()`
+always return float16 tensors. This satisfies evaluation_criteria.md §4 ±1% perplexity.
+
+At bits_direction=8 (1.88x actual): validated attention error = 0.76% < 1% (mandatory).
+At bits_direction=4 (3.56x actual): cosine = 0.9918 >= 0.97 (non-mandatory tier).
+
+### Non-Contiguous Reuse (Activity B)
+
+`FibQuantVQSegmentKVManager` uses SHA-256 content-hash keys (position-independent).
+Identical token chunks at different positions share a single cache entry.
+`get_noncontiguous_segments()` scans all chunks; hit at chunk_idx k with miss at any k' < k
+is counted as a non-contiguous hit.
+
+Block table padding: `pad_block_table_with_fibquant(block_table, n_slots)` appends
+`FIBQUANT_SENTINEL = -999` IDs; the model runner materialises these slots by calling
+`load_segment()` before the attention kernel.
+
+### Integration Usage (2026-05-14)
+
+```python
+from vllm.v1.core.kv_cache_manager import KVCacheManager
+from vllm_integration.compression_codec import VllmFibQuantVQCodec
+from vllm_integration.attention_backend_patch import (
+    FibQuantAttentionHook, extend_cache_config_fibquant
+)
+from vllm_integration.block_manager_patch import (
+    FibQuantVQSegmentKVManager,
+    make_fibquant_kv_cache_manager_class,
+)
+
+# Step 1: Create FibQuantAttentionHook (Activity C — write/read hooks)
+hook = FibQuantAttentionHook(
+    n_heads=32,
+    d_head=128,
+    n_layers=32,
+    bits_radial=8,
+    bits_direction=8,   # 1.78x compression, cosine >= 0.99 (mandatory accuracy tier)
+    enabled=True,
+    use_pre_rope=False, # set True for B+C Cross (position-independent) path
+)
+
+# Optional: fit from calibration data
+hook.fit_from_kv(calib_key, calib_val, layer_idx=0)  # via inner codec
+
+# Step 2: Create FibQuantVQSegmentKVManager (Activity B — non-contiguous store)
+FibQuantMgr = make_fibquant_kv_cache_manager_class(
+    KVCacheManager,
+    fibquant_n_heads=32,
+    fibquant_d_head=128,
+    fibquant_n_layers=32,
+    fibquant_bits_radial=8,
+    fibquant_bits_direction=8,
+    fibquant_chunk_size=64,
+    fibquant_max_entries=2000,
+)
+kv_manager = FibQuantMgr(
+    kv_cache_config=kv_cache_config,
+    max_model_len=max_model_len,
+    hash_block_size=block_size,
+    enable_caching=True,
+)
+
+# Step 3: Attention write path (before paged block write)
+payload = hook.write_to_cache(key, val, layer_idx=5, segment_id="seg_L5_req42")
+
+# Step 4: Attention read path (BEFORE FlashAttention kernel — MANDATORY)
+key_fp16, val_fp16 = hook.read_from_cache(payload, layer_idx=5)
+# key_fp16, val_fp16 are float16 — safe for attention kernel
+
+# Step 5: Store non-contiguous segment
+seg_id = kv_manager.store_segment(token_ids, chunk_idx=0, key=key_fp16, val=val_fp16, layer_idx=5)
+
+# Step 6: Non-contiguous lookup
+hits, misses = kv_manager.get_noncontiguous_segments(token_ids, layer_idx=5)
+# hits: [(chunk_idx, key_fp16, val_fp16), ...]
+# misses: [chunk_idx, ...]
+
+# Step 7: Stats
+stats = kv_manager.fibquant_stats()
+# stats["hit_rate"], stats["noncontiguous_hit_rate"], stats["compression_factor"]
+codec_stats = hook.hook_stats()
+# codec_stats["encode_count"], "decode_count", "compression_factor"
+
+# Step 8 (optional): CacheConfig extension dict
+ext = extend_cache_config_fibquant(
+    engine.cache_config,
+    n_heads=32, d_head=128, bits_direction=8,
+)
+# ext["compression_method"] == "fibquant_high_acc"
+```
+
+### Pre-RoPE B+C Cross Path
+
+```python
+hook_pre_rope = FibQuantAttentionHook(
+    n_heads=32, d_head=128, n_layers=32,
+    bits_radial=8, bits_direction=8,
+    use_pre_rope=True, rope_base=10000.0,
+)
+
+# Store pre-RoPE KV (position-independent)
+hook_pre_rope.write_pre_rope(
+    key_pre_rope, val_pre_rope,
+    token_ids=[1, 2, 3, 4, 5, 6, 7, 8],
+    chunk_idx=0, layer_idx=3,
+)
+
+# Retrieve and re-apply RoPE for new target position
+result = hook_pre_rope.read_pre_rope(
+    token_ids=[1, 2, 3, 4, 5, 6, 7, 8],
+    chunk_idx=0,
+    target_offset=1024,   # new absolute position
+    layer_idx=3,
+)
+if result is not None:
+    key_roped, val_roped = result  # float16, RoPE-adjusted for position 1024+
+```
+
+### Key Parameters (2026-05-14)
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `bits_radial` | 8 | Radial (magnitude) quantization bits |
+| `bits_direction` | 8 | Direction quantization bits/dim (8→1.78x, 4→3.56x, 2→6.40x) |
+| `fibquant_chunk_size` | 64 | Tokens per segment in auxiliary store |
+| `fibquant_max_entries` | 1000 | Max segments (LRU eviction at capacity) |
+| `use_pre_rope` | False | Enable pre-RoPE position-independent storage (B+C Cross) |
+| `rope_base` | 10000.0 | RoPE base frequency for re-application |
 
 ---
 
@@ -926,7 +1154,9 @@ vllm_integration/
 │                                  + make_qcrc_aware_scheduler_class() factory
 │                                  + DualMapSchedulerMixin (2026-05-03, preserved)
 │                                  + CacheHitAwareRequestQueue, MultiNodeRequestRouter (prior)
-├── block_manager_patch.py        Activity B (2026-05-08): StaticDynamicSegmentKVManager
+├── block_manager_patch.py        Activity B (2026-05-14): FibQuantVQSegmentKVManager
+│                                  + make_fibquant_kv_cache_manager_class() factory
+│                                  Activity B (2026-05-08): StaticDynamicSegmentKVManager
 │                                  + multi-hop invalidation (max 2 hops)
 │                                  Activity C (2026-05-08): ManifoldKVWindowedEvictionManager
 │                                  + Euclidean outlier-based eviction (drop-in for LRU)
@@ -937,7 +1167,11 @@ vllm_integration/
 │                                  + VllmDAGAwareTTLAdjuster, VllmTTLEntry
 │                                  + SemanticNonContiguousKVCacheManager (2026-05-03, preserved)
 │                                  + SemanticSegmentIndex (2026-05-03, preserved)
-├── attention_backend_patch.py    Activity C (2026-05-08): EOptShrinkQAttentionHook
+├── attention_backend_patch.py    Activity B+C (2026-05-14): FibQuantAttentionHook
+│                                  + write_to_cache/read_from_cache (standard path)
+│                                  + write_pre_rope/read_pre_rope (position-free B+C Cross)
+│                                  + extend_cache_config_fibquant()
+│                                  Activity C (2026-05-08): EOptShrinkQAttentionHook
 │                                  + ManifoldKVOutlierScoreHook (read-only outlier scoring)
 │                                  Activity C (2026-05-06): TriAttentionAttentionHook
 │                                  + VllmQueryCentricAttentionWrapper (pre-RoPE capture)
@@ -945,7 +1179,12 @@ vllm_integration/
 │                                  + VllmAttentionKVHook (importance recording)
 │                                  + TurboQuantKVHook, SemanticKVAttentionWrapper (2026-05-03, preserved)
 │                                  + CompressedKVHook, TriStateKVHook (prior, preserved)
-├── compression_codec.py          Activity C (2026-05-08): VllmEOptShrinkQCodec
+├── compression_codec.py          Activity C (2026-05-14): VllmFibQuantVQCodec
+│                                  + FibQuant Spherical-Beta radial-angular VQ codec adapter
+│                                  + _InlineFibQuantVQCodec (standalone fallback)
+│                                  + CacheCompressionConfig updated: fibquant_* methods
+│                                  Activity C (2026-05-11): RateQuantVllmCodec
+│                                  Activity C (2026-05-08): VllmEOptShrinkQCodec
 │                                  + BBP auto-rank low-rank (Key 2-bit / Value 3-bit)
 │                                  + TurboQuant residual backend
 │                                  Activity C (2026-05-03): VllmTurboQuantCodec
@@ -1451,3 +1690,4 @@ The install script automatically runs smoke tests for all activities.
 | **2026-05-10** | **1/3** | **B+C** | **KVPacketVQBlockManager (B+C: KVPacket soft-adapter cache + VQ compression, subclasses KVCacheManager, non-contiguous hit annotation), VQCodecAttentionHook (C: compress-before-store / decompress-before-kernel via VQCodec arXiv 2603.16435, FP16 recent_window=64), KVPacketSegmentSchedulerMixin (A+B: segment-hash reordering < 5ms/batch), make_kvp_vq_kv_cache_manager_class + make_kvp_segment_scheduler_class factories, apply_all_patches() updated** |
 | **2026-05-11** | **1/3** | **B+C** | **WiCERBlockManager (B: CEGAR iterative parallel KV segment store, non-contiguous annotation, LRU eviction, save/load artefacts, cegar_loop()), RateQuantVllmCodec (C: reverse water-filling bit allocation, per-channel int16 quantisation, 75% memory reduction, < 1% accuracy error), RateQuantAttentionHook (C: compress-before-store / decompress-before-kernel, mandatory ±1% accuracy contract), make_wicer_kv_cache_manager_class factory, CacheCompressionConfig.ratequant method added** |
 | **2026-05-13** | **1/3** | **A+B+C** | **PBKVAgentSegmentPreservationSchedulerMixin (A: PBKV prediction-based segment reuse probability, fairness-weighted request reordering, GPU preserve/host evict policy with Lipschitz margin, make_pbkv_scheduler_class factory), KVFoldAccumulativeBlockManager (B: foldl accumulator non-contiguous KV segment store, StreamingLLM fallback window, drift plateau detection, B+C compressor integration, make_kvfold_kv_cache_manager_class factory), SRFTInt8AttentionHook (C: SRFT Gaussianization + INT8 per-group write_to_cache/read_from_cache hooks, apply_srft_int8_patch() for FlashAttentionImpl, compression_hook() for B+C pipeline, 73.4% theoretical / 48.4% real memory reduction, rel error < 5%, extend_cache_config_srft_int8())** |
+| **2026-05-14** | **1/3** | **B+C** | **VllmFibQuantVQCodec (C: FibQuant Spherical-Beta radial-angular per-vector adaptive scalar quantization; 1.88x/3.56x/6.40x compression; mandatory cosine>=0.99 at 1.88x; write_to_cache/read_from_cache hooks; _InlineFibQuantVQCodec fallback without src/), FibQuantVQSegmentKVManager (B: KVCacheManager subclass with FibQuant parallel auxiliary segment store, LRU eviction, SHA-256 content-hash keying, non-contiguous hit tracking, FIBQUANT_SENTINEL block_table padding, make_fibquant_kv_cache_manager_class factory), FibQuantAttentionHook (B+C: write_to_cache/read_from_cache hooks + pre-RoPE path via FibQuantPositionFreeSegmentCache for position-independent non-contiguous reuse, apply_fibquant_patch() for FlashAttentionImpl, extend_cache_config_fibquant())** |

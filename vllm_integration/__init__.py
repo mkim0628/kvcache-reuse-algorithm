@@ -1,5 +1,25 @@
 # vllm_integration: Activity A+B+C KV cache port for vLLM 0.20.2
 #
+# 2026-05-14 cycle additions:
+#   compression_codec     — VllmFibQuantVQCodec: FibQuant Spherical-Beta radial-angular
+#                             VQ codec adapter for vLLM attention-backend write/read hooks.
+#                             Ports src/cache/fibquant_vq_codec.FibQuantVQCodec.
+#                             Compression: 1.88x (bits_dir=8) / 3.56x (bits_dir=4) / 6.40x (bits_dir=2)
+#                             Accuracy: cosine>=0.99 at 1.88x (mandatory), >=0.97 at 3.56x
+#   block_manager_patch   — FibQuantVQSegmentKVManager (Activity B):
+#                             KVCacheManager subclass with FibQuant non-contiguous auxiliary store.
+#                             store_segment(): FibQuant-compress → auxiliary store.
+#                             load_segment(): decompress on-demand (random access).
+#                             get_noncontiguous_segments(): multi-chunk hit lookup + tracking.
+#                             pad_block_table_with_fibquant(): FIBQUANT_SENTINEL block padding.
+#                           + make_fibquant_kv_cache_manager_class() factory
+#   attention_backend_patch — FibQuantAttentionHook (Activity B+C):
+#                              write_to_cache() / read_from_cache() for FibQuant VQ.
+#                              Pre-RoPE path: write_pre_rope() / read_pre_rope() for
+#                              position-independent segment reuse (Cross B+C).
+#                              apply_fibquant_patch() monkey-patcher for FlashAttentionImpl.
+#                            + extend_cache_config_fibquant() helper
+#
 # 2026-05-13 cycle additions:
 #   scheduler_patch       — PBKVAgentSegmentPreservationSchedulerMixin (Activity A):
 #                             PBKV prediction-based segment preservation, fairness-weighted
@@ -171,6 +191,13 @@ def apply_all_patches(
 
 __all__ = [
     "apply_all_patches",
+    # 2026-05-14
+    "VllmFibQuantVQCodec",
+    "FibQuantVQSegmentKVManager",
+    "make_fibquant_kv_cache_manager_class",
+    "FibQuantAttentionHook",
+    "apply_fibquant_patch",
+    "extend_cache_config_fibquant",
     # 2026-05-12
     "AdapShotBlockManager",
     "make_adapshot_kv_cache_manager_class",

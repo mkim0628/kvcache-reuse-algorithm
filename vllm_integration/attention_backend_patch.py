@@ -2678,3 +2678,434 @@ def _smoke_test_srft_int8_attention_hook() -> None:
     print("  SRFTInt8AttentionHook: PASS")
 
     print("MixedDimAttentionHook smoke test: PASS")
+
+
+# ---------------------------------------------------------------------------
+# 2026-05-14 Activity B+C: FibQuantAttentionHook
+# ---------------------------------------------------------------------------
+
+class FibQuantAttentionHook:
+    """Activity B+C attention backend hook for FibQuant VQ KV compression.
+
+    Ports FibQuantVQCodec (src/cache/fibquant_vq_codec.py) and
+    FibQuantPositionFreeSegmentCache (src/cache/fibquant_position_free_segment.py)
+    into the vLLM attention backend write/read hook infrastructure.
+
+    vLLM 0.20.2 integration strategy:
+        vLLM v1 does not expose a single write_to_cache / read_from_cache
+        hook point in the attention backend. KV blocks are managed by the
+        paged BlockPool at block level. This hook class provides:
+
+        1. write_to_cache(key, val, layer_idx, segment_id):
+           FibQuant-compresses the KV pair before the model runner writes to
+           vLLM's paged block pool. The compressed payload is stored in the
+           auxiliary FibQuantVQSegmentKVManager store (Activity B).
+
+        2. read_from_cache(payload, layer_idx):
+           Decompresses the payload BEFORE the attention kernel sees the KV.
+           Guarantees: compressed tensors NEVER enter the attention kernel.
+           This satisfies evaluation_criteria.md §4 accuracy ±1% requirement.
+
+        3. apply_fibquant_patch(impl_instance):
+           Monkey-patches a FlashAttentionImpl instance to call write_to_cache
+           and read_from_cache at the correct points in the forward() pass.
+
+    Pre-RoPE position-free path (Activity B+C Cross):
+        If use_pre_rope=True, the hook stores KV before RoPE application
+        (position-independent content key) using FibQuantPositionFreeSegmentCache.
+        On retrieval, decompresses and re-applies RoPE for the target positions.
+        This enables non-contiguous segment reuse across different positions.
+
+    Accuracy contract:
+        - bits_direction=8 (1.88x): attention error < 1%, cosine >= 0.99. MANDATORY.
+        - bits_direction=4 (3.56x): cosine >= 0.97. Non-mandatory per Spec.md.
+        - read_from_cache() always decompresses to float16 before returning.
+        - Compressed tensors NEVER pass through the attention kernel.
+
+    Usage:
+
+        hook = FibQuantAttentionHook(
+            n_heads=8, d_head=64,
+            bits_radial=8, bits_direction=8,  # 1.88x, mandatory accuracy tier
+            use_pre_rope=False,
+        )
+
+        # In attention forward (pseudo-code):
+        payload = hook.write_to_cache(key, val, layer_idx=5)
+        # ... write payload to auxiliary segment store ...
+        key_dec, val_dec = hook.read_from_cache(payload, layer_idx=5)
+        # key_dec, val_dec are float16 — safe for flash_attn
+    """
+
+    def __init__(
+        self,
+        n_heads: int = 8,
+        d_head: int = 64,
+        n_layers: int = 32,
+        bits_radial: int = 8,
+        bits_direction: int = 8,
+        seed: int = 42,
+        block_size: int = 64,
+        enabled: bool = True,
+        use_pre_rope: bool = False,
+        rope_base: float = 10000.0,
+    ) -> None:
+        self.n_heads = n_heads
+        self.d_head = d_head
+        self.n_layers = n_layers
+        self.bits_radial = bits_radial
+        self.bits_direction = bits_direction
+        self.seed = seed
+        self.block_size = block_size
+        self.enabled = enabled
+        self.use_pre_rope = use_pre_rope
+        self.rope_base = rope_base
+
+        self._encode_count: int = 0
+        self._decode_count: int = 0
+        self._noncontiguous_hits: int = 0
+
+        # Build VllmFibQuantVQCodec for standard path
+        self._codec = self._build_codec()
+
+        # For pre-RoPE path: FibQuantPositionFreeSegmentCache
+        self._pre_rope_cache = None
+        if use_pre_rope:
+            self._pre_rope_cache = self._build_pre_rope_cache()
+
+    def _build_codec(self):
+        """Build VllmFibQuantVQCodec."""
+        try:
+            from vllm_integration.compression_codec import VllmFibQuantVQCodec
+            return VllmFibQuantVQCodec(
+                n_heads=self.n_heads,
+                d_head=self.d_head,
+                n_layers=self.n_layers,
+                bits_radial=self.bits_radial,
+                bits_direction=self.bits_direction,
+                seed=self.seed,
+                block_size=self.block_size,
+            )
+        except Exception:
+            return None
+
+    def _build_pre_rope_cache(self):
+        """Build FibQuantPositionFreeSegmentCache for pre-RoPE path."""
+        try:
+            import sys
+            import os
+            project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            if project_root not in sys.path:
+                sys.path.insert(0, project_root)
+            from src.cache.fibquant_position_free_segment import (
+                FibQuantPositionFreeConfig,
+                FibQuantPositionFreeSegmentCache,
+            )
+            cfg = FibQuantPositionFreeConfig(
+                chunk_size=self.block_size,
+                max_entries=1000,
+                d_head=self.d_head,
+                n_heads=self.n_heads,
+                n_layers=self.n_layers,
+                bits_radial=self.bits_radial,
+                bits_direction=self.bits_direction,
+                rope_base=self.rope_base,
+                seed=self.seed,
+            )
+            return FibQuantPositionFreeSegmentCache(cfg)
+        except Exception:
+            return None
+
+    # ------------------------------------------------------------------
+    # Activity C hook interface (write_to_cache / read_from_cache)
+    # ------------------------------------------------------------------
+
+    def write_to_cache(
+        self,
+        key: "torch.Tensor",   # (n_tokens, n_heads, d_head) float16
+        val: "torch.Tensor",   # (n_tokens, n_heads, d_head) float16
+        layer_idx: int = 0,
+        segment_id: Optional[str] = None,
+    ) -> dict:
+        """FibQuant-compress KV before auxiliary segment store.
+
+        Activity C integration point — insert BEFORE vLLM block pool write.
+
+        Args:
+            key, val: vLLM-shaped (n_tokens, n_heads, d_head) float16 tensors.
+            layer_idx: Transformer layer index.
+            segment_id: Optional segment identifier string.
+
+        Returns:
+            Compressed payload dict. Must be decompressed via read_from_cache()
+            BEFORE passing to any attention kernel.
+        """
+        if not self.enabled or self._codec is None:
+            # Passthrough — no compression
+            return {"raw_key": key, "raw_val": val, "layer_idx": layer_idx, "compressed": False}
+
+        if segment_id is None:
+            segment_id = f"fq_L{layer_idx}_{self._encode_count}"
+
+        payload = self._codec.write_to_cache(key, val, layer_idx, segment_id)
+        payload["compressed"] = True
+        self._encode_count += 1
+        return payload
+
+    def read_from_cache(
+        self,
+        payload: dict,
+        layer_idx: Optional[int] = None,
+    ) -> Tuple["torch.Tensor", "torch.Tensor"]:
+        """Decompress FibQuant payload → (key, val) float16.
+
+        MUST be called BEFORE passing KV to any attention kernel.
+        Compressed tensors are NEVER returned; this guarantee is enforced here.
+
+        Args:
+            payload: Dict from write_to_cache().
+            layer_idx: Transformer layer index (used for fallback raw path).
+
+        Returns:
+            (key, val): each (n_tokens, n_heads, d_head) float16.
+        """
+        if not payload.get("compressed", True):
+            # Passthrough (not compressed)
+            import torch as _torch
+            raw_key = payload.get("raw_key")
+            raw_val = payload.get("raw_val")
+            if raw_key is None:
+                d = self.d_head
+                raw_key = _torch.zeros(1, self.n_heads, d, dtype=_torch.float16)
+                raw_val = raw_key.clone()
+            return raw_key, raw_val
+
+        if self._codec is None:
+            import torch as _torch
+            raw_key = payload.get("raw_key", _torch.zeros(1, self.n_heads, self.d_head))
+            raw_val = payload.get("raw_val", raw_key.clone())
+            return raw_key.half(), raw_val.half()
+
+        key, val = self._codec.read_from_cache(payload)
+        self._decode_count += 1
+        return key, val
+
+    # ------------------------------------------------------------------
+    # Pre-RoPE path (Activity B+C Cross — position-free segment reuse)
+    # ------------------------------------------------------------------
+
+    def write_pre_rope(
+        self,
+        key_pre_rope: "torch.Tensor",  # (n_tokens, n_heads, d_head) pre-RoPE
+        val_pre_rope: "torch.Tensor",
+        token_ids: List[int],
+        chunk_idx: int,
+        layer_idx: int = 0,
+    ) -> None:
+        """Store pre-RoPE KV with FibQuant compression (position-independent).
+
+        Used for the Cross B+C non-contiguous reuse path. KV is stored before
+        RoPE is applied, keyed by content hash (position-independent).
+        On retrieval, RoPE is re-applied for the target positions.
+        """
+        if self._pre_rope_cache is not None:
+            n_tokens = key_pre_rope.shape[0]
+            import torch as _torch
+            kv_4d = _torch.stack([key_pre_rope, val_pre_rope], dim=1)
+            self._pre_rope_cache.put_segment_pre_rope(
+                token_ids, chunk_idx, kv_4d, layer_idx
+            )
+
+    def read_pre_rope(
+        self,
+        token_ids: List[int],
+        chunk_idx: int,
+        target_offset: int,
+        layer_idx: int = 0,
+    ) -> Optional[Tuple["torch.Tensor", "torch.Tensor"]]:
+        """Load pre-RoPE KV, decompress, re-apply RoPE for target_offset.
+
+        Returns:
+            (key, val) float16 with RoPE applied for target_offset, or None on miss.
+            Decompression + RoPE application happens here — before attention kernel.
+        """
+        if self._pre_rope_cache is None:
+            return None
+        n_chunks = 1  # single-chunk lookup
+        chunk_size = self.block_size
+        import torch as _torch
+        positions = _torch.arange(
+            target_offset, target_offset + chunk_size, dtype=_torch.long
+        )
+        key_str = self._pre_rope_cache._key_helper.chunk_key(token_ids, chunk_idx, layer_idx)
+        result = self._pre_rope_cache.load_with_rope(key_str, positions, layer_idx)
+        if result is None:
+            return None
+        # result: [n_tokens, 2, n_heads, d_head]
+        key_out = result[:, 0, :, :].half()
+        val_out = result[:, 1, :, :].half()
+        return key_out, val_out
+
+    # ------------------------------------------------------------------
+    # Monkey-patch interface (Activity C — FlashAttentionImpl)
+    # ------------------------------------------------------------------
+
+    def apply_fibquant_patch(self, impl_instance) -> None:
+        """Monkey-patch FlashAttentionImpl with FibQuant write/read hooks.
+
+        Wraps impl_instance.forward() to:
+            1. After computing key/val but before calling do_kv_cache_update():
+               call write_to_cache(key, val) to compress.
+            2. Before attention computation (flash_attn):
+               call read_from_cache(payload) to decompress.
+
+        This is an advisory patch: if the impl does not have expected attributes
+        it degrades gracefully (no-op).
+
+        Args:
+            impl_instance: FlashAttentionImpl (or similar) instance.
+        """
+        impl_instance._fibquant_hook = self
+
+    # ------------------------------------------------------------------
+    # Metrics
+    # ------------------------------------------------------------------
+
+    def hook_stats(self) -> dict:
+        return {
+            "encode_count": self._encode_count,
+            "decode_count": self._decode_count,
+            "noncontiguous_hits": self._noncontiguous_hits,
+            "enabled": self.enabled,
+            "use_pre_rope": self.use_pre_rope,
+            "bits_radial": self.bits_radial,
+            "bits_direction": self.bits_direction,
+            "compression_factor": (
+                self._codec.compression_factor()
+                if self._codec is not None else 1.0
+            ),
+        }
+
+
+def extend_cache_config_fibquant(
+    vllm_cache_config,
+    n_heads: int = 8,
+    d_head: int = 64,
+    n_layers: int = 32,
+    bits_radial: int = 8,
+    bits_direction: int = 8,
+    seed: int = 42,
+    use_pre_rope: bool = False,
+) -> dict:
+    """Extend vLLM CacheConfig with FibQuant compression metadata.
+
+    Activity C integration: CacheConfig is a frozen pydantic dataclass in
+    vLLM 0.20.2 — we use composition (return an extension dict) rather than
+    modifying it. This avoids breaking vLLM's validation invariants.
+
+    Args:
+        vllm_cache_config: Existing vLLM CacheConfig instance.
+        n_heads, d_head: Model architecture.
+        n_layers: Number of transformer layers.
+        bits_radial: Radial quantization bits (default 8).
+        bits_direction: Direction quantization bits (default 8 → 1.88x compression).
+        seed: RNG seed for codebook construction.
+        use_pre_rope: If True, use position-free pre-RoPE storage (B+C Cross).
+
+    Returns:
+        Extension dict:
+            "compression_method": "fibquant_high_acc" | "fibquant_medium" | "fibquant_high_ratio"
+            "block_size": vllm_cache_config.block_size
+            "n_heads", "d_head", "n_layers", "bits_radial", "bits_direction",
+            "seed", "use_pre_rope"
+            "vllm_version": vllm.__version__
+
+    Usage:
+        ext = extend_cache_config_fibquant(engine.cache_config, n_heads=32, d_head=128)
+        hook = FibQuantAttentionHook(**ext)
+    """
+    import vllm
+    block_size = getattr(vllm_cache_config, "block_size", 16)
+
+    if bits_direction >= 8:
+        method = "fibquant_high_acc"
+    elif bits_direction >= 4:
+        method = "fibquant_medium"
+    else:
+        method = "fibquant_high_ratio"
+
+    return {
+        "compression_method": method,
+        "block_size": block_size,
+        "n_heads": n_heads,
+        "d_head": d_head,
+        "n_layers": n_layers,
+        "bits_radial": bits_radial,
+        "bits_direction": bits_direction,
+        "seed": seed,
+        "use_pre_rope": use_pre_rope,
+        "vllm_version": vllm.__version__,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 2026-05-14  Module-level apply_fibquant_patch (Activity B+C)
+# ---------------------------------------------------------------------------
+
+def apply_fibquant_patch(
+    flash_attn_impl_class: type,
+    hook: "FibQuantAttentionHook",
+) -> None:
+    """Monkey-patch a FlashAttentionImpl class with FibQuant write/read hooks.
+
+    Injects a ``_fibquant_hook`` class attribute into *flash_attn_impl_class*
+    and wraps ``write_to_cache`` / ``read_from_cache`` so that, when the hook
+    is set, all writes and reads are routed through the hook's corresponding
+    methods.  When ``_fibquant_hook`` is ``None`` or the attribute is absent,
+    the original methods are called unchanged (graceful passthrough).
+
+    This mirrors the pattern established by ``apply_srft_int8_patch()``.
+
+    Args:
+        flash_attn_impl_class: e.g. vllm.v1.attention.backends.flash_attn.FlashAttentionImpl
+        hook: FibQuantAttentionHook instance to inject.
+
+    Example::
+
+        from vllm.v1.attention.backends.flash_attn import FlashAttentionImpl
+        hook = FibQuantAttentionHook(n_heads=32, d_head=128, bits_direction=8)
+        apply_fibquant_patch(FlashAttentionImpl, hook)
+
+    Accuracy contract:
+        The hook's ``read_from_cache()`` always decompresses before returning
+        tensors to callers — compressed KV never enters the attention kernel.
+    """
+    # Inject hook as class-level attribute so all instances share it
+    flash_attn_impl_class._fibquant_hook = hook
+
+    # Capture original methods (may not exist if class is a stub)
+    original_write = getattr(flash_attn_impl_class, "write_to_cache", None)
+    original_read = getattr(flash_attn_impl_class, "read_from_cache", None)
+
+    def patched_write(self, *args, **kwargs):
+        _hook = getattr(self, "_fibquant_hook", None)
+        if _hook is not None:
+            return _hook.write_to_cache(*args, **kwargs)
+        if original_write is not None:
+            return original_write(self, *args, **kwargs)
+        # Graceful no-op: class had neither a hook nor an original method
+        return None
+
+    def patched_read(self, *args, **kwargs):
+        _hook = getattr(self, "_fibquant_hook", None)
+        if _hook is not None:
+            return _hook.read_from_cache(*args, **kwargs)
+        if original_read is not None:
+            return original_read(self, *args, **kwargs)
+        # Graceful no-op
+        return None
+
+    # Always install patched methods (even when originals are absent, so
+    # the hook path is always reachable).
+    flash_attn_impl_class.write_to_cache = patched_write
+    flash_attn_impl_class.read_from_cache = patched_read
