@@ -232,10 +232,13 @@ class FibQuantVQCodec:
         vecs: torch.Tensor,   # [N, d_head] float32
         n_levels: int,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Per-vector uniform scalar quantization with nibble packing for 4-bit codes.
+        """Per-vector uniform scalar quantization with bit-width-aware packing.
 
-        When bits_direction <= 4 (n_levels <= 16), packs two codes per byte
-        to halve memory usage. Otherwise stores one code per uint8.
+        Packing strategy by n_levels:
+          - n_levels <= 4  (1-2 bits/dim): quartet packing — 4 codes per byte.
+          - n_levels <= 16 (3-4 bits/dim): nibble packing  — 2 codes per byte.
+          - n_levels <= 256 (5-8 bits/dim): uint8 — 1 code per byte.
+          - n_levels > 256: int16 — 2 bytes per code.
         Side-information (min + range) stored as FP16 (2 bytes each).
 
         Returns:
@@ -247,18 +250,32 @@ class FibQuantVQCodec:
         v_max = vecs.max(dim=-1, keepdim=True).values
         v_range = (v_max - v_min).clamp(min=1e-8)
         normalized = (vecs - v_min) / v_range * (n_levels - 1)
-        # Choose integer dtype wide enough for n_levels
-        if n_levels <= 16:
-            int_dtype = torch.uint8
-        elif n_levels <= 256:
+
+        if n_levels <= 256:
             int_dtype = torch.uint8
         else:
-            int_dtype = torch.int16  # up to 32768 levels
+            int_dtype = torch.int16
 
         raw = normalized.round().clamp(0, n_levels - 1).to(int_dtype)  # [N, d]
 
-        if n_levels <= 16:
-            # Pack two 4-bit codes per byte (nibble packing)
+        if n_levels <= 4:
+            # Quartet packing: 4 codes per byte (2 bits/dim effective).
+            # codes[byte] = c0 | (c1 << 2) | (c2 << 4) | (c3 << 6)
+            N, d = raw.shape
+            # Pad to multiple of 4
+            pad = (4 - d % 4) % 4
+            if pad:
+                raw = torch.cat([raw, torch.zeros(N, pad, dtype=torch.uint8)], dim=-1)
+            d_pad = raw.shape[1]
+            packed = (
+                (raw[:, 0::4] & 0x03)
+                | ((raw[:, 1::4] & 0x03) << 2)
+                | ((raw[:, 2::4] & 0x03) << 4)
+                | ((raw[:, 3::4] & 0x03) << 6)
+            )
+            codes = packed  # [N, ceil(d/4)]
+        elif n_levels <= 16:
+            # Nibble packing: 2 codes per byte (4 bits/dim effective).
             N, d = raw.shape
             # Pad to even length
             if d % 2 != 0:
@@ -280,18 +297,30 @@ class FibQuantVQCodec:
     ) -> torch.Tensor:
         """Dequantize scalar codes back to float32 vectors."""
         d_head = self.config.d_head
-        if n_levels <= 16:
-            # Unpack nibbles
+        if n_levels <= 4:
+            # Unpack quartet (4 codes per byte, 2 bits each)
             N = codes.shape[0]
-            lo = (codes & 0x0F).float()       # [N, d//2] even dims
-            hi = ((codes >> 4) & 0x0F).float()  # [N, d//2] odd dims
-            # Interleave: even, odd, even, odd, ...
+            c0 = (codes & 0x03).float()
+            c1 = ((codes >> 2) & 0x03).float()
+            c2 = ((codes >> 4) & 0x03).float()
+            c3 = ((codes >> 6) & 0x03).float()
+            # Interleave: c0[i], c1[i], c2[i], c3[i], ...
+            unpacked = torch.zeros(N, codes.shape[1] * 4, dtype=torch.float32)
+            unpacked[:, 0::4] = c0
+            unpacked[:, 1::4] = c1
+            unpacked[:, 2::4] = c2
+            unpacked[:, 3::4] = c3
+            raw = unpacked[:, :d_head]
+        elif n_levels <= 16:
+            # Unpack nibbles (2 codes per byte, 4 bits each)
+            N = codes.shape[0]
+            lo = (codes & 0x0F).float()        # even dims
+            hi = ((codes >> 4) & 0x0F).float()  # odd dims
             unpacked = torch.zeros(N, codes.shape[1] * 2, dtype=torch.float32)
             unpacked[:, 0::2] = lo
             unpacked[:, 1::2] = hi
             raw = unpacked[:, :d_head]
         elif codes.dtype == torch.int16:
-            # int16 codes: interpret as unsigned (values 0..n_levels-1)
             raw = codes.to(torch.int32).float()
         else:
             raw = codes.float()
