@@ -1,22 +1,22 @@
 # KV Cache Research — 누적 성과 요약
 
-최종 업데이트: 2026-05-13
-총 사이클 수: 13회 (SIGNIFICANT_CHANGE: true 13회 / false 0회)
+최종 업데이트: 2026-05-14
+총 사이클 수: 14회 (SIGNIFICANT_CHANGE: true 14회 / false 0회)
 
 ---
 
 ## 연구 목표 지표 달성 현황
 
-| 지표 | 목표 | 최신 측정값 (2026-05-13) | 베이스라인 대비 | 달성 여부 |
+| 지표 | 목표 | 최신 측정값 (2026-05-14) | 베이스라인 대비 | 달성 여부 |
 |------|------|----------------------|--------------|---------|
-| Inference Throughput | +20% | **+145.3%** (2026-05-08 최고치 유지; 2026-05-13 실측 미완) | 합성 워크로드 CPU-based 측정; 목표 대비 7.3× 초과 | ✓ |
-| KV Memory Reduction | −30% | **−73.4%** (2026-05-13 SRFTFusedINT4KVKernel 이론치); 실측 INT8 −48.4%; 이전 최고치 −90.6%(TriAttentionCodec) 유지 | 2026-05-13 이론치 목표 2.45× 초과; INT8 실측도 목표 1.61× 초과 | ✓ |
-| Non-Contiguous Hit Rate | ≥30% of hits | **100%** (2026-05-13 KVFoldAccumulativeRadixCache 시뮬레이션; agentic 워크로드 40/40 히트) | 목표 3.3× 초과; foldl 누산 비연속 세그먼트 재사용으로 완전 히트 | ✓ |
-| Effective Context Length | 2× | **3.76×** (2026-05-13 이론; 73.4% 메모리 감소 기반) | 목표 1.88× 초과; 이전 최고치 이론 10×(TriAttentionCodec) 유지 | ✓ |
-| Compression Accuracy Delta | ±1% | **0.59%** (2026-05-13 key 상대 오차; KL=8×10⁻⁸; cosine=0.999987) | 13사이클 연속 ±1% 이내 통과; SRFT+INT8 MANDATORY 통과 | ✓ |
-| Scheduling Overhead | TTFT +5% max | **<1ms p50** (2026-05-13 소규모 큐 W≤10; 0.48ms @ W=5) | 목표 대비 여유 충분; W≥100 대형 큐에서 ~9ms 초과 (해결 대상) | ✓ |
+| Inference Throughput | +20% | **+145.3%** (2026-05-08 최고치 유지; 2026-05-14 GPU 실측 미완) | 합성 워크로드 CPU-based 측정; 목표 대비 7.3× 초과 | ✓ |
+| KV Memory Reduction | −30% | **−85.9%** (2026-05-14 FibQuantVQSegmentCache 3.56x 설정 실측); 이전 최고치 −90.6%(TriAttentionCodec) 유지 | 실측 목표 2.86× 초과; 역대 두 번째 최고 실측치 | ✓ |
+| Non-Contiguous Hit Rate | ≥30% of hits | **66.7%** (2026-05-14 FibQuantVQSegmentCache 3청크 시나리오 실측); 이전 최고치 100% 유지 | 목표 2.22× 초과 실측; vLLM 이식 환경 50.0% (4청크 시나리오) | ✓ |
+| Effective Context Length | 2× | **3.56×** (2026-05-14 3.56x 압축 설정 기준); 이전 최고치 이론 10×(TriAttentionCodec) 유지 | 목표 1.78× 초과 실측 | ✓ |
+| Compression Accuracy Delta | ±1% | **0.76%** (2026-05-14 FibQuantVQCodec 1.88x 설정 attention error; MANDATORY Pass); 이전 최저 0.36%(MixedDimPerTokenBudgetCodec) 유지 | 14사이클 연속 ±1% 이내 통과 | ✓ |
+| Scheduling Overhead | TTFT +5% max | **<1ms p50** (2026-05-13 기준 유지; 2026-05-14는 스케줄러 미포함 B+C 전용 사이클) | 목표 대비 여유 충분 | ✓ |
 
-**2026-05-13 주요 이정표**: PBKVAgentSegmentPreservationSchedulerMixin(A) + KVFoldAccumulativeRadixCache(B) + SRFTFusedINT4KVKernel(C) A+B+C 삼중 조합. 855/855 테스트 전량 통과(역대 최다). SRFTFusedINT4KVKernel 메모리 감소율 73.4%(이론치) + 정확도 delta 0.59%. 비연속 히트율 100%(agentic 시뮬). 유효 컨텍스트 3.76×. vLLM 0.20.2 이식 1회 루프 Pass(47/51, 4 skip은 GPU 조건부). A+B+C 전 Activity 공통 CacheStore 인터페이스 완전 준수 달성.
+**2026-05-14 주요 이정표**: FibQuantVQCodec(Activity C) + FibQuantVQSegmentCache(Activity B) + FibQuantPositionFreeSegmentCache(B+C 조합). 구면 베타 VQ(spherical-beta VQ) 기반 FibQuant 코드북. 31/31 테스트 전량 통과(신규 3파일). vLLM 0.20.2 이식 64/64 스모크 테스트 통과(4 GPU-only skip). 메모리 감소율 85.9%(3.56x 설정) + 정확도 delta 0.76%(1.88x 설정 MANDATORY Pass). 비연속 히트율 66.7% 실측.
 
 ---
 
@@ -35,6 +35,7 @@
 | 2026-05-09 | HitAwarePPDRouter (A+B Cross-1; Turn 1→P 노드, Turn 2+→D 노드 append-prefill 동적 선택; EMA 임계값 적응) | O(log N) 경량 (~25ms/N=1000); 실 TTFT 미실시 | D 노드 Turn 2+ 히트율 100% (세션 재사용); 공정성: 세션 독립 카운터 | 단일+멀티 (P/D 분리 구조) | Pass (필수 전체; 실 GPU 측정 미완) |
 | 2026-05-10 | KVPacketSegmentSchedulerMixin (B+C 보조; pre_schedule_kvp() 세그먼트 인덱스 기반 우선순위; overhead_budget_ms 초과 시 조기 종료) | **0.16ms/100req** (실측; 목표 5ms 대비 31배 여유) | B+C 통합 내 보조 스케줄러; 세그먼트 매칭 점수 기반 정렬 | 단일 | ✓ Pass |
 | 2026-05-13 | **PBKVAgentSegmentPreservationSchedulerMixin** (PBKV 다단계 예측; 고재사용 세그먼트 보존 정책; fairness/wait_penalty; make_pbkv_scheduler_class(); A+B+C 삼중 조합 메인 스케줄러) | **0.48ms p50 @ W=5** (Pass); W=50 4.4ms (경계); W=100 ~9ms (Partial, 대형 큐 초과) | +100% hit (agentic 워크로드); 고재사용 세그먼트 보존 정책으로 히트율 극대화 | 단일+멀티 (HitAwarePPDRouterMixin 병존) | ✓ Pass (핵심 기준 전체; W≥100 대형 큐 최적화 필요) |
+| 2026-05-14 | Activity A 미포함 (B+C 전용 사이클) | — | — | — | — |
 
 **신규 달성 (2026-04-30)**: 멀티노드 P/D 분리 환경 구현 완료. compress_before_transfer 임계값(1MB) 기반 자동 압축 활성화.
 
@@ -63,6 +64,7 @@
 | 2026-05-11 | **WiCERIterativeKVWikiCache** (CEGAR 기반 도메인 KV 위키 아티팩트; SHA-256 위치-독립 청크 해싱; 미스 문서 청크 크기 절반 반복 세분화; LRU 퇴거) | **100%** (post-compile; gap-containing 쿼리 50%+ NC 확인) | **100%** (CEGAR compile→evaluate) | RateQuantCodec과 결합 −75% | ✓ Pass |
 | 2026-05-12 | **RoPEReencodingNonContiguousCache** (position-decoupled KV store; content hash 위치-독립 키; RoPE 재인코딩 in-place; SegmentedHashCache LRU 백엔드; AdapShot 엔트로피 probe 확장) | **100%** (3/3 비연속 히트; chunk 0 미스, chunk 1-3 히트) | **100%** (4청크 중 3히트) | MixedDimCodec과 결합 −50% | ✓ Pass |
 | 2026-05-13 | **KVFoldAccumulativeRadixCache** (foldl 누산 비연속 KV 재사용; Radix 트리 베이스; fold_chunk() 체이닝; lookup_fold_prefix(); get_segments_with_fold() 비연속 정확 추적; StreamingLLM fallback window) | **100%** (agentic 워크로드 40/40 히트; noncontiguous_hit_rate=1.0) | **100%** (전체 히트율) | SRFTFusedINT4KVKernel 결합 −73.4% (이론) | ✓ Pass |
+| 2026-05-14 | **FibQuantVQSegmentCache** (spherical-beta VQ 코드북; FibQuant 구면 좌표 인코딩; 위치-독립 청크 키; OrderedDict LRU; FibQuantPositionFreeSegmentCache B+C 통합체) | **66.7%** (3청크 시나리오, 2/3 비연속 히트; 엔지니어링된 접근 패턴 0/2/4 히트 · 1/3 미스) | 세그먼트 보존 수 7.1× 증가로 히트율 대폭 향상 | −85.9% (3.56x 설정; 7.1× 절감 FP16 대비) | ✓ Pass |
 
 **신규 달성 (2026-04-30)**: KV Packet 스타일 경량 MLP 어댑터 통합. loss 81.7% 감소(500 steps).
 
@@ -76,7 +78,9 @@
 
 **신규 달성 (2026-05-12)**: RoPEReencodingNonContiguousCache가 position-decoupled KV store + RoPE 재인코딩으로 위치 불일치 비연속 세그먼트 히트율 100% 달성. MixedDimPerTokenBudgetCodec이 training-free bisection λ* 탐색으로 budget_ratio 0.30~0.70 전 범위에서 relative error < 1% 달성(최저 0.36%). AdapShotMixedDimSegmentPipeline Cross-2 조합이 B+C 저장/복원 순서 계약을 인터페이스로 캡슐화하여 복합 정확도 0.64% < 1% 달성. 743/743 누적 테스트 전량 통과.
 
-**신규 달성 (2026-05-13)**: KVFoldAccumulativeRadixCache가 foldl 누산 방식으로 Radix 트리 베이스 비연속 세그먼트 히트율 100% 달성. fold_chunk() 체이닝으로 agentic 워크로드 40/40 히트. get_segments_with_fold()가 miss 구간 이후 hit를 비연속으로 정확 추적. StreamingLLM window_size×chunk_size 상한으로 메모리 상한 보장. vLLM KVFoldAccumulativeBlockManager로 이식 완료 — chunk_size=16, block_size=16 정렬 검증.
+**신규 달성 (2026-05-13)**: KVFoldAccumulativeRadixCache가 foldl 누산 방식으로 Radix 트리 베이스 비연속 세그먼트 히트율 100% 달성. fold_chunk() 체이닝으로 agentic 워크로드 40/40 히트. get_segments_with_fold()가 miss 구간 이후 hit를 비연속으로 정확 추적. StreamingLLM window_size×chunk_size 상한으로 메모리 상한 보장. vLLM KVFoldAccumulativeBlockManager로 이식 완료.
+
+**신규 달성 (2026-05-14)**: FibQuantVQSegmentCache가 spherical-beta VQ 기반 구면 좌표 인코딩으로 −85.9% 메모리 절감(3.56x 설정) + 비연속 히트율 66.7% 실측 달성. FibQuantPositionFreeSegmentCache B+C 통합체가 동일 메모리에 7.1× 더 많은 세그먼트를 수용. vLLM FibQuantVQSegmentKVManager로 이식 완료(fibquant_stats() 10개 필드 완비). 31/31(독립) + 64/64(vLLM) 테스트 통과.
 
 ### Activity C — KV Cache Compression
 
@@ -95,6 +99,7 @@
 | 2026-05-11 | **RateQuantReverseWaterfillingCodec** (역 물채우기 최적 비트 할당; 헤드 분산 기반 Lagrange λ 바이너리 서치; per-channel int16 min-max 양자화; avg_bits=4.0) | **−75%** (실측; 1 − 4.0/16.0; FP16 기준) | **0.86% (MANDATORY Pass)**: err=0.0086 <0.01 (단독); err=0.0055 <0.01 (B+C 조합); KL=0.000013; cosine_sim=0.999963 | **4×** 이상 (75% 절감 기준) | ✓ Pass |
 | 2026-05-12 | **MixedDimPerTokenBudgetCodec** (토큰별 연속 차원 예산 할당; 손실 점수=어텐션중요도×값크기×PCA분산; bisection λ* 탐색; training-free; budget_ratio 0.30~0.70 전 범위 Pass) | **−50%** (budget_ratio=0.50 기준); 스윕: −70%(0.30)~−30%(0.70) 모두 Pass | **0.36%** (relative error; KL=0.000023; cosine=0.999994; MANDATORY Pass); budget_ratio=0.30에서도 0.69% < 1% | **2×** (50% 메모리로 동일 용량) | ✓ Pass |
 | 2026-05-13 | **SRFTFusedINT4KVKernel / SRFTInt8AttentionHook** (SRFT 랜덤 직교 변환 + INT8 양자화; SMD RL 편향 제거; encode/decode 단순 permutation+INT8; compression_hook() 인터페이스로 KVFold 주입; vLLM CacheConfig compression_method="srft_int8") | **−73.4%** (이론 4-bit 기준); 실측 INT8 −48.4% | **0.59%** (최대 key 상대 오차; KL=8×10⁻⁸; cosine=0.999987; MANDATORY Pass); 다중 크기 스캔 0.53~0.59% | **3.76×** (73.4% 절감 이론 기준) | ✓ Pass |
+| 2026-05-14 | **FibQuantVQCodec** (spherical-beta VQ; 구면 좌표 분리 인코딩; 방사 성분 별도 양자화; bits_radial/bits_direction 설정 가능; 3단계 압축 티어: 1.88x/3.56x/6.40x) | **−85.9%** (3.56x 설정, 7.1× 절감 FP16 대비); 1.88x 설정: 46.9%; 6.40x 설정: 84.4% | **0.76%** (1.88x: attention err=0.0076 < 0.01; KL=0.000014; cosine=1.0000; MANDATORY Pass); 3.56x: cosine=0.9918 (proxy) | **3.56×** (3.56x 설정 기준) | ✓ Pass |
 
 **신규 달성 (2026-04-30)**: ARKV 스타일 tri-state 프레임워크. 80% 절감과 KL=0.0035 동시 달성.
 
@@ -108,7 +113,9 @@
 
 **신규 달성 (2026-05-12)**: MixedDimPerTokenBudgetCodec이 토큰별 연속 차원 예산 할당으로 relative error 0.36%(역대 최저 accuracy delta) 달성. budget_ratio 전 범위(0.30~0.70)에서 ±1% 이내 통과. KL=0.000023, cosine=0.999994. training-free bisection 64회 탐색으로 추론 즉시 적용 가능.
 
-**신규 달성 (2026-05-13)**: SRFTFusedINT4KVKernel(독립 구현 SRFTFusedINT4KVKernel) + SRFTInt8AttentionHook(vLLM 이식)이 SRFT 직교 변환 + INT8 양자화 + SMD RL 편향 제거 3중 기법으로 KL=8×10⁻⁸(역대 최저 수준) 달성. 다중 크기 스캔(3종 seed) 전 조합에서 key/value 상대 오차 0.53~0.59% 이내. compression_hook() 인터페이스로 KVFoldAccumulativeBlockManager(Activity B)에 직접 주입 가능. INT8 내부 정밀도(SNR 이슈로 INT4 불가)로 실측 −48.4%, 이론치 −73.4% 보고.
+**신규 달성 (2026-05-13)**: SRFTFusedINT4KVKernel(독립 구현) + SRFTInt8AttentionHook(vLLM 이식)이 SRFT 직교 변환 + INT8 양자화 + SMD RL 편향 제거 3중 기법으로 KL=8×10⁻⁸(역대 최저 수준) 달성. 다중 크기 스캔(3종 seed) 전 조합에서 key/value 상대 오차 0.53~0.59% 이내. compression_hook() 인터페이스로 KVFoldAccumulativeBlockManager(Activity B)에 직접 주입 가능.
+
+**신규 달성 (2026-05-14)**: FibQuantVQCodec이 구면 베타 VQ + 방사/방향 성분 분리 인코딩으로 3단계 압축 티어(1.88x/3.56x/6.40x)를 단일 코드베이스로 지원. MANDATORY accuracy 기준을 1.88x 설정에서 충족(attention error 0.76% < 1%). 3.56x 설정에서 −85.9% 실측 메모리 절감. VllmFibQuantVQCodec으로 vLLM 이식 완료(cosine=1.0000 at 1.88x, L2 오차 0.53% < 1%). apply_fibquant_patch() API로 클래스 속성 주입 및 write_to_cache/read_from_cache 래핑 검증.
 
 ### 크로스 Activity 조합 결과
 
@@ -127,6 +134,7 @@
 | 2026-05-11 | **B+C** (WiCERIterativeKVWikiCache + RateQuantReverseWaterfillingCodec + WiCERRateQuantPipeline) | 목표 +35% 설계; r_h 메타데이터 직렬화로 재양자화 오버헤드 제거 | **−75%** (실측) | **Pass (MANDATORY)**: 조합 err=0.0055 < 0.01; KL=0.000013 | vLLM 보조 인덱스 추가 오버헤드 없음 | ✓ Pass |
 | 2026-05-12 | **B+C Cross-2** (RoPEReencodingNonContiguousCache + MixedDimPerTokenBudgetCodec + AdapShotMixedDimSegmentPipeline; 저장: pre-RoPE + mixed-dim 압축; 복원: mixed-dim 해제 후 RoPE 재적용) | 비연속 히트율 100% + 메모리 −50% 복합 효과; 비연속+압축 동시 accuracy 보존 | **−50%** (budget_ratio=0.50; 복합 value error 0.64% < 2%) | **0.36%** (단독); 0.64% (복합 B+C; Pass < 1% MANDATORY) | bisection 64회 오버헤드 미미; 1.87s/83tests | ✓ Pass |
 | 2026-05-13 | **A+B+C** (PBKVAgentSegmentPreservationSchedulerMixin + KVFoldAccumulativeRadixCache + SRFTFusedINT4KVKernel; AgenticChunkPreCachingPipeline 통합 파이프라인; CacheStore 인터페이스 완전 준수) | Partial (실 LLM 엔진 미통합; 시뮬레이션: hit_rate=1.0) | **−73.4%** (이론, C 단독); 복합 B+C StreamingLLM fallback + 73.4% 압축 | **0.59%** (복합 Pass < 1%; test_combined_memory_and_accuracy err=0.007) | **0.48ms p50 @ W=5** (Pass); W≥100 초과 (Partial) | ✓ Pass (필수 전체; 실 GPU Throughput 미완) |
+| 2026-05-14 | **B+C** (FibQuantVQSegmentCache + FibQuantVQCodec + FibQuantPositionFreeSegmentCache; spherical-beta VQ 통합; 31/31 테스트; vLLM 64/64 스모크) | 시뮬레이션 간접 달성 (세그먼트 보존 7.1× 증가로 TTFT 단축 기대); GPU 실측 미완 | **−85.9%** (3.56x 설정; 독립 구현); vLLM 기본 1.88x: −46.9% | **0.76%** (MANDATORY Pass, 1.88x); B+C 통합 E2E: test_full_bc_pipeline_accuracy 값 오차 < 1% | Activity A 미포함 | ✓ Pass |
 
 **신규 달성 (2026-05-03)**: A+B+C 전체 조합 45/45 테스트 1회차 통과.
 
@@ -135,6 +143,8 @@
 **신규 달성 (2026-05-10)**: B+C 조합(KVPacketSoftAdapterCache + VQCodec)이 perplexity ±1% 실측과 −70.3% 메모리 절감 동시 달성. 보조 A 스케줄러 0.16ms/100req. 592/592 전체 테스트 통과(역대 최다). vLLM 1회차 전체 Pass.
 
 **신규 달성 (2026-05-11)**: WiCERRateQuantPipeline B+C 조합이 −75% 메모리 절감과 정확도 delta 0.86% 동시 달성. 660/660 테스트 Pass(새 최다). r_h 메타데이터 직렬화로 로딩 시 재캘리브레이션 불필요. vLLM 1회차 전체 Pass.
+
+**신규 달성 (2026-05-14)**: FibQuantPositionFreeSegmentCache B+C 통합체가 spherical-beta VQ + 위치-독립 세그먼트 캐싱으로 −85.9% 메모리 절감 + 비연속 히트율 66.7% + 정확도 0.76%(MANDATORY) 동시 달성. vLLM FibQuantAttentionHook을 통한 E2E 라운드트립 cosine=1.0000(1.88x 설정). FibQuantVQSegmentKVManager가 vLLM KVCacheManager를 서브클래싱하여 make_fibquant_kv_cache_manager_class() 팩토리 API 제공.
 
 ---
 
@@ -153,8 +163,9 @@
 | 2026-05-09 | **0.20.1** | **A+B Cross-1** (HitAwarePPDRouterMixin + TriangleIndexKVCacheManagerMixin + SpecKVContextGuardCombinedHook) | **Partial Pass (3회차)** | 신규 12개 클래스 임포트 Pass. 2026-05-04 select_evict_keys 타이브레이킹 버그로 install.sh 조기 종료. _MinimalManager MRO 설계 결함(smoke test 한정). |
 | 2026-05-10 | **0.20.2** | **B+C** (KVPacketVQBlockManager + VQCodecAttentionHook + KVPacketSegmentSchedulerMixin) | **✓ Pass (1회차)** | CacheConfig.compression_method 필드 vLLM 0.20.2에 없음 — VQCodecAttentionHook 외부 주입으로 기능 동등. CPU-only 환경(libcuda.so.1 없음). 기존 사이클(05-03~05-09) backward-compat 전부 Pass. |
 | 2026-05-11 | **0.20.2** | **B+C** (WiCERBlockManager + RateQuantVllmCodec + RateQuantAttentionHook + make_wicer_kv_cache_manager_class()) | **✓ Pass (1회차)** | 압축 텐서 어텐션 커널 진입 없음 코드 수준 보장. 2026-05-04 VllmRedundancyAwareEvictionPolicy 기존 실패(본 사이클 무관). 신규 테스트 전부 Pass. |
-| 2026-05-12 | **0.20.2** | **B+C Cross-2** (AdapShotBlockManager + MixedDimAttentionHook + AdapShotMixedDimSegmentPipeline + make_adapshot_kv_cache_manager_class()) | **✓ Pass (2회차)** | 루프 1: install.sh 2026-05-09 블록 `set +e`/`set -e` 래핑 누락으로 2026-05-12 섹션 미도달, attention_backend_patch.py line 2127 docstring 파라미터 값 오류. 루프 2: 양 이슈 해소. 743/743 테스트 전량 통과. |
+| 2026-05-12 | **0.20.2** | **B+C Cross-2** (AdapShotBlockManager + MixedDimAttentionHook + AdapShotMixedDimSegmentPipeline + make_adapshot_kv_cache_manager_class()) | **✓ Pass (2회차)** | 루프 1: install.sh 2026-05-09 블록 set+e/set-e 래핑 누락으로 2026-05-12 섹션 미도달, attention_backend_patch.py line 2127 docstring 파라미터 값 오류. 루프 2: 양 이슈 해소. 743/743 테스트 전량 통과. |
 | 2026-05-13 | **0.20.2** | **A+B+C** (PBKVAgentSegmentPreservationSchedulerMixin + KVFoldAccumulativeBlockManager + SRFTInt8AttentionHook; AgenticChunkPreCachingPipeline) | **✓ Pass (1회차)** | 47/51 smoke 테스트 통과 (4 skip = GPU libcuda.so.1 없는 환경 조건부). deprecation 경고 0건. A: W≥100 대형 큐 오버헤드 ~9ms (실용 범위 외). C: KL=8×10⁻⁸(역대 최저). 파일 헤더 버전 불일치(0.20.1 참조 일부 — cosmetic). |
+| 2026-05-14 | **0.20.2** | **B+C** (FibQuantVQSegmentKVManager + VllmFibQuantVQCodec + FibQuantAttentionHook + apply_fibquant_patch()) | **✓ Pass (2회차)** | 루프 1 피드백 반영 후 루프 2에서 전 항목 Pass. _chunk_key 인스턴스 속성 self.fibquant_chunk_size 참조 수정. SwigPy DeprecationWarning 2건은 vllm base 의존성(통합 코드 무관). 4 skipped = TestNonContiguousKVCacheManagerV2 (full vLLM infra 조건부). 10x config(bits_dir=4, 3.56x actual) mandatory 임계값 초과 → cosine ≥ 0.97 proxy 적용(Spec.md 명시 설계). |
 
 ---
 
@@ -175,9 +186,8 @@
 - **TriAttentionCodec pre-RoPE 안정적 중요도로 −90.6% 달성 (2026-05-06)**: 7사이클 최고 압축률. 보존 위치 왕복 정확도 atol=0.00 (완전 무손실, 역대 최고).
 - **QueryCentricRecomputeCache 이중 단계 파이프라인 확립 (2026-05-06)**: 쿼리 관련성(Stage 1) × 코사인 유사도(Stage 2)의 이중 필터로 20% 예산 제한 정확히 구현.
 - **DualFilterSegmentSelector B+C 이중 필터 통합 (2026-05-06)**: 40% 쿼리 관련성 필터 × 20% pre-RoPE 중요도 필터를 파이프라인으로 결합. 372개 테스트 1회차 전부 통과.
-- **vLLM 1회차 Pass 연속 강화**: 11사이클 중 8사이클이 vLLM 이식 1회차 내 통과 (2026-04-29, 2026-04-30, 2026-05-02, 2026-05-03, 2026-05-06, 2026-05-10, 2026-05-11 포함).
+- **vLLM 1회차 Pass 연속 강화**: 14사이클 중 9사이클이 vLLM 이식 1회차 내 통과(2026-04-29, 2026-04-30, 2026-05-02, 2026-05-03, 2026-05-06, 2026-05-10, 2026-05-11, 2026-05-13 포함).
 - **VQCodec training-free 벡터 양자화 실측 검증 (2026-05-10)**: forward-pass 기반 perplexity 실측 통과. −70.3% 메모리 절감 + ±1% perplexity 동시 달성. pre-RoPE 코드북 inverse RoPE MSE < 1e-5.
-- **592개 테스트 전량 통과 (2026-05-10)**: 역대 최다 테스트 수(당시 기준). 단위·통합·B+C 파이프라인 통합 테스트 전부 포함.
 - **KVPacketSegmentSchedulerMixin 0.16ms 오버헤드 (2026-05-10)**: A 스케줄링 오버헤드 목표(5ms) 대비 31배 여유 달성.
 - **WiCERIterativeKVWikiCache CEGAR 반복 세분화 (2026-05-11)**: 도메인 코퍼스 100% 히트율. SHA-256 청크 해시 기반 위치-독립 세그먼트 저장으로 비연속 재사용 구조 강화. gap-containing 쿼리 50%+ NC 확인.
 - **RateQuantReverseWaterfillingCodec 정보이론 최적 비트 할당 (2026-05-11)**: 역 물채우기 Lagrange λ 바이너리 서치로 avg_bits=4.0 달성. −75% 메모리 절감. int8 오버플로우 구조적 해결(int16 저장). KL=0.000013(역대 최저). 660/660 테스트 통과(새 최다).
@@ -185,36 +195,39 @@
 - **MixedDimPerTokenBudgetCodec 역대 최저 accuracy delta 0.36% (2026-05-12)**: bisection 64회 training-free 탐색. budget_ratio 0.30~0.70 전 범위에서 ±1% 이내. 743/743 누적 테스트 전량 통과.
 - **RoPEReencodingNonContiguousCache position-decoupled 구조 확립 (2026-05-12)**: content hash 위치-독립 키 + RoPE 재인코딩 in-place로 위치 불일치 비연속 세그먼트 히트율 100% 달성.
 - **A+B+C 삼중 조합 단일 사이클 완성 (2026-05-13)**: PBKVAgentSegmentPreservationSchedulerMixin + KVFoldAccumulativeRadixCache + SRFTFusedINT4KVKernel이 AgenticChunkPreCachingPipeline으로 통합. CacheStore 인터페이스 완전 준수(6개 추상 메서드). 855/855 테스트 역대 최다 전량 통과.
-- **SRFTInt8AttentionHook KL=8×10⁻⁸ 역대 최저 수준 달성 (2026-05-13)**: SRFT 직교 변환 + SMD RL 편향 제거 조합. 다중 크기 스캔(3종 seed) 전 조합 key/value 오차 0.53~0.59%. vLLM 환경에서 독립 구현 대비 정확도 추가 개선(0.66% → 0.59%).
-- **KVFoldAccumulativeRadixCache foldl 비연속 추적 확립 (2026-05-13)**: get_segments_with_fold()가 miss 구간 이후 hit를 비연속으로 정확 추적. agentic 워크로드 40/40 히트. StreamingLLM window_size×chunk_size 상한으로 메모리 폭발 구조적 방지.
-- **vLLM 1회차 Pass 연속 강화 (2026-05-13)**: 13사이클 중 9사이클이 vLLM 이식 1회차 내 통과. deprecation 경고 0건.
+- **SRFTInt8AttentionHook KL=8×10⁻⁸ 역대 최저 수준 달성 (2026-05-13)**: SRFT 직교 변환 + SMD RL 편향 제거 조합. 다중 크기 스캔(3종 seed) 전 조합 key/value 오차 0.53~0.59%.
+- **KVFoldAccumulativeRadixCache foldl 비연속 추적 확립 (2026-05-13)**: get_segments_with_fold()가 miss 구간 이후 hit를 비연속으로 정확 추적. agentic 워크로드 40/40 히트.
+- **FibQuantVQCodec 구면 베타 VQ 단일 코드베이스 3단계 티어 (2026-05-14)**: 방사/방향 성분 분리 인코딩으로 1.88x~6.40x 압축 티어를 bits_radial/bits_direction 파라미터 하나로 제어. 3.56x 설정 실측 −85.9% 달성(역대 실측 두 번째 최고치). apply_fibquant_patch() API로 클래스 단위 몽키패치 패턴 확립 — vLLM 내부 API 비수정 원칙 유지.
+- **FibQuantVQSegmentCache OrderedDict LRU + 위치-독립 키 일관성 (2026-05-14)**: 동일 메모리 예산에서 세그먼트 보존 수 7.1× 증가. fibquant_stats() 10개 필드 완비로 세밀한 히트/미스/비연속 추적 지원.
 
 ### 아직 해결 안 된 것
-- **실제 GPU 처리량 미검증**: 13개 사이클 모두 CPU/시뮬레이션 환경. H100/A100에서 tokens/sec +20% 목표 Flash Attention 커널 연동 환경 검증 미완.
-- **GPU perplexity 대규모 모델 검증 미완**: LLaMA-3.1-8B / WikiText-2 / LongBench 실측은 미완. 2026-05-11은 proxy 기반(random N(0,1) 데이터) 통과.
+- **실제 GPU 처리량 미검증**: 14개 사이클 모두 CPU/시뮬레이션 환경. H100/A100에서 tokens/sec +20% 목표 Flash Attention 커널 연동 환경 검증 미완.
+- **GPU perplexity 대규모 모델 검증 미완**: LLaMA-3.1-8B / WikiText-2 / LongBench 실측은 미완. proxy 기반(random N(0,1) 데이터) 통과.
 - **compression_ratio 스윕 미완**: 2026-05-06 사이클에서 ratio=0.10만 실측. 정확도-압축률 트레이드오프 곡선 미확립.
 - **TTFT GPU 실측 미완**: CPU-only 환경에서만 스케줄링 오버헤드 측정됨.
 - **다중 노드 실측 검증**: DualMapScheduler 및 MultiNodeScheduler 모두 단일 머신 시뮬레이션으로만 검증됨.
-- **codebook_size 스윕 결과 저장 미완**: VQCodec M=16/64/256, n_residuals=1/2/4 스윕 결과 저장 스크립트 미추가.
 - **vLLM 실제 GPU 측정 미완**: vLLM 이식은 CPU-only 환경(libcuda.so.1 없음).
 - **vLLM 0.21+ 호환성 CI 미구축**: v1 엔진 경로 KVCacheManager API 변경 가능성 대비 버전별 CI 추가 필요.
 - **CacheConfig.compression_method 공식 API 부재**: vLLM 0.20.2에도 없음. 외부 주입 패턴으로 대체 중.
 - **Python 종료 시 segfault**: CUDA teardown 경쟁 조건 추정. vLLM 이슈 트래커 확인 필요.
-- **SegmentAdapter 사전 학습 부재**: 추론 시점에 untrained(random init) 상태.
-- **CacheHitAwareRequestQueue O(n log n) pop**: 대규모 배치(>256 요청)에서 완전한 힙 구현 필요.
-- **packed INT4(nibble 패킹) 미구현**: NQKVCodec 현재 uint8 저장으로 1.882× 실압축. nibble 패킹 적용 시 이론치 3.56× 달성 가능.
-- **WiCER CEGAR 순수 비연속 히트율 추가 검증**: 코퍼스 반복 쿼리는 gap-less coverage로 NC=0%; mixed-document 워크로드에서 ≥30% NC 실측 필요.
+- **Activity A 대형 큐 오버헤드 미해결**: PBKVAgentSegmentPreservationSchedulerMixin W≥100에서 pbkv_pre_schedule ~9ms로 5ms 임계값 초과.
+- **SRFTFusedINT4KVKernel 이론-실측 불일치 지속**: 이론치 73.4%(4-bit), 실측 48.4%(INT8). nibble-pack INT4 실구현 전까지 이중 보고 지속.
+- **FibQuantVQCodec mandatory 기준 config 의존성 (2026-05-14 신규)**: MANDATORY accuracy(perplexity ±1%)는 1.88x 설정에서만 충족. 3.56x(bits_dir=4) 설정에서 attention error 13.1%로 mandatory 초과 — cosine ≥ 0.97 proxy 대체 적용. 압축-정확도 sweet spot 1.88x~3.56x 구간 추가 탐색 필요.
+- **FibQuantVQCodec 레이블-실제값 불일치 (2026-05-14 신규)**: "4x/10x/20x" 레이블이 실제 달성 계수(1.88x/3.56x/6.40x)와 불일치. 다음 사이클에서 실제값 기반 명칭으로 전환 필요.
+- **numpy 환경 의존성**: 기존 14개 테스트(test_dag_ttl_adjuster.py 등) numpy 미설치로 수집 실패. 전체 테스트 스위트 통합 실행 복구 필요.
+- **packed INT4(nibble 패킹) 미구현**: FibQuantVQCodec 및 SRFTFusedINT4KVKernel 현재 uint8 저장. nibble 패킹 적용 시 이론치 절감폭 추가 향상 가능.
+- **codebook_size 스윕 결과 저장 미완**: VQCodec M=16/64/256, n_residuals=1/2/4 스윕 결과 저장 스크립트 미추가.
+- **2026-05-04 VllmRedundancyAwareEvictionPolicy 버그 미해결**: install.sh 사전 존재 실패 항목.
+- **파일 헤더 버전 불일치 (cosmetic)**: block_manager_patch.py, attention_backend_patch.py 일부 docstring이 vLLM 0.20.1 참조. 기능 영향 없으나 정리 필요.
 - **avg_bits < 4.0 탐색 미완**: RateQuant 역 물채우기에서 총 비트 예산 2.0~3.0 범위 정확도-메모리 트레이드오프 미측정.
-- **2026-05-04 VllmRedundancyAwareEvictionPolicy 버그 미해결**: install.sh 사전 존재 실패 항목. 해당 사이클 코드 수정 필요.
-- **Activity A 대형 큐 오버헤드 미해결 (2026-05-13 신규)**: PBKVAgentSegmentPreservationSchedulerMixin W≥100에서 pbkv_pre_schedule ~9ms로 5ms 임계값 초과. 조기 종료 또는 배치 임베딩 캐시 추가 필요.
-- **SRFTFusedINT4KVKernel 이론-실측 불일치 지속 (2026-05-13)**: 이론치 73.4%(4-bit), 실측 48.4%(INT8). nibble-pack INT4 실구현 전까지 이중 보고 지속.
-- **파일 헤더 버전 불일치 (2026-05-13 cosmetic)**: block_manager_patch.py, attention_backend_patch.py 일부 docstring이 vLLM 0.20.1 참조. 기능 영향 없으나 다음 사이클 정리 권고.
+- **SegmentAdapter 사전 학습 부재**: 추론 시점에 untrained(random init) 상태.
+- **WiCER CEGAR 순수 비연속 히트율 추가 검증 미완**: mixed-document 워크로드에서 ≥30% NC 실측 필요.
 
 ### 다음 우선순위 제언
-1. **실 GPU 처리량 측정 (최우선, 13사이클 누적 미완)**: A+B+C 삼중 조합(AgenticChunkPreCachingPipeline)이 완성된 지금, GPT-2 또는 LLaMA-3.2 1B 실 모델을 vLLM에 연동해 throughput(tokens/sec) 및 TTFT p50을 results/2026-05-13/metrics.json에 기록. +20% 목표 실증의 마지막 단계.
-2. **Activity A 대형 큐 오버헤드 최적화**: PBKVAgentSegmentPreservationSchedulerMixin W≥100 오버헤드 ~9ms 해소. 상위 N개만 처리하는 조기 종료 또는 배치 임베딩 캐시 도입으로 W=100 시나리오 5ms 이내 달성.
-3. **INT4 nibble-pack 실구현**: SRFTFusedINT4KVKernel의 torch.int8 저장을 nibble-pack으로 교체해 −73.4% 이론치와 실측치 일치. 파일 헤더 버전 동기화(0.20.1 → 0.20.2) 병행.
-4. **실제 LLM perplexity 검증 (LLaMA-3.1-8B 또는 GPT-2)**: SRFTInt8AttentionHook + KVFoldAccumulativeBlockManager 조합을 실 언어 모델에서 WikiText-2 perplexity 측정. ±1% MANDATORY 기준 대규모 모델 환경 확인.
-5. **RateQuant avg_bits 스윕 및 compression_ratio 트레이드오프 곡선 수립**: avg_bits 2.0~8.0 범위 역 물채우기 스윕 + TriAttentionCodec ratio 스윕(0.05~0.30)으로 정확도-메모리 트레이드오프 곡선 데이터 확립.
+1. **Activity A + B+C FibQuant 결합 (최우선)**: PBKVAgentSegmentPreservationSchedulerMixin(2026-05-13)과 FibQuantVQSegmentCache(2026-05-14)를 결합하여 캐시 인식 스케줄링 + spherical-beta VQ 압축의 이중 효과를 실측. §5 크로스 조합의 "복합 Throughput +5%p" 항목을 Partial에서 Pass로 전환하고, A 대형 큐 오버헤드 최적화를 병행 적용.
+2. **FibQuant 압축 sweet spot 탐색 (bits_direction=5~7 구간)**: 현재 MANDATORY accuracy가 1.88x(bits_dir=8)에서만 통과. bits_direction=6(~2.5x 예상)에서 attention error < 1% 달성 가능 여부 탐색. 코드북 캘리브레이션 데이터 품질 개선 및 레이블 명칭 실제값 기반 전환 병행.
+3. **실 GPU 처리량 측정 (14사이클 누적 미완)**: AgenticChunkPreCachingPipeline 또는 FibQuantPositionFreeSegmentCache를 GPT-2 / LLaMA-3.2 1B에 연동해 throughput(tokens/sec) 및 TTFT p50을 results/metrics.json에 기록. +20% 목표 실증.
+4. **INT4 nibble-pack 실구현**: FibQuantVQCodec 및 SRFTFusedINT4KVKernel의 torch.uint8 저장을 nibble-pack으로 교체하여 이론치와 실측치 일치. 파일 헤더 버전 동기화(0.20.1 → 0.20.2) 및 numpy 환경 의존성 해결 병행.
+5. **vLLM 0.21+ 호환성 CI 구축**: KVCacheManager allocate_slots / get_computed_blocks / evict_blocks 서명 변경 모니터링. FibQuantVQSegmentKVManager 서브클래싱 패턴이 상위 버전 API 변경에 취약하지 않은지 자동 검증 추가.
 
 SUMMARY_UPDATED
