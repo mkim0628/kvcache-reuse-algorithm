@@ -540,17 +540,20 @@ class FibQuantVQCodec:
         """Actual bits per K or V vector, accounting for storage dtype.
 
         For scalar mode (d_sub=1):
-          - n_levels <= 16: nibble packing → 4 bits/dim → d_head/2 bytes codes
-          - n_levels <= 256: uint8 → 8 bits/dim → d_head bytes codes
+          - n_levels <= 4  (1-2 bits/dim): quartet packing → 2 bits/dim → d_head/4 bytes codes
+          - n_levels <= 16 (3-4 bits/dim): nibble packing  → 4 bits/dim → d_head/2 bytes codes
+          - n_levels <= 256 (5-8 bits/dim): uint8 → 8 bits/dim → d_head bytes codes
           - n_levels > 256: int16 → 16 bits/dim → 2*d_head bytes codes
-          Side-info: 2 × FP16 = 32 bits per vector.
+          Side-info: 2 × FP16 = 32 bits per vector (per-vector min + range).
         For PQ mode (d_sub > 1): bits_radial + bits_direction * n_subvec bits.
         """
         cfg = self.config
         d = cfg.d_head
         if cfg.d_sub == 1:
             n_levels = 2 ** cfg.bits_direction
-            if n_levels <= 16:
+            if n_levels <= 4:
+                dir_bits = (d + 3) // 4 * 8  # quartet packing: ceil(d/4) bytes
+            elif n_levels <= 16:
                 dir_bits = (d + 1) // 2 * 8  # nibble packing: ceil(d/2) bytes
             elif n_levels <= 256:
                 dir_bits = d * 8  # uint8
@@ -562,11 +565,11 @@ class FibQuantVQCodec:
             n_sv = self.n_subvec
             return float(cfg.bits_radial + cfg.bits_direction * n_sv)
 
-    def compression_ratio(self, compression_target: float = 10.0) -> float:
+    def compression_ratio(self) -> float:
         """Effective fraction of bits saved vs FP16 baseline (0.0 to 1.0).
 
         Compares bits per K-or-V vector to FP16 bits per vector.
-        Uses actual storage dtype (nibble/uint8/int16) for scalar mode.
+        Uses actual storage dtype (quartet/nibble/uint8/int16) for scalar mode.
         """
         d = self.config.d_head
         fp16_bpv = d * 16  # FP16 bits per K or V vector

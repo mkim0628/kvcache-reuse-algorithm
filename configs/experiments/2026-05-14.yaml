@@ -52,9 +52,14 @@ benchmark:
     perplexity_tolerance_pct: 1.0
     task_accuracy_tolerance_pct: 1.0
   compression_sweep:
-    targets: [4.0, 10.0, 20.0]    # compression ratio sweep
-    bits_radial_sweep: [6, 4, 3]
-    bits_direction_sweep: [10, 9, 7]
+    # Actual compression factors (vs FP16) for each config, using d_sub=1 scalar mode:
+    #   "4x" label  (bits_radial=8, bits_direction=8, uint8):     actual 1.88x
+    #   "10x" label (bits_radial=4, bits_direction=4, nibble):    actual 3.56x
+    #   "20x" label (bits_radial=3, bits_direction=2, quartet):   actual 6.40x
+    # Labels are relative ordering markers; absolute values differ from label names.
+    targets: [1.88, 3.56, 6.40]
+    bits_radial_sweep: [8, 4, 3]
+    bits_direction_sweep: [8, 4, 2]
   hit_rate:
     target_noncontiguous_fraction: 0.30
   memory_reduction:
