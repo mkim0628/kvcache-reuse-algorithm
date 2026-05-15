@@ -159,3 +159,32 @@ class SegmentedHashCache(CacheStore):
         if total_hits == 0:
             return 0.0
         return self._noncontiguous_hits / total_hits
+
+    def load_layers(
+        self,
+        segment_id: str,
+        layer_mask: Optional[bytes] = None,
+    ) -> Optional[Tuple[torch.Tensor, List[int]]]:
+        """Load a segment and optionally select specific layers via bitmask.
+
+        Args:
+            segment_id: segment cache key
+            layer_mask: bitmask bytes (None returns all layers)
+
+        Returns:
+            (kv_tensor, reusable_layer_indices) or None on miss
+        """
+        kv = self.get(segment_id)
+        if kv is None:
+            return None
+        if layer_mask is None:
+            n_layers = kv.shape[1] if kv.dim() >= 3 else 1
+            return kv, list(range(n_layers))
+        mask_int = int.from_bytes(layer_mask, byteorder="little")
+        n_layers = kv.shape[1] if kv.dim() >= 3 else 1
+        reusable = [i for i in range(n_layers) if (mask_int >> i) & 1]
+        if kv.dim() >= 3:
+            selected_kv = kv[:, reusable, ...]
+        else:
+            selected_kv = kv
+        return selected_kv, reusable

@@ -1,4 +1,29 @@
-# vllm_integration: Activity A+B+C KV cache port for vLLM 0.20.2
+# vllm_integration: Activity A+B+C KV cache port for vLLM 0.21.0
+#
+# 2026-05-15 cycle additions:
+#   scheduler_patch       — RadixFeatherSchedulerMixin + make_radix_feather_scheduler_class
+#                             (Activity A): Feather (arXiv 2605.06046) prefix-homogeneity-
+#                             aware batch reordering. Reorders vLLM's waiting queue per
+#                             schedule() step using Radix tree prefix-match signal.
+#                             Overhead: O(window * prefix_len), target < 5ms p50.
+#   block_manager_patch   — RelayUShapeAuxStore + RelayUShapeKVCacheManagerMixin
+#                             + make_relay_ulayer_kv_cache_manager_class (Activity B):
+#                             U-shape layer-selective non-contiguous segment auxiliary
+#                             store alongside vLLM's PagedAttention block table.
+#                             Layer bitmask stored per segment; middle ~70% layers
+#                             reused for non-identical segments.
+#                             Ports: src/cache/relay_ulayer_segment.py
+#   attention_backend_patch — LookaheadEvictionAttentionHook (Activity C):
+#                              write_to_cache() / read_from_cache() for LookaheadKV
+#                              eviction (arXiv 2603.10899, ICLR 2026). Kept KV is
+#                              FP16 original (no quantization distortion).
+#                              Accuracy: eviction_ratio=0.7 → attention error < 1%.
+#                            + LookaheadRelayAttentionHook (Activity B+C):
+#                              dual-filter: U-shape layer filter then LookaheadKV
+#                              token filter. Combined memory reduction ~70–85%.
+#                            + apply_lookahead_eviction_patch() monkey-patcher
+#                            + extend_cache_config_lookahead_eviction() helper
+#                              (adds compression_method, eviction_ratio, etc.)
 #
 # 2026-05-14 cycle additions:
 #   compression_codec     — VllmFibQuantVQCodec: FibQuant Spherical-Beta radial-angular
@@ -84,6 +109,35 @@ from __future__ import annotations
 
 import warnings
 from typing import Any, Optional
+
+# 2026-05-15 imports (Activity A+B+C)
+try:
+    from vllm_integration.scheduler_patch import (
+        RadixFeatherSchedulerConfig,
+        RadixFeatherSchedulerMixin,
+        make_radix_feather_scheduler_class,
+    )
+except Exception as _e_a15:
+    warnings.warn(f"vllm_integration: 2026-05-15 Activity A import failed: {_e_a15}", RuntimeWarning)
+
+try:
+    from vllm_integration.block_manager_patch import (
+        RelayUShapeAuxStore,
+        RelayUShapeKVCacheManagerMixin,
+        make_relay_ulayer_kv_cache_manager_class,
+    )
+except Exception as _e_b15:
+    warnings.warn(f"vllm_integration: 2026-05-15 Activity B import failed: {_e_b15}", RuntimeWarning)
+
+try:
+    from vllm_integration.attention_backend_patch import (
+        LookaheadEvictionAttentionHook,
+        LookaheadRelayAttentionHook,
+        apply_lookahead_eviction_patch,
+        extend_cache_config_lookahead_eviction,
+    )
+except Exception as _e_c15:
+    warnings.warn(f"vllm_integration: 2026-05-15 Activity C import failed: {_e_c15}", RuntimeWarning)
 
 
 def apply_all_patches(
@@ -191,6 +245,17 @@ def apply_all_patches(
 
 __all__ = [
     "apply_all_patches",
+    # 2026-05-15
+    "RadixFeatherSchedulerConfig",
+    "RadixFeatherSchedulerMixin",
+    "make_radix_feather_scheduler_class",
+    "RelayUShapeAuxStore",
+    "RelayUShapeKVCacheManagerMixin",
+    "make_relay_ulayer_kv_cache_manager_class",
+    "LookaheadEvictionAttentionHook",
+    "LookaheadRelayAttentionHook",
+    "apply_lookahead_eviction_patch",
+    "extend_cache_config_lookahead_eviction",
     # 2026-05-14
     "VllmFibQuantVQCodec",
     "FibQuantVQSegmentKVManager",

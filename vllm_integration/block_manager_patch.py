@@ -4755,3 +4755,407 @@ def make_fibquant_kv_cache_manager_class(
 
     _FibQuantVQSegmentKVManager.__init__ = _bound_init
     return _FibQuantVQSegmentKVManager
+
+
+# ===========================================================================
+# 2026-05-15  Activity B: RelayUShapeLayerSelectiveSegmentCache vLLM integration
+# ===========================================================================
+# Ports: src/cache/relay_ulayer_segment.py → RelayUShapeLayerSelectiveSegmentCache
+# vLLM integration points:
+#   vllm/v1/core/kv_cache_manager.py  — KVCacheManager subclass (auxiliary store)
+#   vllm/v1/core/block_pool.py        — block allocation stays intact
+# Algorithm: RelayCaching (arXiv 2603.13289) — U-shape layer-selective
+#   non-contiguous segment reuse.  Byte-non-identical segments can still
+#   reuse middle layers (small KV deviation) while boundary layers are
+#   recomputed.
+#
+# Integration design:
+#   RelayUShapeKVCacheManager(KVCacheManager) maintains a parallel
+#   auxiliary store (dict segment_id → KV + layer bitmask).  vLLM's
+#   existing PagedAttention block logic is NOT modified.  The auxiliary
+#   store is a pure-Python opt-in path for non-contiguous layer-selective
+#   reuse on top of the standard block table.
+# ===========================================================================
+
+import warnings as _warn_b15
+from typing import Any as _Any_b15, Dict as _Dict_b15, List as _List_b15
+from typing import Optional as _Opt_b15, Tuple as _Tup_b15, Type as _Type_b15
+
+try:
+    import torch as _torch_b15
+    _TORCH_OK_B15 = True
+except ImportError:
+    _TORCH_OK_B15 = False
+
+
+class RelayUShapeAuxStore:
+    """Lightweight auxiliary segment store for layer-selective non-contiguous reuse.
+
+    Stores (kv_tensor, layer_bitmask_int) pairs keyed by content-hash segment ID.
+    Uses LRU eviction when max_segments is exceeded.
+    This object is embedded inside RelayUShapeKVCacheManager as a side-channel
+    cache alongside vLLM's standard block table.
+
+    Key API:
+      store(seg_id, kv, layer_mask_int)  → None
+      load(seg_id) → (kv, reusable_layers, boundary_layers) | None
+      noncontiguous_hit_rate() → float
+    """
+
+    def __init__(
+        self,
+        max_segments: int = 1024,
+        n_layers: int = 12,
+        similarity_threshold: float = 0.95,
+        default_middle_frac: float = 0.7,
+    ) -> None:
+        from collections import OrderedDict
+        self._store: "OrderedDict[str, tuple]" = OrderedDict()
+        self._max_segments = max_segments
+        self._n_layers = n_layers
+        self._sim_threshold = similarity_threshold
+        self._default_middle_frac = default_middle_frac
+        # Stats
+        self._hits = 0
+        self._misses = 0
+        self._noncontiguous_hits = 0
+
+    # ------------------------------------------------------------------ #
+    # Core store / load                                                    #
+    # ------------------------------------------------------------------ #
+
+    def store(
+        self,
+        seg_id: str,
+        kv: "_torch_b15.Tensor",  # type: ignore[name-defined]
+        layer_mask_int: int,
+    ) -> None:
+        """Store segment KV with layer reuse bitmask."""
+        if len(self._store) >= self._max_segments:
+            self._evict_lru()
+        if seg_id in self._store:
+            self._store.move_to_end(seg_id)
+        self._store[seg_id] = (kv, layer_mask_int)
+
+    def store_with_default_mask(
+        self,
+        seg_id: str,
+        kv: "_torch_b15.Tensor",  # type: ignore[name-defined]
+        profile_reuse_indices: _Opt_b15[_List_b15[int]] = None,
+    ) -> None:
+        """Store using profile-provided or default middle-layer mask."""
+        if profile_reuse_indices is not None:
+            mask = 0
+            for idx in profile_reuse_indices:
+                mask |= 1 << idx
+        else:
+            mask = self._default_middle_mask()
+        self.store(seg_id, kv, mask)
+
+    def load(
+        self,
+        seg_id: str,
+        target_layers: _Opt_b15[_List_b15[int]] = None,
+    ) -> _Opt_b15[_Tup_b15["_torch_b15.Tensor", _List_b15[int], _List_b15[int]]]:  # type: ignore[name-defined]
+        """Load KV for segment seg_id.
+
+        Returns:
+            (kv_tensor, reusable_layers, boundary_layers) or None on miss.
+        """
+        if seg_id not in self._store:
+            self._misses += 1
+            return None
+        self._store.move_to_end(seg_id)
+        self._hits += 1
+        kv, mask_int = self._store[seg_id]
+        reusable, boundary = self._decode_mask(mask_int)
+        if target_layers is not None:
+            target_set = set(target_layers)
+            reusable = [l for l in reusable if l in target_set]
+            boundary = [l for l in boundary if l in target_set]
+        return kv, reusable, boundary
+
+    def load_batch(
+        self,
+        seg_ids: _List_b15[str],
+    ) -> _Tup_b15[_List_b15, _List_b15[str]]:
+        """Batch load: returns (hits, miss_ids).
+
+        hits: [(seg_id, kv, reusable_layers, boundary_layers), ...]
+        miss_ids: [seg_id, ...]
+        Non-contiguous hit tracking: a hit after a miss in the sequence counts.
+        """
+        hits = []
+        miss_ids = []
+        for seg_id in seg_ids:
+            result = self.load(seg_id)
+            if result is not None:
+                kv, reusable, boundary = result
+                hits.append((seg_id, kv, reusable, boundary))
+                if miss_ids:  # hit after a miss → non-contiguous
+                    self._noncontiguous_hits += 1
+            else:
+                miss_ids.append(seg_id)
+        return hits, miss_ids
+
+    # ------------------------------------------------------------------ #
+    # Metrics                                                               #
+    # ------------------------------------------------------------------ #
+
+    def hit_rate(self) -> float:
+        total = self._hits + self._misses
+        return self._hits / total if total > 0 else 0.0
+
+    def noncontiguous_hit_rate(self) -> float:
+        """Fraction of hits that follow at least one miss (non-contiguous)."""
+        return self._noncontiguous_hits / max(self._hits, 1)
+
+    def memory_bytes(self) -> int:
+        total = 0
+        for kv, _ in self._store.values():
+            if _TORCH_OK_B15 and hasattr(kv, "nbytes"):
+                total += kv.nbytes
+        return total
+
+    def reset_stats(self) -> None:
+        self._hits = 0
+        self._misses = 0
+        self._noncontiguous_hits = 0
+
+    def clear(self) -> None:
+        self._store.clear()
+        self.reset_stats()
+
+    # ------------------------------------------------------------------ #
+    # Internal helpers                                                      #
+    # ------------------------------------------------------------------ #
+
+    def _evict_lru(self) -> None:
+        if self._store:
+            self._store.popitem(last=False)
+
+    def _default_middle_mask(self) -> int:
+        """Bitmask for the middle (default_middle_frac) layers."""
+        n = self._n_layers
+        n_middle = max(1, int(n * self._default_middle_frac))
+        start = (n - n_middle) // 2
+        end = start + n_middle
+        mask = 0
+        for i in range(start, end):
+            mask |= 1 << i
+        return mask
+
+    def _decode_mask(self, mask_int: int) -> _Tup_b15[_List_b15[int], _List_b15[int]]:
+        """Decode bitmask → (reusable_layers, boundary_layers)."""
+        n = self._n_layers
+        reusable = [i for i in range(n) if (mask_int >> i) & 1]
+        boundary = [i for i in range(n) if not ((mask_int >> i) & 1)]
+        return reusable, boundary
+
+
+class RelayUShapeKVCacheManagerMixin:
+    """Mixin: adds layer-selective non-contiguous segment auxiliary store to
+    vLLM's KVCacheManager (Activity B, 2026-05-15).
+
+    The auxiliary store is a side-channel parallel to vLLM's PagedAttention
+    block table.  Existing block allocation / deallocation logic is untouched.
+
+    New public API (added, does not override existing methods):
+      store_relay_segment(seg_id, kv, profile_reuse_indices=None)
+      load_relay_segment(seg_id, target_layers=None) → hit or None
+      load_relay_batch(seg_ids) → (hits, miss_ids)
+      relay_hit_rate() → float
+      relay_noncontiguous_hit_rate() → float
+      relay_memory_bytes() → int
+    """
+
+    _relay_aux_store_2015: RelayUShapeAuxStore
+
+    def _relay_init_2015(
+        self,
+        max_segments: int = 1024,
+        n_layers: int = 12,
+        similarity_threshold: float = 0.95,
+        default_middle_frac: float = 0.7,
+    ) -> None:
+        self._relay_aux_store_2015 = RelayUShapeAuxStore(
+            max_segments=max_segments,
+            n_layers=n_layers,
+            similarity_threshold=similarity_threshold,
+            default_middle_frac=default_middle_frac,
+        )
+
+    def store_relay_segment(
+        self,
+        seg_id: str,
+        kv: "_torch_b15.Tensor",  # type: ignore[name-defined]
+        profile_reuse_indices: _Opt_b15[_List_b15[int]] = None,
+    ) -> None:
+        """Store a KV segment in the relay auxiliary store.
+
+        Parameters
+        ----------
+        seg_id:
+            Content-hash segment identifier (same scheme as SegmentedHashCache).
+        kv:
+            KV tensor: [n_tokens, n_layers, 2, n_heads, d_head] or
+                       [n_tokens, 2, n_heads, d_head] (single layer).
+        profile_reuse_indices:
+            Explicit reusable layer indices from offline profiling.
+            None → use default middle-layer mask.
+        """
+        store = getattr(self, "_relay_aux_store_2015", None)
+        if store is None:
+            _warn_b15.warn(
+                "RelayUShapeKVCacheManagerMixin: _relay_init_2015() not called.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return
+        store.store_with_default_mask(seg_id, kv, profile_reuse_indices)
+
+    def load_relay_segment(
+        self,
+        seg_id: str,
+        target_layers: _Opt_b15[_List_b15[int]] = None,
+    ) -> _Opt_b15[_Tup_b15]:
+        """Load a segment from the relay auxiliary store.
+
+        Returns (kv, reusable_layers, boundary_layers) or None on miss.
+        """
+        store = getattr(self, "_relay_aux_store_2015", None)
+        if store is None:
+            return None
+        return store.load(seg_id, target_layers)
+
+    def load_relay_batch(
+        self,
+        seg_ids: _List_b15[str],
+    ) -> _Tup_b15[_List_b15, _List_b15[str]]:
+        """Batch lookup with non-contiguous hit tracking."""
+        store = getattr(self, "_relay_aux_store_2015", None)
+        if store is None:
+            return [], list(seg_ids)
+        return store.load_batch(seg_ids)
+
+    def relay_hit_rate(self) -> float:
+        store = getattr(self, "_relay_aux_store_2015", None)
+        return store.hit_rate() if store else 0.0
+
+    def relay_noncontiguous_hit_rate(self) -> float:
+        """Fraction of relay hits that are non-contiguous (Activity B metric)."""
+        store = getattr(self, "_relay_aux_store_2015", None)
+        return store.noncontiguous_hit_rate() if store else 0.0
+
+    def relay_memory_bytes(self) -> int:
+        store = getattr(self, "_relay_aux_store_2015", None)
+        return store.memory_bytes() if store else 0
+
+    def reset_relay_stats_2015(self) -> None:
+        store = getattr(self, "_relay_aux_store_2015", None)
+        if store:
+            store.reset_stats()
+
+
+def make_relay_ulayer_kv_cache_manager_class(
+    base_kv_cache_manager_cls: _Type_b15,
+    max_segments: int = 1024,
+    n_layers: int = 12,
+    similarity_threshold: float = 0.95,
+    default_middle_frac: float = 0.7,
+) -> _Type_b15:
+    """Return a new KVCacheManager subclass with relay auxiliary segment store.
+
+    Parameters
+    ----------
+    base_kv_cache_manager_cls:
+        vLLM's KVCacheManager (vllm.v1.core.kv_cache_manager.KVCacheManager).
+    max_segments:
+        Maximum cached segments in the auxiliary LRU store.
+    n_layers:
+        Number of transformer layers (for layer bitmask encoding).
+    similarity_threshold:
+        KV cosine similarity threshold τ_layer for reuse eligibility
+        (informational; actual layer mask set via profile_reuse_indices).
+    default_middle_frac:
+        Fraction of middle layers used as default reuse mask when no profile
+        is provided (default 0.7 = middle 70%).
+
+    Returns
+    -------
+    A new class RelayUShapeVllmKVCacheManager that combines the mixin with
+    base_kv_cache_manager_cls.
+
+    Example
+    -------
+    >>> from vllm.v1.core.kv_cache_manager import KVCacheManager
+    >>> RelayManager = make_relay_ulayer_kv_cache_manager_class(KVCacheManager)
+    """
+
+    class _RelayUShapeVllmKVCacheManager(
+        RelayUShapeKVCacheManagerMixin, base_kv_cache_manager_cls  # type: ignore[valid-type]
+    ):
+        """vLLM KVCacheManager with relay layer-selective auxiliary segment store.
+
+        Activity B (2026-05-15). Ported from:
+          src/cache/relay_ulayer_segment.py (RelayUShapeLayerSelectiveSegmentCache)
+        vLLM version: 0.21.0
+        Algorithm: RelayCaching (arXiv 2603.13289) — U-shape layer deviation.
+        Integration: auxiliary side-channel; existing block table is unchanged.
+        """
+
+        def __init__(self, *args: _Any_b15, **kwargs: _Any_b15) -> None:
+            super().__init__(*args, **kwargs)
+            self._relay_init_2015(
+                max_segments=max_segments,
+                n_layers=n_layers,
+                similarity_threshold=similarity_threshold,
+                default_middle_frac=default_middle_frac,
+            )
+
+    _RelayUShapeVllmKVCacheManager.__name__ = "RelayUShapeVllmKVCacheManager"
+    _RelayUShapeVllmKVCacheManager.__qualname__ = "RelayUShapeVllmKVCacheManager"
+    return _RelayUShapeVllmKVCacheManager
+
+
+# ---------------------------------------------------------------------------
+# Smoke test  (2026-05-15  Activity B)
+# ---------------------------------------------------------------------------
+
+def _smoke_test_relay_ulayer_block_manager_2015() -> None:
+    """Quick functional smoke test for RelayUShapeAuxStore and factory."""
+    if not _TORCH_OK_B15:
+        print("relay_ulayer block_manager_patch smoke test: SKIP (torch unavailable)")
+        return
+
+    import torch as _t
+
+    # Test aux store directly.
+    store = RelayUShapeAuxStore(max_segments=10, n_layers=12)
+
+    kv = _t.randn(32, 12, 2, 8, 64)
+    profile_idx = list(range(2, 10))  # middle 8 of 12 layers
+    store.store_with_default_mask("seg_A", kv, profile_reuse_indices=profile_idx)
+    result = store.load("seg_A")
+    assert result is not None, "load after store must succeed"
+    kv_out, reusable, boundary = result
+    assert set(reusable) == set(profile_idx), "reusable layers must match profile"
+    assert len(boundary) == 4, "boundary = 12 - 8 = 4 layers"
+
+    # Non-contiguous hit tracking.
+    store.store_with_default_mask("seg_B", kv)
+    hits, misses = store.load_batch(["seg_A", "seg_MISS", "seg_B"])
+    assert len(hits) == 2, f"Expected 2 hits, got {len(hits)}"
+    assert len(misses) == 1, f"Expected 1 miss, got {len(misses)}"
+    assert store._noncontiguous_hits >= 1, "seg_B hit after seg_MISS must be non-contiguous"
+
+    # Test factory with vLLM KVCacheManager.
+    try:
+        from vllm.v1.core.kv_cache_manager import KVCacheManager
+        RelayManager = make_relay_ulayer_kv_cache_manager_class(KVCacheManager)
+        assert issubclass(RelayManager, KVCacheManager)
+        print(f"  RelayUShapeVllmKVCacheManager subclass check: PASS ({RelayManager.__name__})")
+    except Exception as exc:
+        print(f"  RelayUShapeVllmKVCacheManager subclass check skipped: {exc}")
+
+    print("RelayUShapeKVCacheManagerMixin smoke test (2026-05-15): PASS")

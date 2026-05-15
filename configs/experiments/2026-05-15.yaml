@@ -1,0 +1,80 @@
+experiment:
+  date: "2026-05-15"
+  activity: "A+B+C"
+  description: >
+    C-1 LookaheadKVEvictionCodec (draft-free future-aware LoRA KV eviction) +
+    B-1 RelayUShapeLayerSelectiveSegmentCache (U-shape layer-selective non-contiguous segment reuse) +
+    Cross-1 LookaheadRelaySegmentCache (dual-filter B+C pipeline) +
+    A-1 RadixFeatherBatchScheduler (auxiliary, Radix-tree homogeneity-signal batch stop)
+
+lookahead_kv_eviction:
+  n_layers: 12
+  n_heads: 8
+  d_head: 64
+  n_lookahead: 5
+  lora_rank: 8
+  eviction_ratio: 0.7
+  blend_ratio: 0.0
+  recent_window: 4
+  max_entries: 1000
+  seed: 42
+
+relay_ulayer_segment:
+  chunk_size: 128
+  max_entries: 1000
+  n_layers: 12
+  n_heads: 8
+  d_head: 64
+  similarity_threshold: 0.95
+  profile_path: "configs/relay_ulayer_profile.yaml"
+  seed: 42
+
+lookahead_relay_segment:
+  token_importance_threshold: 0.3
+  max_entries: 1000
+  seed: 42
+
+radix_feather_scheduler:
+  chunk_size: 256
+  target_batch_size: 8
+  homogeneity_threshold: 0.6
+  scheduler_mode: "static"
+  max_wait_ratio: 2.0
+  seed: 42
+
+benchmark:
+  accuracy:
+    method: "attention_output_proxy"
+    proxy_tolerance: 0.01
+    kl_tolerance: 0.015
+    cosine_min: 0.99
+    perplexity_dataset: "wikitext-2"
+    perplexity_tolerance_pct: 1.0
+    task_accuracy_tolerance_pct: 1.0
+  eviction_sweep:
+    ratios: [0.5, 0.7, 0.85]
+  layer_calibration:
+    n_pairs: 100
+    perturbation_ratio: 0.1
+    tau_layer: 0.95
+  hit_rate:
+    target_noncontiguous_fraction: 0.30
+  memory_reduction:
+    target_ratio: 0.30
+    target_ratio_goal: 0.70
+  throughput:
+    target_improvement_pct: 20
+  effective_context:
+    target_multiplier: 2.0
+  scheduling:
+    ttft_overhead_limit_pct: 5.0
+
+lookahead_training:
+  n_samples: 500
+  n_epochs: 5
+  lr: 1.0e-3
+  output: "configs/lookahead_lora_weights.pt"
+
+layer_calibration_output: "configs/relay_ulayer_profile.yaml"
+seed: 42
+results_dir: "results/2026-05-15"

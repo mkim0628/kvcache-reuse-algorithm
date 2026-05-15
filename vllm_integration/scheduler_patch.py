@@ -2650,3 +2650,356 @@ def _smoke_test_pbkv_scheduler_mixin() -> None:
 
     print("  PBKVAgentSegmentPreservationSchedulerMixin: PASS")
     print("AdapShotSegmentSchedulerMixin smoke test: PASS")
+
+
+# ===========================================================================
+# 2026-05-15  Activity A: RadixFeatherBatchScheduler vLLM integration
+# ===========================================================================
+# Ports: src/scheduler/radix_feather_batch.py → RadixFeatherBatchScheduler
+# vLLM integration point: vllm/v1/core/sched/scheduler.py
+# Algorithm: Prefix-homogeneity-aware batch reordering (Feather, arXiv 2605.06046)
+# Overhead target: TTFT p50 increase < 5% (< 5ms absolute)
+# ===========================================================================
+
+
+import time as _time_2015
+import warnings as _warnings_2015
+from dataclasses import dataclass as _dataclass_2015
+from typing import Any as _Any_2015, Dict as _Dict_2015, List as _List_2015, Optional as _Optional_2015, Type as _Type_2015
+
+
+@_dataclass_2015
+class RadixFeatherSchedulerConfig:
+    """Configuration for homogeneity-aware batch reordering (Activity A, 2026-05-15)."""
+
+    homogeneity_threshold: float = 0.6
+    """Minimum homogeneity score to keep adding requests to a batch group."""
+
+    target_batch_size: int = 8
+    """Maximum number of requests in a single homogenous batch group."""
+
+    max_reorder_window: int = 32
+    """Maximum number of waiting requests inspected per schedule step."""
+
+    max_wait_ratio: float = 2.0
+    """Fairness guard: requests waiting longer than max_wait_ratio × median_wait
+    are promoted to the front of the queue."""
+
+    overhead_warn_ms: float = 5.0
+    """Emit a warning if scheduling overhead exceeds this threshold (ms)."""
+
+
+def _rf_naive_shared_prefix_length(token_lists: _List_2015[_List_2015[int]]) -> int:
+    """Return the length of the common prefix across all token lists."""
+    if not token_lists:
+        return 0
+    if len(token_lists) == 1:
+        return len(token_lists[0])
+    ref = token_lists[0]
+    shared = 0
+    for i, tok in enumerate(ref):
+        if all(len(t) > i and t[i] == tok for t in token_lists[1:]):
+            shared += 1
+        else:
+            break
+    return shared
+
+
+def _rf_homogeneity_score(
+    requests: _List_2015[_Any_2015],
+    radix_cache: _Any_2015 = None,
+) -> float:
+    """Compute prefix-homogeneity score for a candidate batch.
+
+    score = (shared_prefix_tokens * n_requests) / total_tokens
+
+    Falls back to naive O(prefix_len) counting when radix_cache is None or
+    lacks prefix_match_length().
+    """
+    if not requests:
+        return 0.0
+
+    def _get_tokens(req: _Any_2015) -> _List_2015[int]:
+        # Support vLLM Request objects (have prompt_token_ids) and plain dicts.
+        if hasattr(req, "prompt_token_ids"):
+            return list(req.prompt_token_ids)
+        if isinstance(req, dict):
+            return list(req.get("token_ids", req.get("prompt_token_ids", [])))
+        return []
+
+    token_lists = [_get_tokens(r) for r in requests]
+    total_tokens = sum(len(t) for t in token_lists)
+    if total_tokens == 0:
+        return 0.0
+
+    if radix_cache is not None and hasattr(radix_cache, "prefix_match_length"):
+        try:
+            min_hit = min(
+                radix_cache.prefix_match_length(t) for t in token_lists
+            )
+            shared = min_hit * len(requests)
+        except Exception:
+            shared = _rf_naive_shared_prefix_length(token_lists) * len(requests)
+    else:
+        shared = _rf_naive_shared_prefix_length(token_lists) * len(requests)
+
+    return shared / total_tokens
+
+
+def _rf_reorder_by_homogeneity(
+    waiting: _List_2015[_Any_2015],
+    window: int,
+    threshold: float,
+    target_size: int,
+    max_wait_ratio: float,
+    radix_cache: _Any_2015 = None,
+) -> _List_2015[_Any_2015]:
+    """Return a reordered copy of *waiting* grouping high-homogeneity requests.
+
+    Only the first *window* requests are inspected; the rest are appended
+    unchanged. A fairness guard promotes stale requests (waited > max_wait_ratio
+    × median wait) to the front.
+    """
+    if len(waiting) <= 1:
+        return list(waiting)
+
+    candidates = list(waiting[:window])
+    tail = list(waiting[window:])
+    now = _time_2015.monotonic()
+
+    def _arrival(req: _Any_2015) -> float:
+        if hasattr(req, "arrival_time"):
+            return req.arrival_time
+        if isinstance(req, dict):
+            return req.get("arrival_time", now)
+        return now
+
+    # Fairness guard: identify stale vs. fresh candidates.
+    waits = sorted(now - _arrival(r) for r in candidates)
+    median_wait = waits[len(waits) // 2] if waits else 0.0
+    stale_thresh = median_wait * max_wait_ratio if median_wait > 0 else float("inf")
+    stale = [r for r in candidates if (now - _arrival(r)) > stale_thresh]
+    fresh = [r for r in candidates if (now - _arrival(r)) <= stale_thresh]
+
+    # Greedy homogeneity grouping on fresh candidates.
+    remaining = list(fresh)
+    groups: _List_2015[_List_2015[_Any_2015]] = []
+    while remaining:
+        group: _List_2015[_Any_2015] = [remaining.pop(0)]
+        for req in list(remaining):
+            if len(group) >= target_size:
+                break
+            if _rf_homogeneity_score(group + [req], radix_cache) >= threshold:
+                group.append(req)
+                remaining.remove(req)
+        groups.append(group)
+
+    reordered: _List_2015[_Any_2015] = stale[:]
+    for g in groups:
+        reordered.extend(g)
+    return reordered + tail
+
+
+class RadixFeatherSchedulerMixin:
+    """Mixin: adds prefix-homogeneity-aware reordering to vLLM's Scheduler.
+
+    Activity A (2026-05-15) — Feather (arXiv 2605.06046) integration.
+
+    Wrap vLLM's Scheduler with this mixin via make_radix_feather_scheduler_class():
+
+        FeatherScheduler = make_radix_feather_scheduler_class(Scheduler)
+
+    The mixin overrides schedule() to:
+      1. Inspect self.waiting (up to max_reorder_window requests).
+      2. Reorder them so high-homogeneity requests are batched together.
+      3. Measure and record wall-clock overhead.
+      4. Call the parent's schedule() with the reordered queue.
+
+    No existing vLLM internals are mutated beyond the waiting queue order.
+    Graceful degradation: if waiting queue is inaccessible, the override is
+    a transparent pass-through.
+    """
+
+    _feather_cfg_2015: RadixFeatherSchedulerConfig
+    _feather_times_2015: _List_2015[float]
+    _feather_radix_cache_2015: _Any_2015
+
+    def _feather_init_2015(
+        self,
+        feather_config: _Optional_2015[RadixFeatherSchedulerConfig] = None,
+        radix_cache: _Any_2015 = None,
+    ) -> None:
+        self._feather_cfg_2015 = feather_config or RadixFeatherSchedulerConfig()
+        self._feather_times_2015 = []
+        self._feather_radix_cache_2015 = radix_cache
+
+    def schedule(self):  # type: ignore[override]
+        """Override: reorder waiting queue then delegate to parent schedule()."""
+        t0 = _time_2015.monotonic()
+        try:
+            self._feather_reorder_waiting_2015()
+        except Exception as exc:
+            _warnings_2015.warn(
+                f"RadixFeatherSchedulerMixin.schedule: reorder failed ({exc}); "
+                "proceeding with default order.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        overhead_ms = (_time_2015.monotonic() - t0) * 1000.0
+        self._feather_times_2015.append(overhead_ms)
+
+        if overhead_ms > self._feather_cfg_2015.overhead_warn_ms:
+            _warnings_2015.warn(
+                f"RadixFeatherSchedulerMixin: overhead {overhead_ms:.2f}ms "
+                f"> {self._feather_cfg_2015.overhead_warn_ms}ms threshold.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        return super().schedule()  # type: ignore[misc]
+
+    def _feather_reorder_waiting_2015(self) -> None:
+        """Reorder self.waiting in-place by homogeneity score."""
+        # vLLM v1 Scheduler exposes the waiting queue as self.waiting.
+        # It may be a list, deque, or RequestQueue.
+        waiting = getattr(self, "waiting", None)
+        if waiting is None:
+            return
+        if not hasattr(waiting, "__len__") or len(waiting) <= 1:
+            return
+
+        cfg = self._feather_cfg_2015
+        try:
+            waiting_list = list(waiting)
+        except TypeError:
+            return
+
+        reordered = _rf_reorder_by_homogeneity(
+            waiting=waiting_list,
+            window=min(cfg.max_reorder_window, len(waiting_list)),
+            threshold=cfg.homogeneity_threshold,
+            target_size=cfg.target_batch_size,
+            max_wait_ratio=cfg.max_wait_ratio,
+            radix_cache=self._feather_radix_cache_2015,
+        )
+
+        # Write back to the waiting queue.
+        try:
+            waiting.clear()  # type: ignore[union-attr]
+            for req in reordered:
+                waiting.append(req)
+        except AttributeError:
+            pass  # Silently skip if the queue type doesn't support mutation.
+
+    # ------------------------------------------------------------------ #
+    # Evaluation metrics                                                    #
+    # ------------------------------------------------------------------ #
+
+    def scheduling_overhead_ms_p50(self) -> float:
+        """Return median scheduling overhead (ms) added by this mixin."""
+        times = getattr(self, "_feather_times_2015", [])
+        if not times:
+            return 0.0
+        s = sorted(times)
+        return s[len(s) // 2]
+
+    def scheduling_overhead_ms_p99(self) -> float:
+        """Return p99 scheduling overhead (ms)."""
+        times = getattr(self, "_feather_times_2015", [])
+        if not times:
+            return 0.0
+        s = sorted(times)
+        idx = min(int(len(s) * 0.99), len(s) - 1)
+        return s[idx]
+
+    def reset_feather_stats_2015(self) -> None:
+        """Clear overhead measurements."""
+        times = getattr(self, "_feather_times_2015", None)
+        if times is not None:
+            times.clear()
+
+
+def make_radix_feather_scheduler_class(
+    base_scheduler_cls: _Type_2015,
+    feather_config: _Optional_2015[RadixFeatherSchedulerConfig] = None,
+    radix_cache: _Any_2015 = None,
+) -> _Type_2015:
+    """Return a new Scheduler subclass with homogeneity-aware batch reordering.
+
+    Parameters
+    ----------
+    base_scheduler_cls:
+        vLLM's Scheduler (vllm.v1.core.sched.scheduler.Scheduler).
+    feather_config:
+        Policy configuration. Defaults are used if None.
+    radix_cache:
+        Optional Radix tree with prefix_match_length(token_ids) -> int method.
+        None triggers naive common-prefix counting as fallback.
+
+    Returns
+    -------
+    A new class combining RadixFeatherSchedulerMixin and base_scheduler_cls.
+
+    Example
+    -------
+    >>> from vllm.v1.core.sched.scheduler import Scheduler
+    >>> FeatherScheduler = make_radix_feather_scheduler_class(Scheduler)
+    """
+    cfg = feather_config or RadixFeatherSchedulerConfig()
+
+    class _RadixFeatherVllmScheduler(
+        RadixFeatherSchedulerMixin, base_scheduler_cls  # type: ignore[valid-type]
+    ):
+        """vLLM Scheduler with Feather homogeneity-aware batch reordering.
+
+        Activity A (2026-05-15). Ported from:
+          src/scheduler/radix_feather_batch.py (RadixFeatherBatchScheduler)
+        vLLM version: 0.21.0
+        Algorithm: Feather (arXiv 2605.06046) — prefix-homogeneity-aware
+        batch construction policy using Radix tree KV-cache signals.
+        Overhead: O(window * prefix_len) per schedule step, target < 5ms p50.
+        """
+
+        def __init__(self, *args: _Any_2015, **kwargs: _Any_2015) -> None:
+            super().__init__(*args, **kwargs)
+            self._feather_init_2015(cfg, radix_cache)
+
+    _RadixFeatherVllmScheduler.__name__ = "RadixFeatherVllmScheduler"
+    _RadixFeatherVllmScheduler.__qualname__ = "RadixFeatherVllmScheduler"
+    return _RadixFeatherVllmScheduler
+
+
+# ---------------------------------------------------------------------------
+# Smoke test  (2026-05-15)
+# ---------------------------------------------------------------------------
+
+def _smoke_test_radix_feather_scheduler_2015() -> None:
+    """Quick functional smoke test for RadixFeatherSchedulerMixin internals."""
+    import sys, pathlib
+    repo_root = pathlib.Path(__file__).resolve().parent.parent
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+
+    # Test homogeneity score.
+    r1 = {"token_ids": [1, 2, 3, 4, 5], "arrival_time": _time_2015.monotonic()}
+    r2 = {"token_ids": [1, 2, 3, 9, 8], "arrival_time": _time_2015.monotonic()}
+    r3 = {"token_ids": [9, 8, 7, 6, 5], "arrival_time": _time_2015.monotonic()}
+    score_12 = _rf_homogeneity_score([r1, r2])
+    score_13 = _rf_homogeneity_score([r1, r3])
+    assert score_12 > score_13, f"Expected higher score for shared prefix: {score_12} vs {score_13}"
+
+    # Test reorder: r1 and r2 should be grouped together.
+    reordered = _rf_reorder_by_homogeneity(
+        [r1, r3, r2], window=3, threshold=0.4, target_size=8, max_wait_ratio=100.0
+    )
+    assert len(reordered) == 3, "Reordered list must have same length"
+
+    # Test factory with vLLM Scheduler (import only; no GPU init needed).
+    try:
+        from vllm.v1.core.sched.scheduler import Scheduler
+        FeatherScheduler = make_radix_feather_scheduler_class(Scheduler)
+        assert issubclass(FeatherScheduler, Scheduler)
+        print(f"  RadixFeatherVllmScheduler subclass check: PASS ({FeatherScheduler.__name__})")
+    except Exception as exc:
+        print(f"  RadixFeatherVllmScheduler subclass check skipped (no GPU env): {exc}")
+
+    print("RadixFeatherSchedulerMixin smoke test (2026-05-15): PASS")

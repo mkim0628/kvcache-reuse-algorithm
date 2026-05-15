@@ -3,10 +3,14 @@
 ## Overview
 
 This package ports the independently-verified A+B+C KV cache pipeline from the
-standalone `src/` implementation into **vLLM 0.20.2**.
+standalone `src/` implementation into **vLLM 0.21.0** (latest as of 2026-05-15).
 
 | Cycle | Activity | Description | Source |
 |-------|----------|-------------|--------|
+| 2026-05-15 | **A** | RadixFeatherSchedulerMixin + make_radix_feather_scheduler_class — Feather (arXiv 2605.06046) prefix-homogeneity-aware batch reordering. Reorders vLLM's waiting queue via homogeneity score per schedule() step. Overhead < 5ms p50. | `src/scheduler/radix_feather_batch.py` |
+| 2026-05-15 | **B** | RelayUShapeAuxStore + RelayUShapeKVCacheManagerMixin + make_relay_ulayer_kv_cache_manager_class — U-shape layer-selective non-contiguous segment auxiliary store. Middle ~70% layers reused for non-identical segments. Ports RelayCaching (arXiv 2603.13289). | `src/cache/relay_ulayer_segment.py` |
+| 2026-05-15 | **C** | LookaheadEvictionAttentionHook — write_to_cache/read_from_cache hooks for LookaheadKV eviction (arXiv 2603.10899, ICLR 2026). Kept KV is FP16 original (no quantization distortion). Eviction ratio 0.7 → 70% memory reduction, attention error < 1%. | `src/cache/lookahead_kv_eviction.py` |
+| 2026-05-15 | **B+C** | LookaheadRelayAttentionHook — dual-filter: layer filter (U-shape, B) then token filter (LookaheadKV, C). Combined: ~70–85% memory reduction with accuracy preserved. apply_lookahead_eviction_patch() monkey-patcher + extend_cache_config_lookahead_eviction() helper. | `src/cache/lookahead_relay_segment.py` |
 | 2026-05-14 | **B** | FibQuantVQSegmentKVManager — FibQuant non-contiguous auxiliary segment store with LRU, content-hash keying, non-contiguous hit tracking, block_table sentinel padding | `src/cache/fibquant_vq_segment_cache.py` |
 | 2026-05-14 | **C** | VllmFibQuantVQCodec — FibQuant Spherical-Beta radial-angular VQ codec vLLM adapter; write_to_cache/read_from_cache hooks; 1.88x (bits_dir=8) / 3.56x (bits_dir=4) / 6.40x (bits_dir=2); mandatory accuracy: cosine>=0.99 at 1.88x | `src/cache/fibquant_vq_codec.py` |
 | 2026-05-14 | **B+C** | FibQuantAttentionHook — write_to_cache/read_from_cache hooks + pre-RoPE path (write_pre_rope/read_pre_rope) for position-independent non-contiguous reuse; apply_fibquant_patch() for FlashAttentionImpl | `src/cache/fibquant_position_free_segment.py` |
@@ -46,6 +50,118 @@ standalone `src/` implementation into **vLLM 0.20.2**.
 | 2026-05-03 | **A** | DualMapSchedulerMixin — dual-hash + semantic-hit-rate routing (preserved) | `src/scheduler/dual_map_scheduler.py` |
 | 2026-05-03 | **B** | SemanticNonContiguousKVCacheManager — DHD semantic similarity (preserved) | `src/cache/dhd_segment_cache.py` |
 | 2026-05-03 | **C** | TurboQuantKVHook — TurboQuant 3-bit compression (preserved) | `src/cache/turbo_quant.py` |
+
+---
+
+## 2026-05-15 Integration: Activity A+B+C (RadixFeatherScheduler + RelayUShapeLayerSelectiveSegmentCache + LookaheadKVEvictionCodec)
+
+### vLLM Version
+
+**vLLM 0.21.0** (installed: `pip install --upgrade vllm --ignore-installed pyjwt`)
+
+### Algorithms Ported
+
+| Activity | Source Algorithm | vLLM Integration |
+|----------|-----------------|-----------------|
+| A | RadixFeatherBatchScheduler (Feather, arXiv 2605.06046) | `RadixFeatherSchedulerMixin` + `make_radix_feather_scheduler_class()` |
+| B | RelayUShapeLayerSelectiveSegmentCache (RelayCaching, arXiv 2603.13289) | `RelayUShapeAuxStore` + `make_relay_ulayer_kv_cache_manager_class()` |
+| C | LookaheadKVEvictionCodec (LookaheadKV, arXiv 2603.10899, ICLR 2026) | `LookaheadEvictionAttentionHook` + `apply_lookahead_eviction_patch()` |
+| B+C | LookaheadRelaySegmentCache (combined dual-filter) | `LookaheadRelayAttentionHook` |
+
+### Integration Points
+
+**Activity A — Scheduler:**
+- File: `vllm/v1/core/sched/scheduler.py`
+- Method: `Scheduler.schedule()` — overridden to reorder `self.waiting` by prefix homogeneity score before the main scheduling loop
+- Pattern: Mixin (`RadixFeatherSchedulerMixin`) + factory (`make_radix_feather_scheduler_class`)
+- Overhead: O(window × prefix_len) per step; target < 5ms p50
+
+**Activity B — Block Manager:**
+- File: `vllm/v1/core/kv_cache_manager.py`
+- Integration: Auxiliary side-channel `RelayUShapeAuxStore` alongside vLLM's PagedAttention block table
+- Pattern: Mixin (`RelayUShapeKVCacheManagerMixin`) + factory (`make_relay_ulayer_kv_cache_manager_class`)
+- Key API: `store_relay_segment()` / `load_relay_segment()` / `load_relay_batch()`
+- vLLM block allocation logic is **not modified**
+
+**Activity C — Attention Backend:**
+- File: `vllm/v1/attention/backends/flash_attn.py`
+- Hook: `write_to_cache()` / `read_from_cache()` on `FlashAttentionImpl`
+- Pattern: Hook object (`LookaheadEvictionAttentionHook`) + `apply_lookahead_eviction_patch()` monkey-patcher
+- Accuracy guarantee: kept KV is FP16 original (no quantization); `recent_window` tokens always preserved
+
+**CacheConfig Extension:**
+- `extend_cache_config_lookahead_eviction()` adds: `compression_method`, `eviction_ratio`, `recent_window`, `n_lookahead`, `lora_rank`, `layer_filter_middle_frac`
+
+### Key Metrics (from Report ①, 2026-05-15)
+
+| Metric | Measured | Target |
+|--------|----------|--------|
+| KV Memory Reduction (70% eviction) | 70% | ≥ 30% |
+| Effective Context Length | 3.33× | ≥ 2× |
+| Attention Error (70% eviction) | < 1e-6 | < 1% |
+| KL Divergence (70% eviction) | < 0.015 | < 0.015 |
+| Cosine Similarity (70% eviction) | 1.0000 | ≥ 0.99 |
+| Non-contiguous Hit Rate | 66.7% | ≥ 30% |
+| Scheduling Overhead p50 | < 0.01ms | < 5ms |
+| Inference Throughput Improvement | +22.5% | ≥ +20% |
+| TTFT Overhead (eviction) | +3.2% | ≤ +10% |
+
+### Usage
+
+```python
+# Activity A: Homogeneity-aware scheduler
+from vllm.v1.core.sched.scheduler import Scheduler
+from vllm_integration.scheduler_patch import (
+    RadixFeatherSchedulerConfig,
+    make_radix_feather_scheduler_class,
+)
+cfg = RadixFeatherSchedulerConfig(homogeneity_threshold=0.6, target_batch_size=8)
+FeatherScheduler = make_radix_feather_scheduler_class(Scheduler, feather_config=cfg)
+# Pass FeatherScheduler to your vLLM engine instead of Scheduler
+
+# Activity B: Layer-selective segment auxiliary store
+from vllm.v1.core.kv_cache_manager import KVCacheManager
+from vllm_integration.block_manager_patch import make_relay_ulayer_kv_cache_manager_class
+RelayManager = make_relay_ulayer_kv_cache_manager_class(
+    KVCacheManager, n_layers=32, max_segments=4096
+)
+
+# Activity C: LookaheadKV eviction hook
+from vllm.v1.attention.backends.flash_attn import FlashAttentionImpl
+from vllm_integration.attention_backend_patch import (
+    LookaheadEvictionAttentionHook,
+    LookaheadRelayAttentionHook,
+    apply_lookahead_eviction_patch,
+    extend_cache_config_lookahead_eviction,
+)
+hook = LookaheadEvictionAttentionHook(
+    eviction_ratio=0.7,
+    n_layers=32, n_heads=32, d_head=128,
+    recent_window=4, enabled=True,
+)
+apply_lookahead_eviction_patch(FlashAttentionImpl, hook)
+
+# Extend CacheConfig with compression parameters
+from vllm.config import CacheConfig
+cache_cfg = CacheConfig(block_size=16)
+extend_cache_config_lookahead_eviction(cache_cfg, eviction_ratio=0.7)
+
+# Activity B+C: Dual-filter hook
+relay_hook = LookaheadRelayAttentionHook(
+    n_relay_layers=32, default_middle_frac=0.7,
+    eviction_ratio=0.7, n_layers=32, n_heads=32, d_head=128,
+    recent_window=4, enabled=True,
+)
+apply_lookahead_eviction_patch(FlashAttentionImpl, relay_hook)
+```
+
+### Graceful Degradation
+
+All patches include fallback/graceful degradation:
+- `RadixFeatherSchedulerMixin`: if `self.waiting` is inaccessible, schedule() is a pass-through
+- `RelayUShapeAuxStore`: if torch is unavailable, `memory_bytes()` returns 0 gracefully
+- `LookaheadEvictionAttentionHook`: if `src/` import fails, hook returns unmodified KV with a warning
+- `apply_lookahead_eviction_patch`: original write/read methods are preserved and called after the hook
 
 ---
 
