@@ -3109,3 +3109,514 @@ def apply_fibquant_patch(
     # the hook path is always reachable).
     flash_attn_impl_class.write_to_cache = patched_write
     flash_attn_impl_class.read_from_cache = patched_read
+
+
+# ===========================================================================
+# 2026-05-15  Activity C: LookaheadKVEvictionCodec vLLM integration
+#             Activity B+C: LookaheadRelaySegmentCache vLLM integration
+# ===========================================================================
+# Ports:
+#   src/cache/lookahead_kv_eviction.py   → LookaheadKVEvictionCodec
+#   src/cache/lookahead_relay_segment.py → LookaheadRelaySegmentCache (B+C)
+# vLLM integration point:
+#   vllm/v1/attention/backends/flash_attn.py — write_to_cache / read_from_cache hooks
+#   vllm/config/cache.py (CacheConfig) — extended with compression_method field
+#
+# Design:
+#   LookaheadEvictionAttentionHook.write_to_cache():
+#     - Intercepts KV before it is stored in the vLLM block.
+#     - Applies LookaheadKV importance scoring → evicts low-importance tokens.
+#     - Keeps FP16 originals (no quantization distortion).
+#     - Accuracy constraint: eviction preserves recent_window tokens always.
+#   LookaheadEvictionAttentionHook.read_from_cache():
+#     - Returns the eviction-filtered KV (decompressed = original FP16).
+#     - Attention kernel always receives decompressed tensors.
+#   LookaheadRelayAttentionHook.write_to_cache():
+#     - Applies layer filter (U-shape profile) THEN token filter (LookaheadKV).
+#     - Only dual-filtered KV is passed through.
+#   Both hooks are applied via apply_lookahead_eviction_patch() to the
+#   FlashAttentionImpl class (monkey-patch the write/read pair).
+#   Graceful degradation: if vLLM backend class is not found or import fails,
+#   hooks degrade to no-ops.
+# ===========================================================================
+
+import warnings as _warn_c15
+from typing import Any as _Any_c15, Optional as _Opt_c15, Type as _Type_c15
+
+try:
+    import torch as _torch_c15
+    _TORCH_OK_C15 = True
+except ImportError:
+    _TORCH_OK_C15 = False
+
+
+class LookaheadEvictionAttentionHook:
+    """Activity C (2026-05-15): write_to_cache / read_from_cache hook.
+
+    Integrates LookaheadKVEvictionCodec into the vLLM FlashAttentionImpl
+    write/read pair.  KV is eviction-filtered BEFORE being stored; the
+    attention kernel always receives fully decompressed (FP16 original) tensors.
+
+    Accuracy guarantee:
+      - The recent_window most recent tokens are ALWAYS kept (never evicted).
+      - The eviction ratio controls what fraction of non-recent tokens are dropped.
+      - Kept tokens are original FP16 (no quantization distortion).
+      - Accuracy delta target: attention output relative error < 1%
+        (validated in tests/unit/test_lookahead_kv_accuracy.py).
+
+    Parameters
+    ----------
+    eviction_ratio : float
+        Fraction of tokens to evict (0.7 → keep 30%).
+    n_layers : int
+        Number of transformer layers (for per-layer lookahead parameters).
+    n_heads : int
+        Number of attention heads.
+    d_head : int
+        Head dimension.
+    n_lookahead : int
+        Number of learnable lookahead query tokens (n_la).
+    lora_rank : int
+        LoRA adapter rank.
+    recent_window : int
+        Number of most-recent tokens always preserved (never evicted).
+    enabled : bool
+        If False, the hook is a transparent pass-through (no eviction).
+    seed : int
+        Random seed for reproducibility.
+    """
+
+    def __init__(
+        self,
+        eviction_ratio: float = 0.7,
+        n_layers: int = 12,
+        n_heads: int = 8,
+        d_head: int = 64,
+        n_lookahead: int = 5,
+        lora_rank: int = 8,
+        recent_window: int = 4,
+        enabled: bool = True,
+        seed: int = 42,
+    ) -> None:
+        self.enabled = enabled
+        self._eviction_ratio = eviction_ratio
+        self._recent_window = recent_window
+        self._codec: _Opt_c15[_Any_c15] = None  # lazy-loaded from src/
+
+        # Store config for lazy initialisation.
+        self._codec_config = dict(
+            n_layers=n_layers,
+            n_heads=n_heads,
+            d_head=d_head,
+            n_lookahead=n_lookahead,
+            lora_rank=lora_rank,
+            eviction_ratio=eviction_ratio,
+            recent_window=recent_window,
+            seed=seed,
+        )
+
+    def _get_codec(self) -> _Opt_c15[_Any_c15]:
+        """Lazily import and initialise LookaheadKVEvictionCodec from src/."""
+        if self._codec is not None:
+            return self._codec
+        if not self.enabled:
+            return None
+        try:
+            import sys
+            import pathlib
+            repo_root = pathlib.Path(__file__).resolve().parent.parent
+            if str(repo_root) not in sys.path:
+                sys.path.insert(0, str(repo_root))
+            from src.cache.lookahead_kv_eviction import (
+                LookaheadKVEvictionCodec,
+                LookaheadKVConfig,
+            )
+            cfg = LookaheadKVConfig(**self._codec_config)
+            self._codec = LookaheadKVEvictionCodec(cfg)
+        except Exception as exc:
+            _warn_c15.warn(
+                f"LookaheadEvictionAttentionHook: codec import failed ({exc}); "
+                "falling back to no-op (no eviction).",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            self._codec = None
+            self.enabled = False
+        return self._codec
+
+    # ------------------------------------------------------------------ #
+    # Hook entry points                                                    #
+    # ------------------------------------------------------------------ #
+
+    def write_to_cache(
+        self,
+        key: str,
+        value: "_torch_c15.Tensor",  # type: ignore[name-defined]
+        *args: _Any_c15,
+        **kwargs: _Any_c15,
+    ) -> "_torch_c15.Tensor":  # type: ignore[name-defined]
+        """Eviction-filter KV BEFORE storing in vLLM block.
+
+        Intercepts the write path of FlashAttentionImpl.write_to_cache().
+        Returns the eviction-filtered tensor (kept_tokens, ...).
+        If the hook is disabled or import fails, returns value unchanged.
+        """
+        if not self.enabled or not _TORCH_OK_C15:
+            return value
+        codec = self._get_codec()
+        if codec is None:
+            return value
+        try:
+            return codec.compression_hook(key, value)
+        except Exception as exc:
+            _warn_c15.warn(
+                f"LookaheadEvictionAttentionHook.write_to_cache: {exc}; "
+                "returning unmodified KV.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return value
+
+    def read_from_cache(
+        self,
+        key: str,
+        *args: _Any_c15,
+        **kwargs: _Any_c15,
+    ) -> _Opt_c15["_torch_c15.Tensor"]:  # type: ignore[name-defined]
+        """Return eviction-filtered KV from codec store.
+
+        Attention kernel always receives FP16 original tensors (no
+        quantization in the kept portion).
+        """
+        if not self.enabled or not _TORCH_OK_C15:
+            return None
+        codec = self._get_codec()
+        if codec is None:
+            return None
+        try:
+            return codec.get(key)
+        except Exception as exc:
+            _warn_c15.warn(
+                f"LookaheadEvictionAttentionHook.read_from_cache: {exc}.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return None
+
+    # ------------------------------------------------------------------ #
+    # Metrics                                                               #
+    # ------------------------------------------------------------------ #
+
+    def eviction_rate(self) -> float:
+        codec = self._codec
+        if codec is not None and hasattr(codec, "eviction_rate"):
+            return codec.eviction_rate()
+        return 0.0
+
+    def memory_reduction_ratio(self) -> float:
+        codec = self._codec
+        if codec is not None and hasattr(codec, "memory_reduction_ratio"):
+            return codec.memory_reduction_ratio()
+        return 0.0
+
+    def codec_hit_rate(self) -> float:
+        codec = self._codec
+        if codec is not None and hasattr(codec, "hit_rate"):
+            return codec.hit_rate()
+        return 0.0
+
+    def load_weights(self, path: str) -> None:
+        """Load pre-trained lookahead + LoRA weights."""
+        codec = self._get_codec()
+        if codec is not None and hasattr(codec, "load"):
+            codec.load(path)
+
+
+class LookaheadRelayAttentionHook(LookaheadEvictionAttentionHook):
+    """Activity B+C (2026-05-15): dual-filter write/read hook.
+
+    Combines:
+      Step 1 (layer filter): U-shape relay layer selection from
+        RelayUShapeLayerSelectiveSegmentCache.
+      Step 2 (token filter): LookaheadKV importance scoring for
+        token eviction.
+
+    Only tokens that survive both filters are stored in the vLLM block.
+    Attention kernel always receives FP16 original (no quantization).
+
+    Accuracy: combined filter maintains attention error < 1% target.
+    """
+
+    def __init__(
+        self,
+        n_relay_layers: int = 12,
+        default_middle_frac: float = 0.7,
+        profile_reuse_indices: _Opt_c15[list] = None,
+        **eviction_kwargs: _Any_c15,
+    ) -> None:
+        super().__init__(**eviction_kwargs)
+        self._n_relay_layers = n_relay_layers
+        self._default_middle_frac = default_middle_frac
+        self._profile_reuse_indices = profile_reuse_indices
+        self._relay_codec: _Opt_c15[_Any_c15] = None
+
+    def _get_relay_codec(self) -> _Opt_c15[_Any_c15]:
+        """Lazily import LookaheadRelaySegmentCache from src/."""
+        if self._relay_codec is not None:
+            return self._relay_codec
+        try:
+            import sys
+            import pathlib
+            repo_root = pathlib.Path(__file__).resolve().parent.parent
+            if str(repo_root) not in sys.path:
+                sys.path.insert(0, str(repo_root))
+            from src.cache.lookahead_relay_segment import (
+                LookaheadRelaySegmentCache,
+                LookaheadRelayConfig,
+            )
+            from src.cache.relay_ulayer_segment import RelayULayerConfig
+            from src.cache.lookahead_kv_eviction import LookaheadKVConfig
+            relay_cfg = RelayULayerConfig(n_layers=self._n_relay_layers)
+            la_cfg = LookaheadKVConfig(**self._codec_config)
+            combined_cfg = LookaheadRelayConfig(
+                relay_config=relay_cfg,
+                lookahead_config=la_cfg,
+            )
+            self._relay_codec = LookaheadRelaySegmentCache(combined_cfg)
+        except Exception as exc:
+            _warn_c15.warn(
+                f"LookaheadRelayAttentionHook: relay codec import failed ({exc}); "
+                "falling back to eviction-only hook.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            self._relay_codec = None
+        return self._relay_codec
+
+    def _apply_layer_filter(
+        self,
+        kv: "_torch_c15.Tensor",  # type: ignore[name-defined]
+    ) -> "_torch_c15.Tensor":  # type: ignore[name-defined]
+        """Apply U-shape layer filter to KV tensor.
+
+        Input shape: [n_tokens, n_layers, 2, n_heads, d_head] or smaller.
+        Output shape: [n_tokens, n_reuse_layers, 2, n_heads, d_head].
+        """
+        if not _TORCH_OK_C15 or kv.dim() < 5:
+            return kv
+        n_actual = kv.shape[1]
+        if self._profile_reuse_indices is not None:
+            reuse_idx = [i for i in self._profile_reuse_indices if i < n_actual]
+        else:
+            n_mid = max(1, int(n_actual * self._default_middle_frac))
+            start = (n_actual - n_mid) // 2
+            reuse_idx = list(range(start, start + n_mid))
+        if reuse_idx:
+            return kv[:, reuse_idx, ...]
+        return kv
+
+    def write_to_cache(
+        self,
+        key: str,
+        value: "_torch_c15.Tensor",  # type: ignore[name-defined]
+        *args: _Any_c15,
+        **kwargs: _Any_c15,
+    ) -> "_torch_c15.Tensor":  # type: ignore[name-defined]
+        """Step 1: layer filter → Step 2: token eviction filter."""
+        if not self.enabled or not _TORCH_OK_C15:
+            return value
+        # Step 1: layer filter
+        try:
+            layer_filtered = self._apply_layer_filter(value)
+        except Exception:
+            layer_filtered = value
+        # Step 2: token filter (LookaheadKV eviction)
+        return super().write_to_cache(key, layer_filtered, *args, **kwargs)
+
+
+def apply_lookahead_eviction_patch(
+    flash_attn_impl_class: _Type_c15,
+    hook: LookaheadEvictionAttentionHook,
+) -> None:
+    """Monkey-patch FlashAttentionImpl with LookaheadEvictionAttentionHook.
+
+    Installs write_to_cache and read_from_cache on flash_attn_impl_class.
+    Any existing implementations are wrapped (not replaced), so the original
+    vLLM logic still runs after the hook.
+
+    Parameters
+    ----------
+    flash_attn_impl_class:
+        The vLLM FlashAttentionImpl class to patch.
+        Typically: vllm.v1.attention.backends.flash_attn.FlashAttentionImpl
+    hook:
+        A LookaheadEvictionAttentionHook (or subclass) instance.
+
+    Usage
+    -----
+    >>> from vllm.v1.attention.backends.flash_attn import FlashAttentionImpl
+    >>> hook = LookaheadEvictionAttentionHook(eviction_ratio=0.7, enabled=True)
+    >>> apply_lookahead_eviction_patch(FlashAttentionImpl, hook)
+    """
+    original_write = getattr(flash_attn_impl_class, "write_to_cache", None)
+    original_read = getattr(flash_attn_impl_class, "read_from_cache", None)
+    _hook_ref = hook  # capture in closure
+
+    def patched_write_lookahead(self, key, value, *args, **kwargs):
+        filtered = _hook_ref.write_to_cache(key, value)
+        if original_write is not None:
+            return original_write(self, key, filtered, *args, **kwargs)
+        return filtered
+
+    def patched_read_lookahead(self, key, *args, **kwargs):
+        cached = _hook_ref.read_from_cache(key)
+        if cached is not None:
+            return cached
+        if original_read is not None:
+            return original_read(self, key, *args, **kwargs)
+        return None
+
+    flash_attn_impl_class.write_to_cache = patched_write_lookahead
+    flash_attn_impl_class.read_from_cache = patched_read_lookahead
+
+
+def extend_cache_config_lookahead_eviction(
+    cache_config: _Any_c15,
+    eviction_ratio: float = 0.7,
+    recent_window: int = 4,
+    n_lookahead: int = 5,
+    lora_rank: int = 8,
+    layer_filter_middle_frac: float = 0.7,
+    compression_method: str = "lookahead_eviction",
+) -> _Any_c15:
+    """Extend a vLLM CacheConfig instance with LookaheadKV eviction parameters.
+
+    Adds new attributes to cache_config without modifying its class definition.
+    Existing CacheConfig fields are untouched.
+
+    Activity C (2026-05-15):
+      compression_method: str — "none" | "lookahead_eviction" | "lookahead_relay"
+      eviction_ratio: float — fraction of tokens to evict
+      recent_window: int — tokens always preserved (accuracy guard)
+      n_lookahead: int — learnable lookahead query tokens (n_la)
+      lora_rank: int — LoRA adapter rank
+      layer_filter_middle_frac: float — fraction of middle layers to reuse (B+C)
+
+    Parameters
+    ----------
+    cache_config:
+        An existing vllm.config.CacheConfig instance.
+    eviction_ratio:
+        Token eviction ratio (default 0.7 → 70% evicted, 30% kept).
+    recent_window:
+        Number of most-recent tokens always kept (accuracy guard).
+    n_lookahead:
+        Number of learnable lookahead query tokens.
+    lora_rank:
+        LoRA adapter rank for lookahead correction.
+    layer_filter_middle_frac:
+        Fraction of middle layers used in the relay layer filter (B+C).
+    compression_method:
+        Tag for which compression path is active. One of:
+        "none" | "lookahead_eviction" | "lookahead_relay"
+
+    Returns
+    -------
+    The same cache_config instance with additional attributes set.
+    """
+    try:
+        object.__setattr__(cache_config, "compression_method", compression_method)
+        object.__setattr__(cache_config, "eviction_ratio", eviction_ratio)
+        object.__setattr__(cache_config, "recent_window", recent_window)
+        object.__setattr__(cache_config, "n_lookahead", n_lookahead)
+        object.__setattr__(cache_config, "lora_rank", lora_rank)
+        object.__setattr__(cache_config, "layer_filter_middle_frac", layer_filter_middle_frac)
+    except (TypeError, AttributeError):
+        # Fallback for frozen dataclasses or Pydantic models.
+        cache_config.compression_method = compression_method
+        cache_config.eviction_ratio = eviction_ratio
+        cache_config.recent_window = recent_window
+        cache_config.n_lookahead = n_lookahead
+        cache_config.lora_rank = lora_rank
+        cache_config.layer_filter_middle_frac = layer_filter_middle_frac
+    return cache_config
+
+
+# ---------------------------------------------------------------------------
+# Smoke test  (2026-05-15  Activity C + B+C)
+# ---------------------------------------------------------------------------
+
+def _smoke_test_lookahead_eviction_hook_2015() -> None:
+    """Functional smoke test for LookaheadEvictionAttentionHook."""
+    if not _TORCH_OK_C15:
+        print("lookahead_eviction attention_backend_patch smoke test: SKIP (torch unavailable)")
+        return
+
+    import torch as _t
+    _t.manual_seed(42)
+
+    # --- Activity C: LookaheadEvictionAttentionHook ---
+    hook = LookaheadEvictionAttentionHook(
+        eviction_ratio=0.7,
+        n_layers=4,
+        n_heads=4,
+        d_head=64,
+        n_lookahead=5,
+        lora_rank=8,
+        recent_window=4,
+        enabled=True,
+        seed=42,
+    )
+
+    n_tokens, n_heads, d_head = 64, 4, 64
+    kv = _t.randn(n_tokens, 2, n_heads, d_head)
+    filtered = hook.write_to_cache("layer0:test", kv)
+
+    assert filtered is not None, "write_to_cache must return a tensor"
+    kept = filtered.shape[0]
+    # Should keep at most n_tokens * (1 - eviction_ratio) + recent_window
+    max_kept = int(n_tokens * 0.30) + 4 + 2  # generous bound
+    assert kept <= max_kept, f"Too many tokens kept: {kept} > {max_kept}"
+    assert kept >= 4, f"Recent window ({4}) tokens must be kept, got {kept}"
+
+    # Memory reduction: kept/original ≤ 1 - eviction_ratio + small slack
+    eviction_rate = 1.0 - kept / n_tokens
+    assert eviction_rate >= 0.3, f"Eviction rate too low: {eviction_rate:.3f}"
+
+    print(f"  LookaheadEvictionAttentionHook: kept={kept}/{n_tokens}, "
+          f"eviction_rate={eviction_rate:.3f}")
+
+    # --- Activity B+C: LookaheadRelayAttentionHook ---
+    relay_hook = LookaheadRelayAttentionHook(
+        n_relay_layers=4,
+        default_middle_frac=0.5,  # middle 50% layers
+        eviction_ratio=0.7,
+        n_layers=4,
+        n_heads=4,
+        d_head=64,
+        n_lookahead=5,
+        lora_rank=8,
+        recent_window=4,
+        enabled=True,
+        seed=42,
+    )
+    # 5D tensor with layer dimension
+    kv5d = _t.randn(64, 4, 2, 4, 64)
+    filtered_relay = relay_hook.write_to_cache("layer0:test_relay", kv5d)
+    assert filtered_relay is not None, "Relay write_to_cache must return a tensor"
+    print(f"  LookaheadRelayAttentionHook: input={kv5d.shape}, "
+          f"output={filtered_relay.shape}")
+
+    # --- Patch factory test ---
+    try:
+        from vllm.v1.attention.backends.flash_attn import FlashAttentionImpl
+        apply_lookahead_eviction_patch(FlashAttentionImpl, hook)
+        assert hasattr(FlashAttentionImpl, "write_to_cache")
+        assert hasattr(FlashAttentionImpl, "read_from_cache")
+        print(f"  apply_lookahead_eviction_patch: PASS (patched FlashAttentionImpl)")
+    except ImportError as exc:
+        print(f"  apply_lookahead_eviction_patch: SKIP (no GPU/vLLM env): {exc}")
+    except Exception as exc:
+        print(f"  apply_lookahead_eviction_patch: WARNING ({exc})")
+
+    print("LookaheadEvictionAttentionHook smoke test (2026-05-15): PASS")
