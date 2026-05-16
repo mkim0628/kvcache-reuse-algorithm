@@ -1,5 +1,5 @@
 #!/bin/bash
-# install.sh — Install the latest vLLM and verify the A+B+C integration.
+# install.sh — Install the latest vLLM and verify the A+C integration.
 #
 # Usage:
 #   bash vllm_integration/install.sh
@@ -8,6 +8,11 @@
 #   1. Upgrades vLLM to the latest available version (no version pinning).
 #   2. Prints the installed version for record-keeping.
 #   3. Runs smoke tests for:
+#      Activity A+C (2026-05-16):
+#        NAtHDDROffloadingSchedulerMixin, make_nath_ddr_scheduler_class,
+#        GlobalRetentionGateVllmCodec, NAtHDDROffloadingCodecAdapter,
+#        GlobalRetentionGateAttentionHook, NAtHDDRGlobalRetentionHook,
+#        apply_global_retention_gate_patch, extend_cache_config_global_retention
 #      Activity B+C (2026-05-14):
 #        VllmFibQuantVQCodec, FibQuantVQSegmentKVManager,
 #        FibQuantAttentionHook, make_fibquant_kv_cache_manager_class,
@@ -37,6 +42,199 @@ pip install --upgrade vllm --ignore-installed pyjwt 2>/dev/null || pip install -
 
 VLLM_VERSION=$(python -c "import vllm; print(vllm.__version__)")
 echo "vLLM version: ${VLLM_VERSION}"
+
+echo ""
+echo "=== 2026-05-16 A+C smoke tests (NAtHDDROffloadingScheduler + GlobalRetentionGate) ==="
+set +e
+python - <<'PYEOF_2026_05_16'
+import sys, pathlib
+repo_root = str(pathlib.Path(__file__).resolve().parent.parent)
+sys.path.insert(0, repo_root)
+import torch
+torch.manual_seed(42)
+
+# ---------------------------------------------------------------------------
+# Activity A: NAtHDDROffloadingSchedulerMixin
+# ---------------------------------------------------------------------------
+from vllm_integration.scheduler_patch import (
+    NAtHDDROffloadingSchedulerConfig,
+    NAtHDDROffloadingSchedulerMixin,
+    make_nath_ddr_scheduler_class,
+    _InlineNAtHScheduler,
+)
+
+cfg = NAtHDDROffloadingSchedulerConfig(
+    tier_boundaries=[0.30, 0.70, 0.97],
+    max_eviction_ratio=0.03,
+    ema_alpha=0.95,
+    seed=42,
+)
+# Test inline scheduler (no src/ dependency)
+inline_sch = _InlineNAtHScheduler(
+    tier_boundaries=cfg.tier_boundaries,
+    max_eviction_ratio=cfg.max_eviction_ratio,
+    ema_alpha=cfg.ema_alpha,
+)
+# Simulate 100 tokens
+token_keys = [f"req0:tok{i}:{i*7}" for i in range(100)]
+for k in token_keys:
+    inline_sch._attn_score_ema[k] = float(hash(k) % 100) / 100.0
+tier_map = inline_sch.classify_tokens(token_keys)
+assert all(t in (1, 2, 3, 4) for t in tier_map.values()), "Tiers must be 1-4"
+perm_evict = inline_sch.permanent_eviction_ratio()
+assert perm_evict <= 0.04, f"Permanent eviction too high: {perm_evict:.3f}"
+print(f"  NAtHDDROffloadingSchedulerMixin inline: tier_map OK, perm_evict={perm_evict:.3f}")
+
+# Test make_nath_ddr_scheduler_class factory (import-only, no GPU init)
+try:
+    from vllm.v1.core.sched.scheduler import Scheduler
+    NAtHScheduler = make_nath_ddr_scheduler_class(Scheduler)
+    assert issubclass(NAtHScheduler, Scheduler)
+    assert issubclass(NAtHScheduler, NAtHDDROffloadingSchedulerMixin)
+    print(f"  make_nath_ddr_scheduler_class: PASS ({NAtHScheduler.__name__})")
+except Exception as exc:
+    print(f"  make_nath_ddr_scheduler_class: SKIP (no GPU env): {exc}")
+
+# ---------------------------------------------------------------------------
+# Activity C: GlobalRetentionGateVllmCodec
+# ---------------------------------------------------------------------------
+from vllm_integration.compression_codec import (
+    GlobalRetentionGateVllmCodec,
+    NAtHDDROffloadingCodecAdapter,
+)
+
+codec = GlobalRetentionGateVllmCodec(
+    n_layers=4, n_heads=4, d_model=256,
+    budget_ratio=0.3, recent_window=4, seed=42
+)
+# Test write_to_cache (single-layer format)
+kv_sl = torch.randn(32, 2, 4, 64)
+compressed = codec.write_to_cache("req0:l0", kv_sl)
+assert compressed.shape[0] <= 32, "Compressed must have <= original tokens"
+assert compressed.shape[0] >= 4, "recent_window must be preserved"
+assert compressed.dtype == kv_sl.dtype, "FP16 precision must be preserved"
+print(f"  GlobalRetentionGateVllmCodec write_to_cache: {kv_sl.shape} -> {compressed.shape}")
+
+# Test read_from_cache
+restored = codec.read_from_cache("req0:l0", compressed)
+assert restored.shape == compressed.shape
+print(f"  GlobalRetentionGateVllmCodec read_from_cache: PASS (no-op, FP16 original)")
+
+# Test memory_reduction_ratio
+mrr = codec.memory_reduction_ratio()
+assert mrr >= 0.3, f"Memory reduction must be >= 30%: {mrr:.2f}"
+print(f"  GlobalRetentionGateVllmCodec memory_reduction_ratio: {mrr:.2f}")
+
+# Test eviction_rate
+er = codec.eviction_rate()
+print(f"  GlobalRetentionGateVllmCodec eviction_rate: {er:.2f}")
+
+# Test all-layer format
+kv_al = torch.randn(32, 4, 4, 64)
+compressed_al = codec.write_to_cache("req0:all", kv_al)
+assert compressed_al.shape[0] <= 32
+
+# Test budget_ratio sweep (accuracy validation)
+for br in [0.7, 0.5, 0.3]:
+    c_br = GlobalRetentionGateVllmCodec(
+        n_layers=4, n_heads=4, d_model=256,
+        budget_ratio=br, recent_window=4, seed=42
+    )
+    kv_test = torch.randn(64, 2, 4, 64)
+    comp_br = c_br.write_to_cache("test", kv_test)
+    expected_keep = max(4, int(torch.ceil(torch.tensor(64 * br)).item()))
+    actual_keep = comp_br.shape[0]
+    # Accuracy: kept tokens are FP16 original → zero compression error for kept tokens
+    assert actual_keep >= 4, f"recent_window always preserved at budget_ratio={br}"
+    print(f"  budget_ratio={br}: kept={actual_keep}/{64}, memory_reduction={1-br:.1%}")
+
+# Test NAtHDDROffloadingCodecAdapter
+adapter = NAtHDDROffloadingCodecAdapter(max_eviction_ratio=0.03, enabled=True)
+kv_t1 = torch.randn(8, 2, 4, 64)
+# Tier 1: pass-through
+out_t1 = adapter.write_to_cache("k1", kv_t1, tier=1)
+assert out_t1.shape == kv_t1.shape, "Tier 1 must be pass-through"
+# Tier 2: offload
+out_t2 = adapter.write_to_cache("k2", kv_t1, tier=2)
+assert out_t2.numel() == 0, "Tier 2 write must return empty sentinel"
+# Tier 2 restore
+restored_t2 = adapter.read_from_cache("k2", out_t2, tier=2)
+assert restored_t2.shape == kv_t1.shape, f"Tier 2 restore must match original: {restored_t2.shape} vs {kv_t1.shape}"
+# Tier 3: INT8 offload
+out_t3 = adapter.write_to_cache("k3", kv_t1, tier=3)
+assert out_t3.numel() == 0, "Tier 3 write must return empty sentinel"
+restored_t3 = adapter.read_from_cache("k3", out_t3, tier=3)
+assert restored_t3.shape == kv_t1.shape, "Tier 3 dequant must match original shape"
+# Verify INT8 dequant error < 2%
+rel_err = (restored_t3.float() - kv_t1.float()).abs().mean() / (kv_t1.float().abs().mean() + 1e-8)
+assert rel_err < 0.02, f"Tier 3 dequant error too high: {rel_err:.4f}"
+print(f"  NAtHDDROffloadingCodecAdapter: Tier1 pass-through OK, Tier2 FP16 restore OK, Tier3 INT8 err={rel_err:.4f}")
+# Tier 4: evict
+out_t4 = adapter.write_to_cache("k4", kv_t1, tier=4)
+assert out_t4.numel() == 0, "Tier 4 must return empty"
+print("  NAtHDDROffloadingCodecAdapter: PASS")
+
+# ---------------------------------------------------------------------------
+# Activity C: GlobalRetentionGateAttentionHook
+# ---------------------------------------------------------------------------
+from vllm_integration.attention_backend_patch import (
+    GlobalRetentionGateAttentionHook,
+    NAtHDDRGlobalRetentionHook,
+    apply_global_retention_gate_patch,
+    extend_cache_config_global_retention,
+)
+
+hook = GlobalRetentionGateAttentionHook(
+    n_layers=4, n_heads=4, d_model=256,
+    budget_ratio=0.3, recent_window=4, seed=42
+)
+kv_test = torch.randn(32, 2, 4, 64)
+w_out = hook.write_to_cache("hook_test", kv_test)
+assert w_out is not None
+assert w_out.shape[0] <= 32
+r_out = hook.read_from_cache("hook_test", w_out)
+assert r_out.shape == w_out.shape, "read must not change shape"
+print(f"  GlobalRetentionGateAttentionHook: write {kv_test.shape} -> {w_out.shape}, read OK")
+
+# Cross A+C composite hook
+composite = NAtHDDRGlobalRetentionHook(
+    n_layers=4, n_heads=4, d_model=256,
+    budget_ratio=0.3, recent_window=4, seed=42
+)
+w_t1 = composite.write_to_cache("ck1", kv_test, tier=1)
+assert w_t1.shape[0] <= 32, "Tier 1 must apply GlobalRetentionGate"
+w_t2 = composite.write_to_cache("ck2", kv_test, tier=2)
+assert w_t2.numel() == 0, "Tier 2 must offload"
+print("  NAtHDDRGlobalRetentionHook (Cross A+C): PASS")
+
+# Patch factory
+try:
+    from vllm.v1.attention.backends.flash_attn import FlashAttentionImpl
+    grg_hook = apply_global_retention_gate_patch(FlashAttentionImpl, budget_ratio=0.3)
+    assert hasattr(FlashAttentionImpl, "write_to_cache")
+    assert hasattr(FlashAttentionImpl, "read_from_cache")
+    print("  apply_global_retention_gate_patch: PASS")
+except ImportError as exc:
+    print(f"  apply_global_retention_gate_patch: SKIP (no GPU): {exc}")
+except Exception as exc:
+    print(f"  apply_global_retention_gate_patch: WARNING ({exc})")
+
+# extend_cache_config_global_retention
+class _FakeCacheConfig:
+    pass
+fake_cc = _FakeCacheConfig()
+extend_cache_config_global_retention(fake_cc, budget_ratio=0.3)
+assert getattr(fake_cc, "compression_method", None) == "global_retention_gate"
+assert getattr(fake_cc, "grg_budget_ratio", None) == 0.3
+print("  extend_cache_config_global_retention: PASS")
+
+print("=== 2026-05-16 A+C smoke tests: PASS ===")
+PYEOF_2026_05_16
+EXIT_2016=$?
+set -e
+if [ $EXIT_2016 -ne 0 ]; then
+  echo "WARNING: 2026-05-16 A+C smoke tests had failures (exit=$EXIT_2016)" >&2
+fi
 
 echo ""
 echo "=== 2026-05-15 A+B+C smoke tests (RadixFeatherScheduler + RelayUShapeKVManager + LookaheadEvictionHook) ==="

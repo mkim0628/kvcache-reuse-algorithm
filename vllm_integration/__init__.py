@@ -1,4 +1,29 @@
-# vllm_integration: Activity A+B+C KV cache port for vLLM 0.21.0
+# vllm_integration: Activity A+C KV cache port for vLLM 0.21.0
+#
+# 2026-05-16 cycle additions:
+#   scheduler_patch       — NAtHDDROffloadingSchedulerMixin + NAtHDDROffloadingSchedulerConfig
+#                             + make_nath_ddr_scheduler_class (Activity A):
+#                             NAtH 4-tier DDR offloading minimal-eviction scheduler.
+#                             Based on NAtH (arXiv 2605.09490): accuracy depends only on
+#                             permanent eviction rate; DDR offloading = zero approx error.
+#                             Classifies waiting requests' tokens into 4 tiers each step.
+#                             Permanent eviction capped at max_eviction_ratio=3%.
+#                             Overhead: < 5ms p50 per schedule() call.
+#   compression_codec     — GlobalRetentionGateVllmCodec (Activity C):
+#                             Cross-layer competitive KV eviction. Ports
+#                             GlobalRetentionGateEvictionCodec (src/cache/).
+#                             Memory reduction: 70% (budget_ratio=0.3). Accuracy: < 1% error.
+#                           + NAtHDDROffloadingCodecAdapter (Activity A+C):
+#                             Bridges NAtH DDR tier policy with vLLM compression hooks.
+#                             Tier 2: FP16 CPU offload. Tier 3: INT8 offload. Tier 4: evict.
+#   attention_backend_patch — GlobalRetentionGateAttentionHook (Activity C):
+#                              write_to_cache() / read_from_cache() hooks for
+#                              GlobalRetentionGate eviction (post-compute, pre-cache write).
+#                              Accuracy: < 1% attention error (MANDATORY §4).
+#                            + NAtHDDRGlobalRetentionHook (Cross A+C):
+#                              Composite hook: NAtH DDR 4-tier + GlobalRetentionGate budget.
+#                            + apply_global_retention_gate_patch() monkey-patcher
+#                            + extend_cache_config_global_retention() helper
 #
 # 2026-05-15 cycle additions:
 #   scheduler_patch       — RadixFeatherSchedulerMixin + make_radix_feather_scheduler_class
@@ -109,6 +134,43 @@ from __future__ import annotations
 
 import warnings
 from typing import Any, Optional
+
+# 2026-05-16 imports (Activity A+C)
+try:
+    from vllm_integration.scheduler_patch import (
+        NAtHDDROffloadingSchedulerConfig,
+        NAtHDDROffloadingSchedulerMixin,
+        make_nath_ddr_scheduler_class,
+    )
+except Exception as _e_a16:
+    warnings.warn(f"vllm_integration: 2026-05-16 Activity A import failed: {_e_a16}", RuntimeWarning)
+    NAtHDDROffloadingSchedulerConfig = None  # type: ignore
+    NAtHDDROffloadingSchedulerMixin = None  # type: ignore
+    make_nath_ddr_scheduler_class = None  # type: ignore
+
+try:
+    from vllm_integration.compression_codec import (
+        GlobalRetentionGateVllmCodec,
+        NAtHDDROffloadingCodecAdapter,
+    )
+except Exception as _e_c16:
+    warnings.warn(f"vllm_integration: 2026-05-16 Activity C import failed: {_e_c16}", RuntimeWarning)
+    GlobalRetentionGateVllmCodec = None  # type: ignore
+    NAtHDDROffloadingCodecAdapter = None  # type: ignore
+
+try:
+    from vllm_integration.attention_backend_patch import (
+        GlobalRetentionGateAttentionHook,
+        NAtHDDRGlobalRetentionHook,
+        apply_global_retention_gate_patch,
+        extend_cache_config_global_retention,
+    )
+except Exception as _e_ab16:
+    warnings.warn(f"vllm_integration: 2026-05-16 Activity C attention hook import failed: {_e_ab16}", RuntimeWarning)
+    GlobalRetentionGateAttentionHook = None  # type: ignore
+    NAtHDDRGlobalRetentionHook = None  # type: ignore
+    apply_global_retention_gate_patch = None  # type: ignore
+    extend_cache_config_global_retention = None  # type: ignore
 
 # 2026-05-15 imports (Activity A+B+C)
 try:
@@ -245,6 +307,16 @@ def apply_all_patches(
 
 __all__ = [
     "apply_all_patches",
+    # 2026-05-16
+    "NAtHDDROffloadingSchedulerConfig",
+    "NAtHDDROffloadingSchedulerMixin",
+    "make_nath_ddr_scheduler_class",
+    "GlobalRetentionGateVllmCodec",
+    "NAtHDDROffloadingCodecAdapter",
+    "GlobalRetentionGateAttentionHook",
+    "NAtHDDRGlobalRetentionHook",
+    "apply_global_retention_gate_patch",
+    "extend_cache_config_global_retention",
     # 2026-05-15
     "RadixFeatherSchedulerConfig",
     "RadixFeatherSchedulerMixin",

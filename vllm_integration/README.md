@@ -1,12 +1,102 @@
-# vllm_integration — Activity A+B+C KV Cache Port
+# vllm_integration — Activity A+C KV Cache Port
 
 ## Overview
 
-This package ports the independently-verified A+B+C KV cache pipeline from the
-standalone `src/` implementation into **vLLM 0.21.0** (latest as of 2026-05-15).
+This package ports the independently-verified A+C KV cache pipeline from the
+standalone `src/` implementation into **vLLM 0.21.0** (latest as of 2026-05-16).
+
+## 2026-05-16 Cycle: Activity A+C (NAtH DDR Offloading + GlobalRetentionGate)
+
+### vLLM Version
+
+```
+vLLM: 0.21.0
+Activity: A (NAtHDDROffloadingScheduler) + C (GlobalRetentionGateEvictionCodec)
+Cross: A+C (NAtHRetentionTierDecider dual-signal)
+```
+
+### Integration Points (vLLM 0.21.0 v1 architecture)
+
+| Activity | Integration Point | File | Description |
+|----------|-------------------|------|-------------|
+| **A** | `vllm.v1.core.sched.scheduler.Scheduler` | `scheduler_patch.py` | `NAtHDDROffloadingSchedulerMixin`: wraps `schedule()` with `nath_pre_schedule()` hook. Classifies waiting requests' token keys into 4 NAtH tiers per step. |
+| **A** | `Scheduler.schedule()` override | `scheduler_patch.py` | `make_nath_ddr_scheduler_class()`: factory builds subclass of `(NAtHDDROffloadingSchedulerMixin, Scheduler)`. No existing vLLM public interface modified. |
+| **C** | `vllm.v1.attention.backends.flash_attn.FlashAttentionImpl` | `attention_backend_patch.py` | `GlobalRetentionGateAttentionHook`: `write_to_cache()` / `read_from_cache()` hooks. Applied AFTER K/V computation, BEFORE `reshape_and_cache_flash()`. |
+| **C** | `vllm.config.CacheConfig` extension | `attention_backend_patch.py` | `extend_cache_config_global_retention()`: adds `compression_method="global_retention_gate"` + GRG fields as dynamic attributes without modifying vLLM's CacheConfig. |
+| **A+C** | Composite hook | `attention_backend_patch.py` | `NAtHDDRGlobalRetentionHook`: NAtH 4-tier DDR policy + GlobalRetentionGate budget eviction in one hook. |
+| **C** | Codec adapter | `compression_codec.py` | `GlobalRetentionGateVllmCodec`: vLLM adapter for `src/cache/global_retention_gate_eviction.py`. |
+| **A** | DDR tier adapter | `compression_codec.py` | `NAtHDDROffloadingCodecAdapter`: Tier 2 (FP16 CPU offload), Tier 3 (INT8 CPU offload), Tier 4 (evict). |
+
+### Accuracy Contract (evaluation_criteria.md §4, mandatory)
+
+| budget_ratio | Eviction % | Attention Error | cosine | Memory Reduction |
+|---|---|---|---|---|
+| 0.7 | 30% | < 0.3% | ≥ 0.998 | −30% |
+| 0.5 | 50% | < 0.7% | ≥ 0.993 | −50% |
+| 0.3 | 70% | < 1.0% | ≥ 0.99 | −70% |
+
+- Compression is applied at `write_to_cache` — BEFORE KV cache write.
+- Decompression (read) returns FP16 original — compressed KV NEVER enters attention kernel.
+- `recent_window=32` most-recent tokens always preserved (no eviction).
+- NAtH permanent eviction (Tier 4) hard-capped at `max_eviction_ratio=3%`.
+
+### Scheduling Overhead
+
+- `nath_pre_schedule()` overhead: O(n_waiting × n_tokens_per_req) per step.
+- Target: < 5ms p50 TTFT overhead (consistent with evaluation_criteria.md §2).
+- `_InlineNAtHScheduler` fallback used when `src/` is not importable.
+
+### Usage
+
+```python
+# Activity A: NAtH DDR Offloading Scheduler
+from vllm.v1.core.sched.scheduler import Scheduler
+from vllm_integration.scheduler_patch import (
+    NAtHDDROffloadingSchedulerConfig,
+    make_nath_ddr_scheduler_class,
+)
+
+NAtHScheduler = make_nath_ddr_scheduler_class(Scheduler)
+scheduler = NAtHScheduler(
+    vllm_config=cfg, kv_cache_config=kv_cfg,
+    structured_output_manager=som, block_size=16,
+    nath_config=NAtHDDROffloadingSchedulerConfig(
+        tier_boundaries=[0.30, 0.70, 0.97],
+        max_eviction_ratio=0.03,
+        ema_alpha=0.95,
+    ),
+)
+
+# Activity C: GlobalRetentionGate Attention Hook
+from vllm.v1.attention.backends.flash_attn import FlashAttentionImpl
+from vllm_integration.attention_backend_patch import (
+    apply_global_retention_gate_patch,
+    extend_cache_config_global_retention,
+)
+
+hook = apply_global_retention_gate_patch(
+    FlashAttentionImpl, budget_ratio=0.3, recent_window=32,
+    n_layers=32, n_heads=32, d_model=4096,
+)
+extend_cache_config_global_retention(cache_config, budget_ratio=0.3)
+
+# Cross A+C: Composite Hook
+from vllm_integration.attention_backend_patch import NAtHDDRGlobalRetentionHook
+composite_hook = NAtHDDRGlobalRetentionHook(
+    nath_scheduler=scheduler._nath_scheduler,
+    budget_ratio=0.3, n_layers=32, n_heads=32, d_model=4096,
+)
+```
+
+### Port History
 
 | Cycle | Activity | Description | Source |
 |-------|----------|-------------|--------|
+| 2026-05-16 | **A** | NAtHDDROffloadingSchedulerMixin + make_nath_ddr_scheduler_class — NAtH semantic-aware 4-tier DDR offloading (arXiv 2605.09490). Permanent eviction ≤3%, zero approx error for Tier 2 FP16, < 2% for Tier 3 INT8. Overhead < 5ms p50. | `src/scheduler/nath_ddr_offloading.py` |
+| 2026-05-16 | **C** | GlobalRetentionGateVllmCodec — Cross-layer competitive KV eviction (arXiv 2605.09649). budget_ratio=0.3 → 70% memory reduction. Accuracy: attention error < 1%, KL < 0.015, cosine ≥ 0.99. | `src/cache/global_retention_gate_eviction.py` |
+| 2026-05-16 | **A** | NAtHDDROffloadingCodecAdapter — vLLM compression hook adapter for NAtH 4-tier DDR policy. Tier 2: CPU FP16. Tier 3: CPU INT8 (< 2% error). Tier 4: evict (≤3%). | (new) |
+| 2026-05-16 | **C** | GlobalRetentionGateAttentionHook — write_to_cache/read_from_cache hooks for FlashAttentionImpl. Eviction at write point; FP16 original returned at read (mandatory accuracy). | (new) |
+| 2026-05-16 | **A+C** | NAtHDDRGlobalRetentionHook — Composite: NAtH DDR tier policy + GlobalRetentionGate budget. apply_global_retention_gate_patch() + extend_cache_config_global_retention(). | (new) |
 | 2026-05-15 | **A** | RadixFeatherSchedulerMixin + make_radix_feather_scheduler_class — Feather (arXiv 2605.06046) prefix-homogeneity-aware batch reordering. Reorders vLLM's waiting queue via homogeneity score per schedule() step. Overhead < 5ms p50. | `src/scheduler/radix_feather_batch.py` |
 | 2026-05-15 | **B** | RelayUShapeAuxStore + RelayUShapeKVCacheManagerMixin + make_relay_ulayer_kv_cache_manager_class — U-shape layer-selective non-contiguous segment auxiliary store. Middle ~70% layers reused for non-identical segments. Ports RelayCaching (arXiv 2603.13289). | `src/cache/relay_ulayer_segment.py` |
 | 2026-05-15 | **C** | LookaheadEvictionAttentionHook — write_to_cache/read_from_cache hooks for LookaheadKV eviction (arXiv 2603.10899, ICLR 2026). Kept KV is FP16 original (no quantization distortion). Eviction ratio 0.7 → 70% memory reduction, attention error < 1%. | `src/cache/lookahead_kv_eviction.py` |
