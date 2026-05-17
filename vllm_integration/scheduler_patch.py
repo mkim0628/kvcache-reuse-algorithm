@@ -3502,4 +3502,689 @@ def _smoke_test_radix_feather_scheduler_2015() -> None:
     except Exception as exc:
         print(f"  RadixFeatherVllmScheduler subclass check skipped (no GPU env): {exc}")
 
+
+# ===========================================================================
+# 2026-05-17: HMAMultiConnectorSchedulerMixin — Activity A (A+C)
+#
+# Ports HMAMultiConnectorCompressionPluginScheduler (Activity A) and
+# RLAdaptivePrecisionQuantizer (Activity C) into vLLM 0.21.0 v1 Scheduler.
+#
+# Key design:
+#   - HMAMultiConnectorSchedulerMixin subclasses vLLM v1 Scheduler via mixin.
+#   - Maintains an HMA connector registry (dict[str, HMAConnectorInterface_V1]).
+#   - Wraps schedule() with hma_pre_schedule(): for each waiting request,
+#     selects the optimal compression connector based on request profile
+#     (is_rl_mode, context_length, memory_pressure) and annotates the request.
+#   - Activity C: RLAdaptivePrecisionAttentionHook integrates the
+#     RLAdaptivePrecisionQuantizer into the attention write/read path.
+#
+# vLLM 0.21.0 integration:
+#   - Scheduler lives in vllm.v1.core.sched.scheduler.Scheduler
+#   - schedule() → SchedulerOutput (no args)
+#   - Request object has: request_id, num_prompt_tokens, arrival_time,
+#     sampling_params, priority
+#   - KVConnector (self.connector) is the native HMA multi-connector API.
+#     This mixin is a lightweight scheduling-level integration that works
+#     independently of (and alongside) vLLM's native connector infrastructure.
+#
+# Activity A connector_dispatch_policy (mirrored from HMAMultiConnectorConfig):
+#   1. is_rl_mode=True or num_completions>1 → "rl_adaptive"
+#   2. context_length > long_ctx_threshold → "global_retention"
+#   3. memory_pressure > threshold → "ratequant"
+#   4. else → default_connector
+#
+# Overhead: O(1) dict lookup per request — target < 0.1ms per request.
+# ===========================================================================
+
+import time as _time_2017
+from dataclasses import dataclass as _dataclass_2017, field as _field_2017
+from typing import Dict as _Dict_2017, List as _List_2017, Optional as _Optional_2017, Any as _Any_2017
+
+
+def _try_import_hma_multi_connector_src() -> tuple:
+    """Lazily import HMAMultiConnectorCompressionPluginScheduler and related from src/."""
+    try:
+        import sys as _sys, pathlib as _pathlib
+        repo_root = str(_pathlib.Path(__file__).resolve().parent.parent)
+        if repo_root not in _sys.path:
+            _sys.path.insert(0, repo_root)
+        from src.scheduler.hma_multi_connector_scheduler import (
+            HMAMultiConnectorCompressionPluginScheduler,
+            HMAMultiConnectorConfig,
+            HMAConnectorAdapter,
+            HMAConnectorInterface,
+        )
+        from src.cache.rl_adaptive_precision_quantizer import (
+            RLAdaptivePrecisionQuantizer,
+            RLAdaptivePrecisionConfig,
+        )
+        return (
+            HMAMultiConnectorCompressionPluginScheduler,
+            HMAMultiConnectorConfig,
+            HMAConnectorAdapter,
+            HMAConnectorInterface,
+            RLAdaptivePrecisionQuantizer,
+            RLAdaptivePrecisionConfig,
+        )
+    except ImportError:
+        return (None,) * 6
+
+
+@_dataclass_2017
+class HMAMultiConnectorSchedulerConfig:
+    """Configuration for HMAMultiConnectorSchedulerMixin (vLLM 0.21.0 Activity A+C).
+
+    Mirrors HMAMultiConnectorConfig from src/ for environments where src/ is importable,
+    and provides a standalone fallback configuration.
+
+    Fields:
+        long_ctx_threshold: context length above which "global_retention" connector is used.
+        memory_pressure_threshold: memory_pressure fraction above which "ratequant" is used.
+        default_connector: connector name used when no other rule matches.
+        pipeline_mode: if True, chain primary connector + global_retention sequentially.
+        max_wait_ratio: fairness constraint (max wait time multiplier).
+        rl_mode_connector: connector for RL workloads (is_rl_mode=True or num_completions>1).
+        long_ctx_connector: connector for long context (context_length > long_ctx_threshold).
+        high_pressure_connector: connector for high memory pressure.
+        seed: random seed for quantizer initialization.
+        enable_rl_quantizer: if True, auto-register RLAdaptivePrecisionQuantizer as "rl_adaptive".
+        rl_precision_ratio_fp16: FP16 ratio for RLAdaptivePrecisionQuantizer (Activity C).
+        rl_precision_ratio_int8: INT8 ratio for RLAdaptivePrecisionQuantizer.
+    """
+    long_ctx_threshold: int = 4096
+    memory_pressure_threshold: float = 0.8
+    default_connector: str = "global_retention"
+    pipeline_mode: bool = False
+    max_wait_ratio: float = 2.0
+    rl_mode_connector: str = "rl_adaptive"
+    long_ctx_connector: str = "global_retention"
+    high_pressure_connector: str = "ratequant"
+    seed: int = 42
+    enable_rl_quantizer: bool = True
+    rl_precision_ratio_fp16: float = 0.40
+    rl_precision_ratio_int8: float = 0.60
+
+
+class HMAConnectorInterface_V1:
+    """Minimal HMA connector interface for scheduler-level use in vLLM 0.21.0.
+
+    Each compression codec (Activity C) is wrapped as an HMAConnectorInterface_V1
+    for registration in the scheduler's connector registry. This is a lightweight
+    scheduling-layer wrapper; it does NOT replace vLLM's native KVConnector.
+
+    compress() / decompress() are called at the scheduling pre-step to annotate
+    requests with their selected connector. Actual KV compression at inference time
+    is handled by RLAdaptivePrecisionAttentionHook (attention_backend_patch.py).
+    """
+
+    def __init__(self, name: str, codec: _Any_2017 = None) -> None:
+        self._name = name
+        self._codec = codec
+
+    @property
+    def connector_name(self) -> str:
+        return self._name
+
+    def compress(self, kv: "torch.Tensor", request_profile: _Dict_2017) -> "torch.Tensor":
+        """Compress KV tensor. Delegates to codec.compression_hook() or encode()."""
+        if self._codec is None:
+            return kv
+        if hasattr(self._codec, "compression_hook"):
+            return self._codec.compression_hook("__hma_v1__", kv)
+        if hasattr(self._codec, "encode"):
+            return self._codec.encode(kv, layer_idx=0)
+        return kv
+
+    def decompress(self, compressed_kv: "torch.Tensor", request_profile: _Dict_2017) -> "torch.Tensor":
+        """Decompress KV tensor. Delegates to codec.decode() if available."""
+        if self._codec is None:
+            return compressed_kv
+        if hasattr(self._codec, "decode"):
+            return self._codec.decode(compressed_kv, layer_idx=0)
+        return compressed_kv
+
+
+class HMAMultiConnectorSchedulerMixin:
+    """vLLM 0.21.0 Scheduler mixin: HMA multi-connector compression plugin meta-scheduler.
+
+    Activity A: KV Cache-aware Scheduling.
+    Activity C: RL-adaptive precision quantization (via connector dispatch).
+
+    This mixin wraps schedule() with an hma_pre_schedule() hook that:
+      1. Iterates self.waiting (RequestQueue) without modifying queue order.
+      2. For each waiting request, evaluates request profile:
+           - is_rl_mode: True if request has sampling_params.n > 1 (best_of multiple completions)
+           - context_length: num_prompt_tokens (request.num_prompt_tokens)
+           - memory_pressure: estimated from running queue length / max_num_running_reqs
+      3. Selects the optimal HMA connector via O(1) dict lookup:
+           - "rl_adaptive" (RLAdaptivePrecisionQuantizer) for RL workloads
+           - "global_retention" for long-context requests
+           - "ratequant" for high memory pressure
+           - default_connector otherwise
+      4. Annotates the vLLM Request with:
+           hma_connector_name: str — selected connector
+           hma_request_profile: dict — {is_rl_mode, context_length, memory_pressure}
+           hma_connector_overhead_ms: float — selection overhead
+
+    Overhead: O(1) dict lookup per request.
+    Target: < 0.1ms/request (TTFT p50 overhead < 5ms for 100-request batches).
+
+    Connector registry:
+      - "rl_adaptive"      : RLAdaptivePrecisionQuantizer (Activity C, RL workloads)
+      - "global_retention" : GlobalRetentionGateEvictionCodec (long context)
+      - "ratequant"        : RateQuantReverseWaterfillingCodec (short high-throughput)
+
+    Usage:
+
+        from vllm.v1.core.sched.scheduler import Scheduler
+        from vllm_integration.scheduler_patch import (
+            HMAMultiConnectorSchedulerMixin,
+            HMAMultiConnectorSchedulerConfig,
+            make_hma_multi_connector_scheduler_class,
+        )
+
+        # Option A: factory
+        HMAScheduler = make_hma_multi_connector_scheduler_class(Scheduler)
+        scheduler = HMAScheduler(
+            ...,  # standard vLLM Scheduler args
+            hma_config=HMAMultiConnectorSchedulerConfig(
+                long_ctx_threshold=4096,
+                enable_rl_quantizer=True,
+            ),
+        )
+
+        # Option B: manual subclass
+        class MyScheduler(HMAMultiConnectorSchedulerMixin, Scheduler):
+            def schedule(self):
+                self.hma_pre_schedule()
+                return super().schedule()
+
+    Activity C accuracy contract:
+        RLAdaptivePrecisionQuantizer default config uses FP16=0.40, INT8=0.60, INT4=0.00.
+        attention_output_relative_error < 0.02 (validated in Report ① 2026-05-17).
+        Actual KV compression during inference is handled by RLAdaptivePrecisionAttentionHook.
+    """
+
+    def __init__(
+        self,
+        *args: _Any_2017,
+        hma_config: _Optional_2017[HMAMultiConnectorSchedulerConfig] = None,
+        **kwargs: _Any_2017,
+    ) -> None:
+        """
+        Args:
+            hma_config: HMAMultiConnectorSchedulerConfig. If None, uses defaults.
+            All other args/kwargs forwarded to the base Scheduler.__init__().
+        """
+        super().__init__(*args, **kwargs)
+
+        if hma_config is None:
+            hma_config = HMAMultiConnectorSchedulerConfig()
+        self._hma_cfg = hma_config
+
+        # Connector registry: name -> HMAConnectorInterface_V1
+        self._hma_registry: _Dict_2017[str, HMAConnectorInterface_V1] = {}
+        self._hma_scheduling_times: _List_2017[float] = []
+        self._hma_connector_selection_counts: _Dict_2017[str, int] = {}
+        self._hma_request_connector_map: _Dict_2017[str, str] = {}
+
+        # Try to import src/ implementations
+        (
+            HMAMultiConnectorCompressionPluginScheduler,
+            HMAMultiConnectorConfig,
+            HMAConnectorAdapterCls,
+            HMAConnectorInterfaceCls,
+            RLAdaptivePrecisionQuantizer,
+            RLAdaptivePrecisionConfig,
+        ) = _try_import_hma_multi_connector_src()
+
+        self._hma_src_scheduler: _Optional_2017[_Any_2017] = None
+        self._hma_use_src: bool = False
+
+        if HMAMultiConnectorCompressionPluginScheduler is not None:
+            # Use the full src/ implementation via facade
+            src_cfg = HMAMultiConnectorConfig(
+                long_ctx_threshold=hma_config.long_ctx_threshold,
+                memory_pressure_threshold=hma_config.memory_pressure_threshold,
+                default_connector=hma_config.default_connector,
+                pipeline_mode=hma_config.pipeline_mode,
+                max_wait_ratio=hma_config.max_wait_ratio,
+                seed=hma_config.seed,
+                rl_mode_connector=hma_config.rl_mode_connector,
+                long_ctx_connector=hma_config.long_ctx_connector,
+                high_pressure_connector=hma_config.high_pressure_connector,
+            )
+            self._hma_src_scheduler = HMAMultiConnectorCompressionPluginScheduler(
+                config=src_cfg, cache=None
+            )
+            self._hma_use_src = True
+
+            # Auto-register RLAdaptivePrecisionQuantizer as "rl_adaptive"
+            if hma_config.enable_rl_quantizer and RLAdaptivePrecisionQuantizer is not None:
+                rl_cfg = RLAdaptivePrecisionConfig(
+                    precision_ratio_fp16=hma_config.rl_precision_ratio_fp16,
+                    precision_ratio_int8=hma_config.rl_precision_ratio_int8,
+                    precision_ratio_int4=0.0,
+                    seed=hma_config.seed,
+                )
+                rl_quantizer = RLAdaptivePrecisionQuantizer(rl_cfg)
+                rl_connector = HMAConnectorAdapterCls("rl_adaptive", rl_quantizer)
+                self._hma_src_scheduler.register_connector("rl_adaptive", rl_connector)
+                # Register passthrough connectors as placeholders if not present
+                for name in ("global_retention", "ratequant"):
+                    self._hma_src_scheduler.register_connector(
+                        name, HMAConnectorAdapterCls(name, None)
+                    )
+            self._hma_use_src = True
+        else:
+            # Inline fallback: lightweight inline connector dispatch
+            if hma_config.enable_rl_quantizer:
+                self._hma_registry["rl_adaptive"] = HMAConnectorInterface_V1(
+                    "rl_adaptive", _InlineRLQuantizer(seed=hma_config.seed)
+                )
+            self._hma_registry["global_retention"] = HMAConnectorInterface_V1("global_retention")
+            self._hma_registry["ratequant"] = HMAConnectorInterface_V1("ratequant")
+            for name in self._hma_registry:
+                self._hma_connector_selection_counts[name] = 0
+
+        # Overhead tracking
+        self._hma_schedule_count: int = 0
+
+    # ------------------------------------------------------------------
+    # Primary scheduling hook — call at the start of schedule()
+    # ------------------------------------------------------------------
+
+    def hma_pre_schedule(self) -> None:
+        """Select HMA connector for each waiting request and annotate.
+
+        Algorithm (connector_dispatch_policy):
+          1. is_rl_mode=True or num_completions>1 → "rl_adaptive"
+          2. context_length > long_ctx_threshold → "global_retention"
+          3. context_length <= threshold and memory_pressure > threshold → "ratequant"
+          4. else → config.default_connector
+
+        Annotates each vLLM Request with:
+          hma_connector_name: str
+          hma_request_profile: dict
+          hma_connector_overhead_ms: float
+
+        Overhead target: < 0.1ms per request, < 5ms p50 for 100-request batches.
+        """
+        t0 = _time_2017.monotonic()
+        self._hma_schedule_count += 1
+
+        waiting = getattr(self, "waiting", None)
+        if waiting is None:
+            elapsed_ms = (_time_2017.monotonic() - t0) * 1000.0
+            self._hma_scheduling_times.append(elapsed_ms)
+            return
+
+        pending = self._hma_extract_waiting(waiting)
+
+        # Estimate memory pressure from running queue
+        running = getattr(self, "running", [])
+        max_running = getattr(self, "max_num_running_reqs", 256)
+        memory_pressure = len(running) / max(1, max_running)
+
+        for req in pending:
+            req_t0 = _time_2017.monotonic()
+            req_id = getattr(req, "request_id", str(id(req)))
+            context_length = self._hma_get_context_length(req)
+            is_rl_mode, num_completions = self._hma_get_rl_info(req)
+
+            profile = {
+                "is_rl_mode": is_rl_mode,
+                "num_completions": num_completions,
+                "context_length": context_length,
+                "memory_pressure": memory_pressure,
+            }
+
+            # Select connector
+            connector_name = self._hma_select_connector(profile)
+
+            # Track metrics
+            self._hma_request_connector_map[req_id] = connector_name
+            self._hma_connector_selection_counts[connector_name] = (
+                self._hma_connector_selection_counts.get(connector_name, 0) + 1
+            )
+
+            # Annotate request
+            req_overhead_ms = (_time_2017.monotonic() - req_t0) * 1000.0
+            try:
+                req.hma_connector_name = connector_name
+                req.hma_request_profile = profile
+                req.hma_connector_overhead_ms = req_overhead_ms
+            except (AttributeError, TypeError):
+                pass  # frozen/immutable request; graceful skip
+
+        elapsed_ms = (_time_2017.monotonic() - t0) * 1000.0
+        self._hma_scheduling_times.append(elapsed_ms)
+
+    def hma_register_connector(
+        self,
+        name: str,
+        connector: HMAConnectorInterface_V1,
+    ) -> None:
+        """Register an HMA connector into the mixin registry.
+
+        Also registers into the src/ scheduler if available.
+
+        Args:
+            name: connector identifier.
+            connector: HMAConnectorInterface_V1 instance.
+        """
+        self._hma_registry[name] = connector
+        self._hma_connector_selection_counts.setdefault(name, 0)
+        if self._hma_use_src and self._hma_src_scheduler is not None:
+            # Wrap as HMAConnectorAdapter if needed
+            try:
+                from src.scheduler.hma_multi_connector_scheduler import HMAConnectorAdapter
+                if not isinstance(connector, HMAConnectorAdapter):
+                    self._hma_src_scheduler.register_connector(name, connector)
+                else:
+                    self._hma_src_scheduler.register_connector(name, connector)
+            except ImportError:
+                pass
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _hma_select_connector(self, profile: _Dict_2017) -> str:
+        """O(1) connector selection based on request profile."""
+        cfg = self._hma_cfg
+        is_rl = profile.get("is_rl_mode", False)
+        num_completions = profile.get("num_completions", 1)
+        context_length = profile.get("context_length", 0)
+        memory_pressure = profile.get("memory_pressure", 0.0)
+
+        registry = self._hma_registry if not self._hma_use_src else self._hma_src_scheduler._connector_registry
+
+        if (is_rl or num_completions > 1) and cfg.rl_mode_connector in registry:
+            return cfg.rl_mode_connector
+        if context_length > cfg.long_ctx_threshold and cfg.long_ctx_connector in registry:
+            return cfg.long_ctx_connector
+        if (context_length <= cfg.long_ctx_threshold
+                and memory_pressure > cfg.memory_pressure_threshold
+                and cfg.high_pressure_connector in registry):
+            return cfg.high_pressure_connector
+        if cfg.default_connector in registry:
+            return cfg.default_connector
+        # Fallback: first available
+        keys = list(registry.keys())
+        return keys[0] if keys else cfg.default_connector
+
+    def _hma_extract_waiting(self, waiting: _Any_2017) -> _List_2017[_Any_2017]:
+        """Extract requests from vLLM's RequestQueue (read-only, no modification)."""
+        from collections import deque as _deque
+        pending: _List_2017[_Any_2017] = []
+        if isinstance(waiting, _deque):
+            pending = list(waiting)
+        elif hasattr(waiting, "_heap"):
+            pending = [entry[-1] for entry in waiting._heap if entry]
+        elif hasattr(waiting, "__iter__"):
+            try:
+                pending = list(waiting)
+            except Exception:
+                pass
+        return pending
+
+    def _hma_get_context_length(self, req: _Any_2017) -> int:
+        """Extract prompt context length from a vLLM Request."""
+        # vLLM v1: num_prompt_tokens is the reliable attribute
+        for attr in ("num_prompt_tokens", "num_computed_tokens", "context_length"):
+            val = getattr(req, attr, None)
+            if val is not None and isinstance(val, int):
+                return val
+        # Fallback: count prompt_token_ids
+        ids = getattr(req, "prompt_token_ids", None)
+        if ids is not None:
+            return len(ids)
+        return 0
+
+    def _hma_get_rl_info(self, req: _Any_2017) -> tuple:
+        """Extract RL workload info: (is_rl_mode, num_completions).
+
+        RL workloads are identified by sampling_params.n > 1 (best_of / beam_search).
+        """
+        sp = getattr(req, "sampling_params", None)
+        if sp is not None:
+            num_completions = getattr(sp, "n", 1) or 1
+            best_of = getattr(sp, "best_of", 1) or 1
+            num_completions = max(num_completions, best_of)
+            is_rl = (num_completions > 1)
+            return is_rl, num_completions
+        return False, 1
+
+    def get_hma_stats(self) -> _Dict_2017[str, _Any_2017]:
+        """Return HMA scheduling statistics.
+
+        Returns:
+            dict with keys:
+              schedule_count: int
+              scheduling_overhead_ms_p50: float
+              connector_selection_counts: dict[str, int]
+              vllm_version: str
+        """
+        p50_ms = 0.0
+        if self._hma_scheduling_times:
+            sorted_t = sorted(self._hma_scheduling_times)
+            p50_ms = sorted_t[len(sorted_t) // 2]
+
+        src_stats = {}
+        if self._hma_use_src and self._hma_src_scheduler is not None:
+            try:
+                src_stats = {
+                    "src_connector_stats": self._hma_src_scheduler.connector_selection_stats(),
+                    "src_overhead_ms_p50": self._hma_src_scheduler.scheduling_overhead_ms_p50(),
+                }
+            except Exception:
+                pass
+
+        return {
+            "schedule_count": self._hma_schedule_count,
+            "scheduling_overhead_ms_p50": p50_ms,
+            "connector_selection_counts": dict(self._hma_connector_selection_counts),
+            "vllm_version": vllm.__version__,
+            **src_stats,
+        }
+
+
+class _InlineRLQuantizer:
+    """Minimal inline RL quantizer stub for environments where src/ is unavailable.
+
+    Applies INT8 quantization (entropy-agnostic) as a graceful fallback.
+    In production, RLAdaptivePrecisionQuantizer from src/ is used instead.
+    """
+
+    def __init__(self, seed: int = 42) -> None:
+        self._seed = seed
+
+    def compression_hook(self, key: str, value: "torch.Tensor") -> "torch.Tensor":
+        """INT8 symmetric per-token quantization → FP16 dequantize."""
+        try:
+            import torch as _torch
+            v = value.detach().float()
+            n_tokens = v.shape[0]
+            flat = v.reshape(n_tokens, -1)
+            scale = flat.abs().max(dim=-1, keepdim=True)[0].clamp(min=1e-8) / 127.0
+            q8 = (flat / scale).round().clamp(-127, 127)
+            result = (q8 * scale).half().reshape(value.shape)
+            return result
+        except Exception:
+            return value.half() if hasattr(value, "half") else value
+
+
+def make_hma_multi_connector_scheduler_class(
+    base_scheduler_cls: type,
+) -> type:
+    """Factory: build a vLLM 0.21.0 Scheduler subclass with HMAMultiConnectorSchedulerMixin.
+
+    The returned class overrides schedule() to call hma_pre_schedule() before
+    the base Scheduler.schedule() logic, annotating waiting requests with
+    their selected HMA connector (Activity A) and RL-adaptive compression
+    config (Activity C).
+
+    Args:
+        base_scheduler_cls: vLLM Scheduler class
+            (e.g. vllm.v1.core.sched.scheduler.Scheduler).
+
+    Returns:
+        HMAMultiConnectorVllmScheduler: subclass of
+            (HMAMultiConnectorSchedulerMixin, base_scheduler_cls).
+
+    Example:
+
+        from vllm.v1.core.sched.scheduler import Scheduler
+        from vllm_integration.scheduler_patch import (
+            make_hma_multi_connector_scheduler_class,
+            HMAMultiConnectorSchedulerConfig,
+        )
+
+        HMAScheduler = make_hma_multi_connector_scheduler_class(Scheduler)
+        scheduler = HMAScheduler(
+            vllm_config=cfg,
+            kv_cache_config=kv_cfg,
+            structured_output_manager=som,
+            block_size=16,
+            hma_config=HMAMultiConnectorSchedulerConfig(
+                long_ctx_threshold=4096,
+                enable_rl_quantizer=True,
+                rl_precision_ratio_fp16=0.40,
+                rl_precision_ratio_int8=0.60,
+            ),
+        )
+
+    Activity C accuracy contract:
+        Default config: FP16=0.40, INT8=0.60, INT4=0.00.
+        attention_output_relative_error < 0.02 (validated Report ① 2026-05-17).
+        cosine_similarity >= 0.99, kl_divergence < 0.015.
+    """
+
+    class HMAMultiConnectorVllmScheduler(
+        HMAMultiConnectorSchedulerMixin, base_scheduler_cls
+    ):
+        """vLLM Scheduler extended with HMA multi-connector scheduling (Activity A+C).
+
+        Wraps schedule() to annotate waiting requests with the optimal HMA
+        connector before the base FCFS scheduling runs. Supports RL-adaptive
+        precision quantization (Activity C) via "rl_adaptive" connector.
+        """
+
+        def __init__(
+            self,
+            *args: _Any_2017,
+            hma_config: _Optional_2017[HMAMultiConnectorSchedulerConfig] = None,
+            **kwargs: _Any_2017,
+        ) -> None:
+            super().__init__(*args, hma_config=hma_config, **kwargs)
+
+        def schedule(self) -> _Any_2017:
+            """Override: run HMA connector selection before base scheduling."""
+            self.hma_pre_schedule()
+            return super().schedule()
+
+    HMAMultiConnectorVllmScheduler.__name__ = (
+        f"HMAMultiConnector_{base_scheduler_cls.__name__}"
+    )
+    HMAMultiConnectorVllmScheduler.__qualname__ = (
+        HMAMultiConnectorVllmScheduler.__name__
+    )
+    return HMAMultiConnectorVllmScheduler
+
+
+# End of 2026-05-17 HMAMultiConnector A+C additions
+# ===========================================================================
+
+
+# ---------------------------------------------------------------------------
+# Smoke test (2026-05-17)
+# ---------------------------------------------------------------------------
+
+def _smoke_test_hma_multi_connector_scheduler_2017() -> None:
+    """Quick functional smoke test for HMAMultiConnectorSchedulerMixin internals."""
+    import sys as _sys, pathlib as _pathlib
+    repo_root = _pathlib.Path(__file__).resolve().parent.parent
+    if str(repo_root) not in _sys.path:
+        _sys.path.insert(0, str(repo_root))
+
+    cfg = HMAMultiConnectorSchedulerConfig(
+        long_ctx_threshold=512,
+        memory_pressure_threshold=0.8,
+        enable_rl_quantizer=True,
+        rl_precision_ratio_fp16=0.40,
+        rl_precision_ratio_int8=0.60,
+        seed=42,
+    )
+
+    # Test inline connector selection logic
+    mixin = HMAMultiConnectorSchedulerMixin.__new__(HMAMultiConnectorSchedulerMixin)
+    mixin._hma_cfg = cfg
+    mixin._hma_scheduling_times = []
+    mixin._hma_connector_selection_counts = {}
+    mixin._hma_request_connector_map = {}
+    mixin._hma_schedule_count = 0
+    mixin._hma_use_src = False
+    mixin._hma_src_scheduler = None
+    mixin._hma_registry = {
+        "rl_adaptive": HMAConnectorInterface_V1("rl_adaptive"),
+        "global_retention": HMAConnectorInterface_V1("global_retention"),
+        "ratequant": HMAConnectorInterface_V1("ratequant"),
+    }
+
+    # Rule 1: RL mode → rl_adaptive
+    p1 = {"is_rl_mode": True, "num_completions": 2, "context_length": 128, "memory_pressure": 0.1}
+    assert mixin._hma_select_connector(p1) == "rl_adaptive", "RL mode should select rl_adaptive"
+
+    # Rule 2: long context → global_retention
+    p2 = {"is_rl_mode": False, "num_completions": 1, "context_length": 1024, "memory_pressure": 0.1}
+    assert mixin._hma_select_connector(p2) == "global_retention", "Long context should select global_retention"
+
+    # Rule 3: high memory pressure → ratequant
+    p3 = {"is_rl_mode": False, "num_completions": 1, "context_length": 128, "memory_pressure": 0.9}
+    assert mixin._hma_select_connector(p3) == "ratequant", "High pressure should select ratequant"
+
+    # Rule 4: default
+    p4 = {"is_rl_mode": False, "num_completions": 1, "context_length": 128, "memory_pressure": 0.1}
+    assert mixin._hma_select_connector(p4) == "global_retention", "Default connector should be global_retention"
+
+    print("  HMAMultiConnectorSchedulerMixin connector dispatch: 4/4 PASS")
+
+    # Test InlineRLQuantizer
+    import torch as _torch_smoke
+    iq = _InlineRLQuantizer(seed=42)
+    kv = _torch_smoke.randn(16, 64)
+    compressed = iq.compression_hook("test", kv)
+    assert compressed.dtype == _torch_smoke.float16
+    assert compressed.shape == kv.shape
+    rel_err = (kv.float() - compressed.float()).norm() / kv.float().norm().clamp(min=1e-8)
+    assert rel_err.item() < 0.05, f"InlineRLQuantizer relative error too large: {rel_err.item()}"
+    print(f"  _InlineRLQuantizer INT8 compression: rel_err={rel_err.item():.6f} PASS")
+
+    # Test factory with vLLM Scheduler
+    try:
+        from vllm.v1.core.sched.scheduler import Scheduler
+        HMAScheduler = make_hma_multi_connector_scheduler_class(Scheduler)
+        assert issubclass(HMAScheduler, Scheduler)
+        assert issubclass(HMAScheduler, HMAMultiConnectorSchedulerMixin)
+        print(f"  make_hma_multi_connector_scheduler_class: PASS ({HMAScheduler.__name__})")
+    except Exception as exc:
+        print(f"  make_hma_multi_connector_scheduler_class: SKIP (no GPU env): {exc}")
+
+    # Test src/ import path
+    (
+        HMAMultiConnectorCompressionPluginScheduler,
+        HMAMultiConnectorConfig,
+        HMAConnectorAdapter,
+        HMAConnectorInterface,
+        RLAdaptivePrecisionQuantizer,
+        RLAdaptivePrecisionConfig,
+    ) = _try_import_hma_multi_connector_src()
+    if HMAMultiConnectorCompressionPluginScheduler is not None:
+        print("  _try_import_hma_multi_connector_src: PASS (src/ importable)")
+    else:
+        print("  _try_import_hma_multi_connector_src: SKIP (src/ not in sys.path)")
+
+    print("HMAMultiConnectorSchedulerMixin smoke test (2026-05-17): PASS")
+
     print("RadixFeatherSchedulerMixin smoke test (2026-05-15): PASS")

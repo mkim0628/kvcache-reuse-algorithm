@@ -1,4 +1,12 @@
-"""block_manager_patch.py — Activity B: KV cache non-contiguous reuse integration for vLLM 0.20.2.
+"""block_manager_patch.py — Activity B: KV cache non-contiguous reuse integration for vLLM 0.21.0.
+
+2026-05-17: HMA connector integration note for A+C cycle.
+            This cycle focuses on Activity A (HMAMultiConnectorSchedulerMixin) and Activity C
+            (RLAdaptivePrecisionAttentionHook). Block manager changes are not required for this
+            cycle's A+C integration. The HMAConnectorAdapter_V1 in attention_backend_patch.py
+            bridges the Activity C quantizer into the scheduler's connector registry.
+            For Activity B non-contiguous reuse integration, see AdapShotBlockManager below.
+            vLLM version: 0.21.0
 
 2026-05-12: AdapShotBlockManager — wraps AdapShotMixedDimSegmentPipeline (B+C Cross-2).
             Ports RoPEReencodingNonContiguousCache + MixedDimPerTokenBudgetCodec pipeline

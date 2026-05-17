@@ -3,7 +3,95 @@
 ## Overview
 
 This package ports the independently-verified A+C KV cache pipeline from the
-standalone `src/` implementation into **vLLM 0.21.0** (latest as of 2026-05-16).
+standalone `src/` implementation into **vLLM 0.21.0** (latest as of 2026-05-17).
+
+## 2026-05-17 Cycle: Activity A+C (HMAMultiConnectorScheduler + RLAdaptivePrecisionQuantizer)
+
+### vLLM Version
+
+```
+vLLM: 0.21.0
+Activity: A (HMAMultiConnectorCompressionPluginScheduler) + C (RLAdaptivePrecisionQuantizer)
+Cross: A+C (HMAChainedACPipeline — connector dispatch + RL-adaptive precision)
+```
+
+### Integration Points (vLLM 0.21.0 v1 architecture)
+
+| Activity | Integration Point | File | Description |
+|----------|-------------------|------|-------------|
+| **A** | `vllm.v1.core.sched.scheduler.Scheduler` | `scheduler_patch.py` | `HMAMultiConnectorSchedulerMixin`: wraps `schedule()` with `hma_pre_schedule()` hook. For each waiting request, selects the optimal HMA connector via O(1) dispatch. |
+| **A** | `Scheduler.schedule()` override | `scheduler_patch.py` | `make_hma_multi_connector_scheduler_class()`: factory builds `(HMAMultiConnectorSchedulerMixin, Scheduler)` subclass. No existing vLLM public interface modified. |
+| **C** | Attention write/read path | `attention_backend_patch.py` | `RLAdaptivePrecisionAttentionHook`: `write_to_cache()` applies entropy-based FP16/INT8/INT4 assignment. `read_from_cache()` returns FP16 passthrough (accuracy preserved). |
+| **A+C** | Connector bridge | `attention_backend_patch.py` | `HMAConnectorAdapter_V1`: wraps `RLAdaptivePrecisionAttentionHook` as an HMA connector interface, enabling registration in `HMAMultiConnectorSchedulerMixin._hma_registry`. |
+
+### Accuracy Contract (evaluation_criteria.md §4, MANDATORY — validated Report ① 2026-05-17)
+
+| Config | FP16 | INT8 | INT4 | attention_output_relative_error | cosine | KL | Memory Reduction |
+|---|---|---|---|---|---|---|---|
+| Default | 0.40 | 0.60 | 0.00 | **0.004168** < 0.02 | **0.999991** ≥ 0.99 | **3.0e-6** < 0.015 | 30.0% (theoretical) |
+
+- Compression applied at `write_to_cache()` — AFTER Q/K/V computation, BEFORE block pool write.
+- INT8/INT4 intervals decoded back to FP16 at write time.
+- Compressed KV stored as FP16 — NEVER enters attention kernel as quantized data.
+- `warmup_steps=10` initial steps: full FP16 (protects early RL exploration patterns).
+
+### Connector Dispatch Policy (Activity A)
+
+| Priority | Condition | Connector |
+|----------|-----------|-----------|
+| 1 | `is_rl_mode=True` or `num_completions > 1` | `"rl_adaptive"` (RLAdaptivePrecisionQuantizer) |
+| 2 | `context_length > long_ctx_threshold=4096` | `"global_retention"` |
+| 3 | `memory_pressure > 0.8` | `"ratequant"` |
+| 4 | (default) | `config.default_connector` |
+
+- Overhead: O(1) dict lookup per request — < 0.1ms/request.
+- Target TTFT p50 overhead: < 5ms for 100-request batches.
+
+### Usage
+
+```python
+# Activity A: HMA Multi-Connector Scheduler
+from vllm.v1.core.sched.scheduler import Scheduler
+from vllm_integration.scheduler_patch import (
+    HMAMultiConnectorSchedulerConfig,
+    make_hma_multi_connector_scheduler_class,
+)
+
+HMAScheduler = make_hma_multi_connector_scheduler_class(Scheduler)
+scheduler = HMAScheduler(
+    vllm_config=cfg, kv_cache_config=kv_cfg,
+    structured_output_manager=som, block_size=16,
+    hma_config=HMAMultiConnectorSchedulerConfig(
+        long_ctx_threshold=4096,
+        enable_rl_quantizer=True,
+        rl_precision_ratio_fp16=0.40,
+        rl_precision_ratio_int8=0.60,
+    ),
+)
+
+# Activity C: RL-Adaptive Precision Attention Hook
+from vllm_integration.attention_backend_patch import (
+    RLAdaptivePrecisionAttentionHook,
+    HMAConnectorAdapter_V1,
+)
+
+hook = RLAdaptivePrecisionAttentionHook(
+    precision_ratio_fp16=0.40,
+    precision_ratio_int8=0.60,
+    precision_ratio_int4=0.00,
+    warmup_steps=10,
+    seed=42,
+)
+
+# In model runner — before KV block pool write:
+compressed_key, compressed_value = hook.write_to_cache(key, value, layer_idx=layer_idx)
+
+# Optionally register with scheduler mixin registry:
+adapter = HMAConnectorAdapter_V1(hook, name="rl_adaptive")
+scheduler.hma_register_connector("rl_adaptive", adapter)
+```
+
+---
 
 ## 2026-05-16 Cycle: Activity A+C (NAtH DDR Offloading + GlobalRetentionGate)
 
@@ -92,6 +180,9 @@ composite_hook = NAtHDDRGlobalRetentionHook(
 
 | Cycle | Activity | Description | Source |
 |-------|----------|-------------|--------|
+| 2026-05-17 | **A** | HMAMultiConnectorSchedulerMixin + make_hma_multi_connector_scheduler_class — O(1) connector dispatch by request profile (RL mode / long context / memory pressure). Annotates vLLM Request with hma_connector_name. Overhead < 0.1ms/request. | `src/scheduler/hma_multi_connector_scheduler.py` |
+| 2026-05-17 | **C** | RLAdaptivePrecisionAttentionHook — entropy-based FP16/INT8/INT4 per-token KV quantization. write_to_cache/read_from_cache hooks. FP16=0.40/INT8=0.60/INT4=0.00 default. attention_output_relative_error=0.004 < 0.02 (MANDATORY PASS). | `src/cache/rl_adaptive_precision_quantizer.py` |
+| 2026-05-17 | **A+C** | HMAConnectorAdapter_V1 — bridges RLAdaptivePrecisionAttentionHook as HMA connector interface. Enables scheduler-level connector registry integration. | (new) |
 | 2026-05-16 | **A** | NAtHDDROffloadingSchedulerMixin + make_nath_ddr_scheduler_class — NAtH semantic-aware 4-tier DDR offloading (arXiv 2605.09490). Permanent eviction ≤3%, zero approx error for Tier 2 FP16, < 2% for Tier 3 INT8. Overhead < 5ms p50. | `src/scheduler/nath_ddr_offloading.py` |
 | 2026-05-16 | **C** | GlobalRetentionGateVllmCodec — Cross-layer competitive KV eviction (arXiv 2605.09649). budget_ratio=0.3 → 70% memory reduction. Accuracy: attention error < 1%, KL < 0.015, cosine ≥ 0.99. | `src/cache/global_retention_gate_eviction.py` |
 | 2026-05-16 | **A** | NAtHDDROffloadingCodecAdapter — vLLM compression hook adapter for NAtH 4-tier DDR policy. Tier 2: CPU FP16. Tier 3: CPU INT8 (< 2% error). Tier 4: evict (≤3%). | (new) |

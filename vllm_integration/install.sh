@@ -2581,3 +2581,217 @@ set -e
 
 echo ""
 echo "=== 2026-05-13 A+B+C smoke tests complete ==="
+
+echo ""
+echo "=== 2026-05-17 A+C smoke tests (HMAMultiConnectorScheduler + RLAdaptivePrecision) ==="
+set +e
+python - <<'PYEOF_2026_05_17'
+import sys, pathlib
+repo_root = str(pathlib.Path(__file__).resolve().parent.parent)
+sys.path.insert(0, repo_root)
+import torch
+torch.manual_seed(42)
+
+# ---------------------------------------------------------------------------
+# Activity A: HMAMultiConnectorSchedulerMixin
+# ---------------------------------------------------------------------------
+from vllm_integration.scheduler_patch import (
+    HMAMultiConnectorSchedulerConfig,
+    HMAMultiConnectorSchedulerMixin,
+    HMAConnectorInterface_V1,
+    make_hma_multi_connector_scheduler_class,
+    _InlineRLQuantizer,
+    _try_import_hma_multi_connector_src,
+)
+
+cfg = HMAMultiConnectorSchedulerConfig(
+    long_ctx_threshold=512,
+    memory_pressure_threshold=0.8,
+    enable_rl_quantizer=True,
+    rl_precision_ratio_fp16=0.40,
+    rl_precision_ratio_int8=0.60,
+    seed=42,
+)
+
+# Test inline connector dispatch (no vLLM Scheduler instantiation needed)
+mixin = HMAMultiConnectorSchedulerMixin.__new__(HMAMultiConnectorSchedulerMixin)
+mixin._hma_cfg = cfg
+mixin._hma_scheduling_times = []
+mixin._hma_connector_selection_counts = {}
+mixin._hma_request_connector_map = {}
+mixin._hma_schedule_count = 0
+mixin._hma_use_src = False
+mixin._hma_src_scheduler = None
+mixin._hma_registry = {
+    "rl_adaptive": HMAConnectorInterface_V1("rl_adaptive"),
+    "global_retention": HMAConnectorInterface_V1("global_retention"),
+    "ratequant": HMAConnectorInterface_V1("ratequant"),
+}
+
+# Rule 1: RL mode
+p1 = {"is_rl_mode": True, "num_completions": 2, "context_length": 128, "memory_pressure": 0.1}
+c1 = mixin._hma_select_connector(p1)
+assert c1 == "rl_adaptive", f"Expected rl_adaptive, got {c1}"
+print(f"  Rule 1 (RL mode): {c1} — PASS")
+
+# Rule 2: long context
+p2 = {"is_rl_mode": False, "num_completions": 1, "context_length": 1024, "memory_pressure": 0.1}
+c2 = mixin._hma_select_connector(p2)
+assert c2 == "global_retention", f"Expected global_retention, got {c2}"
+print(f"  Rule 2 (long ctx): {c2} — PASS")
+
+# Rule 3: high pressure
+p3 = {"is_rl_mode": False, "num_completions": 1, "context_length": 128, "memory_pressure": 0.9}
+c3 = mixin._hma_select_connector(p3)
+assert c3 == "ratequant", f"Expected ratequant, got {c3}"
+print(f"  Rule 3 (high pressure): {c3} — PASS")
+
+# Rule 4: default
+p4 = {"is_rl_mode": False, "num_completions": 1, "context_length": 128, "memory_pressure": 0.1}
+c4 = mixin._hma_select_connector(p4)
+assert c4 == "global_retention", f"Expected global_retention, got {c4}"
+print(f"  Rule 4 (default): {c4} — PASS")
+
+# Test InlineRLQuantizer compression accuracy
+iq = _InlineRLQuantizer(seed=42)
+kv_test = torch.randn(64, 128)
+# Advance past warmup steps
+for _ in range(3):
+    iq.compression_hook("warmup", torch.randn(8, 128))
+iq._step = 11  # past warmup
+comp_kv = iq.compression_hook("test", kv_test)
+assert comp_kv.dtype == torch.float16, f"Expected float16, got {comp_kv.dtype}"
+assert comp_kv.shape == kv_test.shape
+print(f"  _InlineRLQuantizer: dtype={comp_kv.dtype} shape={comp_kv.shape} — PASS")
+
+# Test src/ import
+(
+    HMAMultiConnectorCompressionPluginScheduler,
+    HMAMultiConnectorConfig,
+    HMAConnectorAdapter,
+    HMAConnectorInterface,
+    RLAdaptivePrecisionQuantizer,
+    RLAdaptivePrecisionConfig,
+) = _try_import_hma_multi_connector_src()
+if HMAMultiConnectorCompressionPluginScheduler is not None:
+    print("  _try_import_hma_multi_connector_src: PASS (src/ importable)")
+    # Test full src/ integration
+    src_cfg = HMAMultiConnectorConfig(
+        long_ctx_threshold=512, memory_pressure_threshold=0.8, seed=42
+    )
+    src_sch = HMAMultiConnectorCompressionPluginScheduler(config=src_cfg)
+    rl_cfg = RLAdaptivePrecisionConfig(
+        precision_ratio_fp16=0.40, precision_ratio_int8=0.60, precision_ratio_int4=0.00, seed=42
+    )
+    rl_q = RLAdaptivePrecisionQuantizer(rl_cfg)
+    src_sch.register_connector("rl_adaptive", HMAConnectorAdapter("rl_adaptive", rl_q))
+    src_sch.register_connector("global_retention", HMAConnectorAdapter("global_retention", None))
+    print("  src/ HMAMultiConnectorCompressionPluginScheduler: registry PASS")
+else:
+    print("  _try_import_hma_multi_connector_src: SKIP (src/ not in sys.path)")
+
+# Test factory
+try:
+    from vllm.v1.core.sched.scheduler import Scheduler
+    HMAScheduler = make_hma_multi_connector_scheduler_class(Scheduler)
+    assert issubclass(HMAScheduler, Scheduler)
+    assert issubclass(HMAScheduler, HMAMultiConnectorSchedulerMixin)
+    print(f"  make_hma_multi_connector_scheduler_class: PASS ({HMAScheduler.__name__})")
+except Exception as exc:
+    print(f"  make_hma_multi_connector_scheduler_class: SKIP (no GPU env): {exc}")
+
+# ---------------------------------------------------------------------------
+# Activity C: RLAdaptivePrecisionAttentionHook
+# ---------------------------------------------------------------------------
+from vllm_integration.attention_backend_patch import (
+    RLAdaptivePrecisionAttentionHook,
+    HMAConnectorAdapter_V1,
+)
+
+hook = RLAdaptivePrecisionAttentionHook(
+    precision_ratio_fp16=0.40,
+    precision_ratio_int8=0.60,
+    precision_ratio_int4=0.00,
+    warmup_steps=2,
+    seed=42,
+    enabled=True,
+)
+
+# Advance past warmup
+for _ in range(3):
+    hook.write_to_cache(torch.randn(8, 64), torch.randn(8, 64), layer_idx=0)
+
+# MANDATORY accuracy check — seq_len=64, d=64 matches Report ① validation
+torch.manual_seed(42)
+original_kv = torch.randn(64, 64)
+comp_k, comp_v = hook.write_to_cache(original_kv, original_kv, layer_idx=0)
+assert comp_k.shape == original_kv.shape, f"Shape mismatch"
+assert comp_k.dtype == torch.float16, f"Expected float16, got {comp_k.dtype}"
+metrics = hook.compute_accuracy_metrics(original_kv.float(), comp_k.float())
+rel_err = metrics["attention_output_relative_error"]
+kl = metrics["kl_divergence"]
+cos = metrics["cosine_similarity"]
+assert rel_err < 0.02, f"MANDATORY FAIL: attention_output_relative_error={rel_err:.6f} >= 0.02"
+assert kl < 0.015, f"MANDATORY FAIL: kl_divergence={kl:.6f} >= 0.015"
+assert cos >= 0.99, f"MANDATORY FAIL: cosine_similarity={cos:.6f} < 0.99"
+print(f"  RLAdaptivePrecisionAttentionHook accuracy: rel_err={rel_err:.6f} kl={kl:.8f} cos={cos:.6f} — all PASS")
+
+# Reward feedback
+hook.update_reward(0.9)
+ratios = hook.current_precision_ratios()
+assert abs(ratios["fp16"] + ratios["int8"] + ratios["int4"] - 1.0) < 1e-5
+print(f"  update_reward(0.9): ratios={ratios} sum=1.0 — PASS")
+
+# Memory reduction
+mr = hook.memory_reduction_ratio()
+assert mr >= 0.0
+print(f"  memory_reduction_ratio: {mr:.3f} (expect ~0.30 for INT8=0.60)")
+
+# read_from_cache: FP16 output, passthrough
+key_out, val_out = hook.read_from_cache(comp_k, comp_v, layer_idx=0)
+assert key_out.dtype == torch.float16
+print(f"  read_from_cache: dtype={key_out.dtype} — PASS")
+
+# HMAConnectorAdapter_V1
+adapter = HMAConnectorAdapter_V1(hook, name="rl_adaptive")
+kv_sample = torch.randn(16, 64)
+comp_s = adapter.compress(kv_sample, {"layer_idx": 0})
+assert comp_s.dtype == torch.float16
+decomp_s = adapter.decompress(comp_s, {"layer_idx": 0})
+assert decomp_s.dtype == torch.float16
+print(f"  HMAConnectorAdapter_V1: compress/decompress — PASS")
+
+# stats
+s = hook.stats()
+assert s["write_count"] >= 4
+print(f"  stats: write_count={s['write_count']} use_src={s['use_src']}")
+
+# Multi-seed robustness check (5 seeds)
+# Use seq_len=64, d=64 — matches Report ① validation (RLAdaptivePrecisionQuantizer)
+robustness_pass = 0
+for seed in [42, 123, 7, 999, 2024]:
+    h = RLAdaptivePrecisionAttentionHook(
+        precision_ratio_fp16=0.40, precision_ratio_int8=0.60, precision_ratio_int4=0.00,
+        warmup_steps=2, seed=seed, enabled=True,
+    )
+    # past warmup
+    for _ in range(3):
+        h.write_to_cache(torch.randn(8, 64), torch.randn(8, 64), layer_idx=0)
+    # Use seed to generate the test tensor (seq_len=64, d=64 matching Report ①)
+    torch.manual_seed(seed)
+    orig = torch.randn(64, 64)
+    ck, _ = h.write_to_cache(orig, orig, layer_idx=0)
+    m = h.compute_accuracy_metrics(orig.float(), ck.float())
+    if (m["attention_output_relative_error"] < 0.02 and
+        m["kl_divergence"] < 0.015 and
+        m["cosine_similarity"] >= 0.99):
+        robustness_pass += 1
+assert robustness_pass == 5, f"Robustness: {robustness_pass}/5 seeds passed"
+print(f"  Multi-seed robustness: {robustness_pass}/5 seeds PASS")
+
+print(f"\nAll 2026-05-17 A+C smoke tests passed.  vLLM={__import__('vllm').__version__}")
+PYEOF_2026_05_17
+set -e
+
+echo ""
+echo "=== 2026-05-17 A+C smoke tests complete ==="
