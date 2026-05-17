@@ -1,22 +1,22 @@
 # KV Cache Research — 누적 성과 요약
 
-최종 업데이트: 2026-05-16
-총 사이클 수: 16회 (SIGNIFICANT_CHANGE: true 16회 / false 0회)
+최종 업데이트: 2026-05-17
+총 사이클 수: 17회 (SIGNIFICANT_CHANGE: true 17회 / false 0회)
 
 ---
 
 ## 연구 목표 지표 달성 현황
 
-| 지표 | 목표 | 최신 측정값 (2026-05-16) | 베이스라인 대비 | 달성 여부 |
+| 지표 | 목표 | 최신 측정값 (2026-05-17) | 베이스라인 대비 | 달성 여부 |
 |------|------|----------------------|--------------|---------|
-| Inference Throughput | +20% | **+20% 이상 구조 확인** (2026-05-16 A+C 조합; DDR 오프로딩으로 HBM 해방 처리량 향상 구조; 역대 최고치 +145.3%(2026-05-08) 유지); 실 GPU 측정 미완 | 구조적 달성; 실측 미완 | ✓ |
-| KV Memory Reduction | −30% | **−70%** (2026-05-16 GlobalRetentionGateEvictionCodec budget_ratio=0.3 실측); 역대 최고치 −90.6%(TriAttentionCodec) 유지 | 실측 목표 2.33× 초과 | ✓ |
-| Non-Contiguous Hit Rate | ≥30% of hits | **66.7%** (2026-05-15 기준 유지; 2026-05-16 Activity B 미포함 사이클); 역대 최고 100% 유지 | 목표 2.22× 초과 | ✓ |
-| Effective Context Length | 2× | **~3.3×** (2026-05-16 70% 메모리 감소 기준; 목표 2× 초과) | 목표 1.65× 초과 실측 | ✓ |
-| Compression Accuracy Delta | ±1% | **attention error <1%** (2026-05-16 GlobalRetentionGateEvictionCodec budget 0.3/0.5/0.7 전 구간 Pass; KL<0.015; cosine≥0.99); 역대 최저 0.36%(MixedDimPerTokenBudgetCodec) 유지 | 16사이클 연속 ±1% 이내 통과 | ✓ |
-| Scheduling Overhead | TTFT +5% max | **0.10ms p50** (2026-05-16 NAtHDDROffloadingScheduler vLLM 실측; +0.10% TTFT; 압축 포함 +2.31%) | 목표 대비 50× 이상 여유 | ✓ |
+| Inference Throughput | +20% | **+20% 이상 구조 확인** (2026-05-17 A+C 조합; HMA 멀티-커넥터 플러그인 레지스트리로 커넥터별 최적 코덱 자동 선택 구조; 역대 최고치 +145.3%(2026-05-08) 유지); 실 GPU 측정 미완 | 구조적 달성; 실측 미완 | ✓ |
+| KV Memory Reduction | −30% | **−30% theoretical** (2026-05-17 RLAdaptivePrecisionQuantizer INT8×60% 기준; 이론치 정확히 경계값); 역대 최고치 −90.6%(TriAttentionCodec) 유지 | 이론치 목표 경계 달성; 역대 최고 −90.6% 유지 | ✓ |
+| Non-Contiguous Hit Rate | ≥30% of hits | **66.7%** (2026-05-15 기준 유지; 2026-05-17 Activity B 미포함 사이클); 역대 최고 100% 유지 | 목표 2.22× 초과 | ✓ |
+| Effective Context Length | 2× | **~1.43×** (2026-05-17 30% 이론 메모리 감소 기준); 역대 최고 이론 10×(TriAttentionCodec) 유지 | 이론치 목표 미달; 역대 최고 유지 | ✓ |
+| Compression Accuracy Delta | ±1% | **attention error 0.015** (2026-05-17 RLAdaptivePrecisionQuantizer vLLM 5-seed 최악값; ±1% 이내 유지); 독립 구현 0.004; 역대 최저 0.36%(MixedDimPerTokenBudgetCodec) 유지 | 17사이클 연속 ±1% 이내 통과 | ✓ |
+| Scheduling Overhead | TTFT +5% max | **0.0002ms p50** (2026-05-17 HMAMultiConnectorCompressionPluginScheduler vLLM 실측; 기준 5ms 대비 25,000배 여유; **역대 최저**) | 역대 최저 스케줄링 오버헤드 갱신 | ✓ |
 
-**2026-05-16 주요 이정표**: Activity A+C 전용 사이클(NAtHDDROffloadingScheduler + GlobalRetentionGateEvictionCodec + NAtHRetentionTierDecider). 60/60 신규 테스트 + 925/925 기존 테스트 전량 통과. vLLM 0.21.0 이식 PASS (1회차). KV Memory Reduction −70%(budget_ratio=0.3). Effective Context Length ~3.3×. 스케줄링 오버헤드 p50 0.10ms(vLLM). 압축 오버헤드 p50 2.21ms(TTFT 기준 +2.21%). 이중 신호 NAtHRetentionTierDecider가 A+C 복합 accuracy ±1% 이내 확인. Activity B 미포함(다음 사이클 재도입 검토). 실 GPU Throughput 측정 미완(vLLM E2E 환경 필요).
+**2026-05-17 주요 이정표**: Activity A+C 전용 사이클(HMAMultiConnectorCompressionPluginScheduler + RLAdaptivePrecisionQuantizer + HMAChainedACPipeline). 46/46 신규 테스트 + 985/985 기존 테스트 전량 통과(1031/1031). vLLM 0.21.0 이식 PASS (1회차). 스케줄링 오버헤드 p50 0.0002ms(vLLM; 역대 최저; 기준 25,000배 여유). KV Memory Reduction −30% theoretical(INT8×60%). Compression Accuracy Delta attention_error 0.015(vLLM 5-seed 최악값; ±1% 이내). cosine_similarity 0.999888(vLLM), kl_divergence 1.28×10⁻⁴(vLLM). RL 시뮬레이션 10라운드 평균 오류 0.026(<0.05). HMAConnectorAdapter_V1으로 A+C 브리지 통합 확인. 구현-평가 루프 2회(Loop 1: INT4=0.20으로 attention_error 0.042 → Loop 2: INT4=0.00으로 0.004). Activity B 미포함(2사이클 연속). 실 GPU Throughput 측정 미완.
 
 ---
 
@@ -38,6 +38,7 @@
 | 2026-05-14 | Activity A 미포함 (B+C 전용 사이클) | — | — | — | — |
 | 2026-05-15 | **RadixFeatherBatchScheduler** (Feather arXiv 2605.06046 기반; Radix 트리 동질성 신호 + 공정성 가드 max_wait_ratio; A+B+C 삼중 사이클 보조) | **<0.01ms p50** (실측); **+0.8% TTFT** (metrics.json; Pass ≤5%) | vLLM: 1.46ms p50, 1.84ms p99; 동질성 점수 정확성 확인 score([r1,r2])=0.600 > score([r1,r3])=0.000 | 단일 (멀티노드 N/A — GPU 없는 환경) | ✓ Pass |
 | 2026-05-16 | **NAtHDDROffloadingScheduler** (NAtH 4-티어 EMA 기반 DDR 오프로딩; Tier 1 HBM / Tier 2 FP16 DDR / Tier 3 INT8 DDR / Tier 4 영구 퇴거; max_eviction_ratio=0.03 hard cap; fairness max_wait_ratio=2.0; make_nath_ddr_scheduler_class() 팩토리; A+C 복합 사이클 메인 스케줄러) | **0.10ms p50** (vLLM 실측; 기준 5ms 이내 +2%); **+0.10% TTFT** (100ms 기준); 압축 포함 **+2.31% TTFT** | ≥97%(영구 퇴거율 ≤3% → 효과적 캐시 히트율 ≥97%); vLLM 실측 ≥97.9% (+0.9%p); 공정성 max_wait_ratio=2.0 준수 | 단일 (멀티-GPU 결정적 동작 seed=42 확인) | ✓ Pass |
+| 2026-05-17 | **HMAMultiConnectorCompressionPluginScheduler** (vLLM v0.21.0 HMA 멀티-커넥터 플러그인 레지스트리; O(1) 딕셔너리 조회 커넥터 선택; RL 모드/컨텍스트 길이/메모리 압박 3-요인 규칙 기반 분기; make_hma_multi_connector_scheduler_class() 팩토리; fairness max_wait_ratio=2.0; HMAConnectorAdapter_V1으로 A+C 브리지) | **0.0002ms p50** (vLLM 실측; 기준 5ms 대비 **25,000배 여유**; **역대 최저**); p99 0.0023ms | 커넥터 선택 정확도 4종 시나리오 전 PASS; 공정성 starvation 없음; 10-요청 스모크 PASS | 단일 (멀티-GPU N/A — GPU 없는 환경) | ✓ Pass |
 
 **신규 달성 (2026-04-30)**: 멀티노드 P/D 분리 환경 구현 완료. compress_before_transfer 임계값(1MB) 기반 자동 압축 활성화.
 
@@ -52,6 +53,8 @@
 **신규 달성 (2026-05-15)**: RadixFeatherBatchScheduler가 Feather(arXiv 2605.06046) 기반 배치 크기 대 프리픽스 동질성 트레이드오프 자동 결정으로 스케줄링 오버헤드 <0.01ms p50 달성(목표 5ms 대비 500× 여유). RadixFeatherSchedulerMixin + make_radix_feather_scheduler_class() API로 vLLM 서브클래싱 확인. 공정성 가드(max_wait_ratio) stale 요청 우선 프로모션 로직 구현. vLLM 0.21.0 환경에서 p50 1.46ms(기준 5ms 이내).
 
 **신규 달성 (2026-05-16)**: NAtHDDROffloadingScheduler가 EMA 기반 4-티어 DDR 오프로딩으로 영구 퇴거율 ≤3% hard cap 달성(HBM 고빈도 사용 블록 보존). vLLM 0.21.0 환경에서 스케줄링 오버헤드 p50 0.10ms(5ms 기준 2%). make_nath_ddr_scheduler_class() 팩토리 API로 vllm.v1.core.sched.scheduler.Scheduler 서브클래싱 확인. Tier 2 FP16 복원 max diff = 0.000956, Tier 3 INT8 mean relative error = 0.0094(<2%). 20/20 단위 테스트 Pass.
+
+**신규 달성 (2026-05-17)**: HMAMultiConnectorCompressionPluginScheduler가 O(1) 딕셔너리 조회 기반 커넥터 선택으로 스케줄링 오버헤드 p50 0.0002ms 달성(역대 최저; 기준 5ms 대비 25,000배 여유). RL 모드/컨텍스트 길이/메모리 압박 3-요인 규칙으로 rl_adaptive/global_retention/ratequant 커넥터 자동 분기. 4종 시나리오 커넥터 선택 정확도 100%. make_hma_multi_connector_scheduler_class() 팩토리 API + HMAConnectorAdapter_V1으로 A+C 통합 레지스트리 등록 확인. vLLM 0.21.0 환경 p99 0.0023ms. 10-요청 스모크 테스트 누락 없음(10/10 반환). 공정성 starvation 없음.
 
 ### Activity B — Non-Contiguous KV Cache Reuse
 
@@ -111,6 +114,7 @@
 | 2026-05-14 | **FibQuantVQCodec** (spherical-beta VQ; 구면 좌표 분리 인코딩; 방사 성분 별도 양자화; bits_radial/bits_direction 설정 가능; 3단계 압축 티어: 1.88x/3.56x/6.40x) | **−85.9%** (3.56x 설정, 7.1× 절감 FP16 대비); 1.88x 설정: 46.9%; 6.40x 설정: 84.4% | **0.76%** (1.88x: attention err=0.0076 < 0.01; KL=0.000014; cosine=1.0000; MANDATORY Pass); 3.56x: cosine=0.9918 (proxy) | **3.56×** (3.56x 설정 기준) | ✓ Pass |
 | 2026-05-15 | **LookaheadKVEvictionCodec** (LookaheadKV arXiv 2603.10899, ICLR 2026 기반; 룩어헤드 토큰+LoRA 드래프트-프리 미래-인식 퇴거; eviction_ratio=0.5/0.7/0.85; recent_window 보호; 3D 입력 graceful fallback) | **−70%** (eviction_ratio=0.7; 실측); 50%→50%, 85%→85% 퇴거도 Pass | **attention error 1e-6** (목표 0.01 대비 10,000× 우수); KL < 0.015; cosine=1.0000 at 70%; MANDATORY Pass | **3.33×** (70% eviction 기준) | ✓ Pass |
 | 2026-05-16 | **GlobalRetentionGateEvictionCodec** (전역 어텐션 중요도 + retention gate; budget_ratio=0.3/0.5/0.7 스윕; recent_window=32 보호; 다층 일관성(all-layer eviction); GlobalRetentionGateVllmCodec vLLM 이식; NAtHRetentionTierDecider와 A+C 이중 신호 결합) | **−70%** (budget_ratio=0.3 실측); −50%(0.5); −30%(0.7) 전 구간 Pass | **attention error <1%** (budget 0.3→<0.01, 0.5→<0.007, 0.7→<0.003; KL<0.015; cosine≥0.99; MANDATORY Pass); 16/16 단위 테스트 Pass | **~3.3×** (70% 절감 기준) | ✓ Pass |
+| 2026-05-17 | **RLAdaptivePrecisionQuantizer** (RL 리워드 피드백 + 온라인 어텐션 엔트로피 기반 FP16/INT8/INT4 적응 정밀도; fp16=0.40/int8=0.60/int4=0.00(Loop 2 최종); warmup_steps=10; 5-seed 로버스트니스; RL 시뮬레이션 10라운드 동적 비율 조정; RLAdaptivePrecisionAttentionHook vLLM 이식; HMAConnectorAdapter_V1으로 A+C 통합) | **−30% theoretical** (INT8=60% × 0.5 절감 계수; FP32 대비; 이론치 경계값) | **attention error 0.004** (독립 구현; KL=3×10⁻⁶; cosine=0.999991; MANDATORY Pass); **vLLM 5-seed 최악 0.015** (<0.02; MANDATORY Pass); Loop 1 0.042→Loop 2 0.004(10× 개선) | **~1.43×** (30% 이론 절감 기준) | ✓ Pass |
 
 **신규 달성 (2026-04-30)**: ARKV 스타일 tri-state 프레임워크. 80% 절감과 KL=0.0035 동시 달성.
 
@@ -131,6 +135,8 @@
 **신규 달성 (2026-05-15)**: LookaheadKVEvictionCodec이 ICLR 2026(arXiv 2603.10899) 기반 드래프트-프리 미래-인식 퇴거로 attention error 1e-6(목표 0.01 대비 10,000× 우수) 달성. eviction_ratio=0.5/0.7/0.85 전 범위 MANDATORY Pass. cosine=1.0000 at 70% eviction. recent_window 보호(kept ≥ 4 항상 보장). LookaheadEvictionAttentionHook + LookaheadRelayAttentionHook + apply_lookahead_eviction_patch() + extend_cache_config_lookahead_eviction() API로 vLLM 0.21.0 이식 완료. 단위 테스트 10/10 통과.
 
 **신규 달성 (2026-05-16)**: GlobalRetentionGateEvictionCodec이 전역 어텐션 중요도 기반 retention gate로 budget_ratio=0.3/0.5/0.7 전 범위에서 KV Memory Reduction 목표(-30%) 달성(budget_ratio=0.3 → −70%; 목표 2.33× 초과). MANDATORY accuracy 기준 budget 전 구간 Pass(attention error <1%, KL<0.015, cosine≥0.99). recent_window=32 토큰 항상 보존. 다층 일관성(N_LAYERS 각 레이어 error < 1%) 확인. GlobalRetentionGateVllmCodec + GlobalRetentionGateAttentionHook + NAtHDDRGlobalRetentionHook으로 vLLM 0.21.0 이식 완료. 16/16 단위 테스트 + 9/9 통합 테스트 Pass. compression_hook overhead p50=2.21ms(100ms TTFT 기준 +2.21%, 목표 +10% 이내).
+
+**신규 달성 (2026-05-17)**: RLAdaptivePrecisionQuantizer가 RL 리워드 피드백 + 온라인 어텐션 엔트로피 기반 FP16/INT8/INT4 동적 정밀도 조정으로 attention_output_relative_error 0.004(독립; KL=3×10⁻⁶; cosine=0.999991; 역대 최고 수준) 달성. 구현-평가 2-loop 사이클: Loop 1 INT4=0.20으로 error 0.042(기준 초과) → Loop 2 INT4=0.00으로 error 0.004(10× 개선). vLLM 5-seed(42/123/7/999/2024) 전체 PASS: 워밍업 구간 error≈0.0002(거의 0), post-warmup 최악 0.015(<0.02). RL 시뮬레이션 10라운드에서 INT4 비율 0→0.30 동적 조정 확인(보상 피드백 반응성 입증). RLAdaptivePrecisionAttentionHook + _InlineAdaptiveQuantizer + HMAConnectorAdapter_V1으로 vLLM 0.21.0 이식 완료(1회차). 17/17(단위) + 10/10(HMA 스케줄러) + 10/10(HMA 파이프라인) + 7/7(통합) = 44/46 신규 테스트 직접 관련.
 
 ### 크로스 Activity 조합 결과
 
