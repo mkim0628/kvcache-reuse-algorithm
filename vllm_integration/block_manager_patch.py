@@ -5198,7 +5198,7 @@ import hashlib as _hashlib_b18
 import math as _math_b18
 from collections import OrderedDict as _ODict_b18
 from dataclasses import dataclass as _dc_b18, field as _field_b18
-from typing import Any as _Any_b18, Dict as _Dict_b18, List as _List_b18, Optional as _Opt_b18, Tuple as _Tuple_b18
+from typing import Any as _Any_b18, Dict as _Dict_b18, List as _List_b18, Optional as _Opt_b18, Tuple as _Tuple_b18, Union as _Union_b18
 
 try:
     import torch as _torch_b18
@@ -5432,24 +5432,58 @@ class AMPDAdapShotLazyLoadKVCacheManagerMixin:
     def load_and_reencode_b18(
         self,
         segment_id: str,
-        source_position: int,
-        target_position: int,
-    ) -> "_Opt_b18[_torch_b18.Tensor]":
+        source_position: "_Union_b18[int, _List_b18[int]]",
+        target_position: "_Union_b18[int, _List_b18[int]]",
+    ) -> "_Opt_b18[_Union_b18[_torch_b18.Tensor, _List_b18[_Opt_b18[_torch_b18.Tensor]]]]":
         """Stage 2+3: load then immediately AdapShot-reencode.
 
         Algorithm:
           1. Load segment_id KV from auxiliary store.
           2. AdapShot RoPE reencoding: delta = target_position - source_position.
           3. Return reencoded KV tensor (FP16).
+
+        Type safety:
+            source_position / target_position may be:
+              - int scalar  → single-segment mode, returns Tensor or None.
+              - list[int]   → batch mode, each element is processed independently,
+                              returns List[Tensor | None] of the same length.
+            If a list is passed and lengths mismatch a ValueError is raised.
         """
         if not _TORCH_OK_B18:
             return None
+
+        # ---- batch mode (list inputs) ------------------------------------
+        if isinstance(source_position, (list, tuple)):
+            if not isinstance(target_position, (list, tuple)):
+                target_position = [int(target_position)] * len(source_position)
+            if len(source_position) != len(target_position):
+                raise ValueError(
+                    f"load_and_reencode_b18: source_position length "
+                    f"({len(source_position)}) != target_position length "
+                    f"({len(target_position)})"
+                )
+            results: _List_b18[_Opt_b18[_torch_b18.Tensor]] = []
+            for src, tgt in zip(source_position, target_position):
+                results.append(
+                    self.load_and_reencode_b18(segment_id, int(src), int(tgt))
+                )
+            return results
+
+        if isinstance(target_position, (list, tuple)):
+            # source is scalar, target is list: expand source
+            source_position = [int(source_position)] * len(target_position)
+            return self.load_and_reencode_b18(segment_id, source_position, list(target_position))
+
+        # ---- scalar mode -------------------------------------------------
+        src_int: int = int(source_position)
+        tgt_int: int = int(target_position)
+
         kv = self._ampd_b18_store.get(segment_id)
         if kv is None:
             return None
-        if source_position != target_position:
+        if src_int != tgt_int:
             kv = _adapshot_rope_reencode_b18(
-                kv, source_position, target_position,
+                kv, src_int, tgt_int,
                 rope_theta=self._ampd_b18_cfg.rope_theta,
             )
         return kv
